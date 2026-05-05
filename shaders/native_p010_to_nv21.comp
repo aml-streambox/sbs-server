@@ -1,0 +1,410 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer SrcP010 {
+    uint data[];
+} src;
+layout(set = 0, binding = 1, r8) uniform image2D y_img;
+layout(set = 0, binding = 2, rg8) uniform image2D uv_img;
+
+layout(push_constant) uniform PushConstants {
+    uint canvas_width;
+    uint canvas_height;
+    int dst_x;
+    int dst_y;
+    uint dst_w;
+    uint dst_h;
+    uint src_w;
+    uint src_h;
+    float opacity;
+    uint flags;
+    uint y_stride;
+    uint uv_stride;
+    uint uv_offset;
+    float y_scale_x;
+    float y_scale_y;
+    float uv_scale_x;
+    float uv_scale_y;
+    float bg_y;
+    float bg_u;
+    float bg_v;
+    uint filter_flags;
+    float hdr_to_sdr_amount;
+    float hdr_saturation;
+    float hdr_brightness;
+    float hdr_hue_cos;
+    float hdr_hue_sin;
+    float filter_params[4];
+} pc;
+
+const uint FLAG_FULL_CANVAS = 1u;
+const uint FLAG_DST_IN_BOUNDS = 8u;
+const uint FLAG_SRC_OFFSET = 16u;
+const uint FILTER_GRAYSCALE = 1u;
+const uint FILTER_BRIGHTNESS = 2u;
+const uint FILTER_CONTRAST = 4u;
+const uint FILTER_HDR_TO_SDR = 32u;
+const uint FILTER_COLOR_CORRECTION = 64u;
+
+bool dst_in_bounds() { return (pc.flags & FLAG_DST_IN_BOUNDS) != 0u; }
+bool filter_hdr_to_sdr() { return (pc.filter_flags & FILTER_HDR_TO_SDR) != 0u; }
+bool src_offset_enabled() { return (pc.flags & FLAG_SRC_OFFSET) != 0u; }
+
+uint src_local_x(uint x) {
+    return src_offset_enabled() && pc.dst_x > 0 ? x + uint(pc.dst_x) : x;
+}
+
+uint src_local_y(uint y) {
+    return src_offset_enabled() && pc.dst_y > 0 ? y + uint(pc.dst_y) : y;
+}
+
+uint src_local_uv_x(uint x) {
+    return src_offset_enabled() && pc.dst_x > 0 ? x + (uint(pc.dst_x) >> 1) : x;
+}
+
+uint src_local_uv_y(uint y) {
+    return src_offset_enabled() && pc.dst_y > 0 ? y + (uint(pc.dst_y) >> 1) : y;
+}
+
+float apply_basic_luma_filters(float y) {
+    if ((pc.filter_flags & (FILTER_BRIGHTNESS | FILTER_COLOR_CORRECTION)) != 0u)
+        y += pc.filter_params[1];
+    if ((pc.filter_flags & (FILTER_CONTRAST | FILTER_COLOR_CORRECTION)) != 0u)
+        y = ((y - 0.5) * pc.filter_params[2]) + 0.5;
+    if ((pc.filter_flags & FILTER_COLOR_CORRECTION) != 0u)
+        y = pow(clamp(y, 0.0, 1.0), 1.0 / clamp(pc.filter_params[3], 0.1, 4.0));
+    return clamp(y, 0.0, 1.0);
+}
+
+vec2 apply_basic_chroma_filters(vec2 vu) {
+    if ((pc.filter_flags & FILTER_GRAYSCALE) != 0u) {
+        float amount = clamp(pc.filter_params[0], 0.0, 1.0);
+        vu = mix(vu, vec2(128.0 / 255.0), amount);
+    }
+    if ((pc.filter_flags & FILTER_COLOR_CORRECTION) != 0u) {
+        float saturation = clamp(pc.filter_params[0], 0.0, 3.0);
+        vu = vec2(128.0 / 255.0) + (vu - vec2(128.0 / 255.0)) * saturation;
+    }
+    return clamp(vu, 0.0, 1.0);
+}
+
+const vec3 BT2020_LUMA = vec3(0.2627, 0.6780, 0.0593);
+const vec3 RGB_TO_Y709 = vec3(0.2126, 0.7152, 0.0722);
+const vec3 RGB_TO_CB709 = vec3(-0.114572, -0.385428, 0.5);
+const vec3 RGB_TO_CR709 = vec3(0.5, -0.454153, -0.045847);
+const float SDR_CHROMA_NEUTRAL = 128.0 / 255.0;
+
+uint read_u16(uint byte_addr) {
+    uint word = src.data[byte_addr >> 2];
+    return ((byte_addr & 2u) == 0u) ? (word & 0xFFFFu) : (word >> 16);
+}
+
+uint read_y10_at(uint x, uint y) {
+    return (read_u16(y * pc.y_stride + x * 2u) >> 6) & 0x3FFu;
+}
+
+uint sample_y10_for_uv(uint src_uv_x, uint src_uv_y) {
+    uint x0 = min(src_uv_x * 2u, pc.src_w - 1u);
+    uint y0 = min(src_uv_y * 2u, pc.src_h - 1u);
+    uint x1 = min(x0 + 1u, pc.src_w - 1u);
+    uint y1 = min(y0 + 1u, pc.src_h - 1u);
+    return (read_y10_at(x0, y0) + read_y10_at(x1, y0) +
+            read_y10_at(x0, y1) + read_y10_at(x1, y1) + 2u) >> 2;
+}
+
+uint scale_nearest(uint pos, uint src_extent, float scale) {
+    if (src_extent <= 1u) return 0u;
+    float f = (float(pos) + 0.5) * scale;
+    uint v = uint(f);
+    return min(v, src_extent - 1u);
+}
+
+bool hdr_sdr_enabled() {
+    return filter_hdr_to_sdr() && pc.hdr_to_sdr_amount > 0.0;
+}
+
+float map_hdr_luma_to_sdr(float limited_luma) {
+    return clamp((limited_luma - 0.1425) * 1.86, 0.0, 0.996853);
+}
+
+float pq_to_nits(float v) {
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 128.0;
+    const float c3 = 2392.0 / 128.0;
+    float vp = pow(clamp(v, 0.0, 1.0), 1.0 / m2);
+    float num = max(vp - c1, 0.0);
+    float den = max(c2 - c3 * vp, 0.000001);
+    return 10000.0 * pow(num / den, 1.0 / m1);
+}
+
+float tone_map_sdr_linear(float nits) {
+    float x = max(nits, 0.0) / 203.0;
+    const float white = 1000.0 / 203.0;
+    float y = x / (1.0 + x);
+    float yw = white / (1.0 + white);
+    return clamp(y / yw, 0.0, 1.0);
+}
+
+float linear_to_bt709(float v) {
+    v = clamp(v, 0.0, 1.0);
+    return v < 0.018 ? 4.5 * v : 1.099 * pow(v, 0.45) - 0.099;
+}
+
+vec3 bt2020_to_bt709(vec3 linear2020) {
+    return clamp(vec3(
+         1.6605 * linear2020.r - 0.5876 * linear2020.g - 0.0728 * linear2020.b,
+        -0.1246 * linear2020.r + 1.1329 * linear2020.g - 0.0083 * linear2020.b,
+        -0.0182 * linear2020.r - 0.1006 * linear2020.g + 1.1187 * linear2020.b),
+        0.0, 1.0);
+}
+
+vec3 hdr2020_pq_to_sdr709(vec3 rgb2020_pq) {
+    vec3 nits = vec3(
+        pq_to_nits(rgb2020_pq.r),
+        pq_to_nits(rgb2020_pq.g),
+        pq_to_nits(rgb2020_pq.b));
+    float luma = dot(nits, BT2020_LUMA);
+    float mapped = tone_map_sdr_linear(luma);
+    float scale = luma > 0.0001 ? mapped / luma : 0.0;
+    vec3 linear709 = bt2020_to_bt709(nits * scale);
+    return vec3(
+        linear_to_bt709(linear709.r),
+        linear_to_bt709(linear709.g),
+        linear_to_bt709(linear709.b));
+}
+
+float pq_luma_to_sdr(float pq_luma) {
+    float x = clamp(pq_luma, 0.0, 1.0);
+    return map_hdr_luma_to_sdr(x);
+}
+
+vec3 bt2020_to_bt709_code(vec3 rgb2020_pq) {
+    return clamp(vec3(
+         1.6605 * rgb2020_pq.r - 0.5876 * rgb2020_pq.g - 0.0728 * rgb2020_pq.b,
+        -0.1246 * rgb2020_pq.r + 1.1329 * rgb2020_pq.g - 0.0083 * rgb2020_pq.b,
+        -0.0182 * rgb2020_pq.r - 0.1006 * rgb2020_pq.g + 1.1187 * rgb2020_pq.b),
+        0.0, 1.0);
+}
+
+vec3 fast_hdr2020_pq_to_sdr709(vec3 rgb2020_pq, float pq_luma) {
+    vec3 rgb709 = bt2020_to_bt709_code(rgb2020_pq);
+    float old_y = max(dot(rgb709, RGB_TO_Y709), 0.0001);
+    float mapped_y = pq_luma_to_sdr(pq_luma);
+    float chroma_scale = clamp(mapped_y / old_y, 0.35, 1.8) * 1.08;
+    return clamp(vec3(mapped_y) + (rgb709 - vec3(old_y)) * chroma_scale, 0.0, 1.0);
+}
+
+float encode_y709(vec3 rgb709) {
+    return clamp((16.0 + dot(rgb709, RGB_TO_Y709) * 219.0) / 255.0, 0.0, 1.0);
+}
+
+vec2 encode_vu709(vec3 rgb709) {
+    float cb = dot(rgb709, RGB_TO_CB709);
+    float cr = dot(rgb709, RGB_TO_CR709);
+    return clamp(vec2((128.0 + cr * 224.0) / 255.0,
+                      (128.0 + cb * 224.0) / 255.0),
+                 0.0, 1.0);
+}
+
+vec3 sample_hdr_sdr_rgb(uint local_x, uint local_y) {
+    uint src_x = scale_nearest(src_local_x(local_x), pc.src_w, pc.y_scale_x);
+    uint src_y = scale_nearest(src_local_y(local_y), pc.src_h, pc.y_scale_y);
+    uint y_word = read_u16(src_y * pc.y_stride + src_x * 2u);
+    float y10 = float((y_word >> 6) & 0x3FFu);
+    uint src_uv_w = max((pc.src_w + 1u) >> 1, 1u);
+    uint src_uv_h = max((pc.src_h + 1u) >> 1, 1u);
+    uint src_uv_x = min(src_x >> 1, src_uv_w - 1u);
+    uint src_uv_y = min(src_y >> 1, src_uv_h - 1u);
+    uint uv_addr = pc.uv_offset + src_uv_y * pc.uv_stride + src_uv_x * 4u;
+    float u10 = float((read_u16(uv_addr) >> 6) & 0x3FFu);
+    float v10 = float((read_u16(uv_addr + 2u) >> 6) & 0x3FFu);
+    float y = clamp((y10 - 64.0) / 876.0, 0.0, 1.0);
+    float cb = clamp((u10 - 512.0) / 896.0, -0.5, 0.5);
+    float cr = clamp((v10 - 512.0) / 896.0, -0.5, 0.5);
+    vec3 rgb2020_pq = clamp(vec3(
+        y + 1.4746 * cr,
+        y - 0.16455 * cb - 0.57135 * cr,
+        y + 1.8814 * cb), 0.0, 1.0);
+    return fast_hdr2020_pq_to_sdr709(rgb2020_pq, y);
+}
+
+float map_y10(uint y10, bool hdr_enabled) {
+    if (!hdr_enabled)
+        return apply_basic_luma_filters(clamp(float(y10) * (1.0 / 1020.0), 0.0, 1.0));
+    float mapped_y = clamp((float(y10) - 188.83) * (1.86 / 876.0) + pc.hdr_brightness, 0.0, 0.996853);
+    return apply_basic_luma_filters((16.0 / 255.0) + mapped_y * (219.0 / 255.0));
+}
+
+vec2 adjust_hdr_chroma(vec2 vu) {
+    vec2 chroma = (vu - vec2(SDR_CHROMA_NEUTRAL)) * max(pc.hdr_saturation, 0.0);
+    vec2 rotated = vec2(
+        pc.hdr_hue_cos * chroma.x - pc.hdr_hue_sin * chroma.y,
+        pc.hdr_hue_sin * chroma.x + pc.hdr_hue_cos * chroma.y);
+    return clamp(vec2(SDR_CHROMA_NEUTRAL) + rotated, 0.0, 1.0);
+}
+
+float sample_y_src(uint src_x, uint src_y, bool hdr_enabled) {
+    return map_y10(read_y10_at(src_x, src_y), hdr_enabled);
+}
+
+float sample_y(uint local_x, uint local_y, bool hdr_enabled) {
+    uint src_x = scale_nearest(src_local_x(local_x), pc.src_w, pc.y_scale_x);
+    uint src_y = scale_nearest(src_local_y(local_y), pc.src_h, pc.y_scale_y);
+    return sample_y_src(src_x, src_y, hdr_enabled);
+}
+
+vec2 map_vu10(uint u10, uint v10, bool hdr_enabled) {
+    if (!hdr_enabled)
+        return apply_basic_chroma_filters(vec2(float(v10) / 1023.0, float(u10) / 1023.0));
+
+    return clamp(vec2((512.0 + (float(v10) - 512.0) * 1.0) / 1023.0,
+                      (512.0 + (float(u10) - 512.0) * 1.0) / 1023.0),
+                 0.0, 1.0);
+}
+
+vec2 sample_vu(uint local_uv_x, uint local_uv_y, bool hdr_enabled) {
+    uint src_uv_w = max((pc.src_w + 1u) >> 1, 1u);
+    uint src_uv_h = max((pc.src_h + 1u) >> 1, 1u);
+    local_uv_x = src_local_uv_x(local_uv_x);
+    local_uv_y = src_local_uv_y(local_uv_y);
+    uint src_uv_x = scale_nearest(local_uv_x, src_uv_w, pc.uv_scale_x);
+    uint src_uv_y = scale_nearest(local_uv_y, src_uv_h, pc.uv_scale_y);
+    uint uv_addr = pc.uv_offset + src_uv_y * pc.uv_stride + src_uv_x * 4u;
+    uint u10 = (read_u16(uv_addr) >> 6) & 0x3FFu;
+    uint v10 = (read_u16(uv_addr + 2u) >> 6) & 0x3FFu;
+    if (!hdr_enabled)
+        return map_vu10(u10, v10, false);
+
+    float v = (128.0 / 255.0) + (float(v10) - 512.0) * (2.60 / 1020.0);
+    float u = (128.0 / 255.0) + (float(u10) - 512.0) * (1.80 / 1020.0);
+    return apply_basic_chroma_filters(adjust_hdr_chroma(vec2(v, u)));
+}
+
+void main() {
+    bool full_canvas = (pc.flags & FLAG_FULL_CANVAS) != 0u;
+    uvec2 base = gl_GlobalInvocationID.xy * 2u;
+    uint limit_w = full_canvas ? pc.canvas_width : pc.dst_w;
+    uint limit_h = full_canvas ? pc.canvas_height : pc.dst_h;
+    if (base.x >= limit_w || base.y >= limit_h) return;
+    bool hdr_enabled = hdr_sdr_enabled();
+
+    ivec2 dst_base = full_canvas
+        ? ivec2(int(base.x), int(base.y))
+        : ivec2(pc.dst_x + int(base.x), pc.dst_y + int(base.y));
+
+    if (full_canvas && pc.opacity >= 0.999 &&
+        dst_base.x >= pc.dst_x && dst_base.y >= pc.dst_y &&
+        dst_base.x + 1 < pc.dst_x + int(pc.dst_w) &&
+        dst_base.y + 1 < pc.dst_y + int(pc.dst_h)) {
+        uint local_x0 = uint(dst_base.x - pc.dst_x);
+        uint local_y0 = uint(dst_base.y - pc.dst_y);
+        uint local_x1 = local_x0 + 1u;
+        uint local_y1 = local_y0 + 1u;
+        uint src_x0 = scale_nearest(local_x0, pc.src_w, pc.y_scale_x);
+        uint src_x1 = scale_nearest(local_x1, pc.src_w, pc.y_scale_x);
+        uint src_y0 = scale_nearest(local_y0, pc.src_h, pc.y_scale_y);
+        uint src_y1 = scale_nearest(local_y1, pc.src_h, pc.y_scale_y);
+        imageStore(y_img, dst_base, vec4(sample_y_src(src_x0, src_y0, hdr_enabled), 0.0, 0.0, 1.0));
+        imageStore(y_img, dst_base + ivec2(1, 0), vec4(sample_y_src(src_x1, src_y0, hdr_enabled), 0.0, 0.0, 1.0));
+        imageStore(y_img, dst_base + ivec2(0, 1), vec4(sample_y_src(src_x0, src_y1, hdr_enabled), 0.0, 0.0, 1.0));
+        imageStore(y_img, dst_base + ivec2(1, 1), vec4(sample_y_src(src_x1, src_y1, hdr_enabled), 0.0, 0.0, 1.0));
+
+        uint local_uv_x = uint(dst_base.x + 1 - pc.dst_x) >> 1;
+        uint local_uv_y = uint(dst_base.y + 1 - pc.dst_y) >> 1;
+        imageStore(uv_img, dst_base >> 1,
+                   vec4(sample_vu(local_uv_x, local_uv_y, hdr_enabled), 0.0, 1.0));
+        return;
+    }
+
+    if (!full_canvas && pc.opacity >= 0.999 && dst_in_bounds()) {
+        uint x1 = min(base.x + 1u, limit_w - 1u);
+        uint y1 = min(base.y + 1u, limit_h - 1u);
+        uint src_x0 = scale_nearest(src_local_x(base.x), pc.src_w, pc.y_scale_x);
+        uint src_x1 = scale_nearest(src_local_x(x1), pc.src_w, pc.y_scale_x);
+        uint src_y0 = scale_nearest(src_local_y(base.y), pc.src_h, pc.y_scale_y);
+        uint src_y1 = scale_nearest(src_local_y(y1), pc.src_h, pc.y_scale_y);
+
+        imageStore(y_img, dst_base, vec4(sample_y_src(src_x0, src_y0, hdr_enabled), 0.0, 0.0, 1.0));
+        if (base.x + 1u < limit_w)
+            imageStore(y_img, dst_base + ivec2(1, 0), vec4(sample_y_src(src_x1, src_y0, hdr_enabled), 0.0, 0.0, 1.0));
+        if (base.y + 1u < limit_h) {
+            imageStore(y_img, dst_base + ivec2(0, 1), vec4(sample_y_src(src_x0, src_y1, hdr_enabled), 0.0, 0.0, 1.0));
+            if (base.x + 1u < limit_w)
+                imageStore(y_img, dst_base + ivec2(1, 1), vec4(sample_y_src(src_x1, src_y1, hdr_enabled), 0.0, 0.0, 1.0));
+        }
+
+        imageStore(uv_img, dst_base >> 1, vec4(sample_vu(base.x >> 1, base.y >> 1, hdr_enabled), 0.0, 1.0));
+        return;
+    }
+
+    for (uint yy = 0u; yy < 2u; yy++) {
+        uint pos_y = base.y + yy;
+        if (pos_y >= limit_h) continue;
+
+        for (uint xx = 0u; xx < 2u; xx++) {
+            uint pos_x = base.x + xx;
+            if (pos_x >= limit_w) continue;
+
+            ivec2 dst = full_canvas
+                ? ivec2(int(pos_x), int(pos_y))
+                : ivec2(pc.dst_x + int(pos_x), pc.dst_y + int(pos_y));
+            if (dst.x < 0 || dst.y < 0 ||
+                dst.x >= int(pc.canvas_width) || dst.y >= int(pc.canvas_height)) continue;
+
+            bool inside = true;
+            uint local_x = pos_x;
+            uint local_y = pos_y;
+            if (full_canvas) {
+                inside = dst.x >= pc.dst_x && dst.y >= pc.dst_y &&
+                         dst.x < pc.dst_x + int(pc.dst_w) &&
+                         dst.y < pc.dst_y + int(pc.dst_h);
+                if (inside) {
+                    local_x = uint(dst.x - pc.dst_x);
+                    local_y = uint(dst.y - pc.dst_y);
+                }
+            }
+
+            float y = inside ? sample_y(local_x, local_y, hdr_enabled) : pc.bg_y;
+            if (pc.opacity >= 0.999) {
+                imageStore(y_img, dst, vec4(y, 0.0, 0.0, 1.0));
+            } else {
+                float old_y = imageLoad(y_img, dst).r;
+                imageStore(y_img, dst, vec4(mix(old_y, y, pc.opacity), 0.0, 0.0, 1.0));
+            }
+        }
+    }
+
+    ivec2 uv_dst = full_canvas ? ivec2(int(base.x >> 1), int(base.y >> 1))
+                               : (dst_base >> 1);
+    if (uv_dst.x >= 0 && uv_dst.y >= 0 &&
+        uv_dst.x < int(pc.canvas_width >> 1) &&
+        uv_dst.y < int(pc.canvas_height >> 1) &&
+        (full_canvas || (dst_base.x >= 0 && dst_base.y >= 0 &&
+         dst_base.x < int(pc.canvas_width) && dst_base.y < int(pc.canvas_height)))) {
+        bool uv_inside = true;
+        uint local_uv_x = base.x >> 1;
+        uint local_uv_y = base.y >> 1;
+        if (full_canvas) {
+            ivec2 uv_sample = ivec2(int(base.x + 1u), int(base.y + 1u));
+            uv_inside = uv_sample.x >= pc.dst_x && uv_sample.y >= pc.dst_y &&
+                        uv_sample.x < pc.dst_x + int(pc.dst_w) &&
+                        uv_sample.y < pc.dst_y + int(pc.dst_h);
+            if (uv_inside) {
+                local_uv_x = uint(uv_sample.x - pc.dst_x) >> 1;
+                local_uv_y = uint(uv_sample.y - pc.dst_y) >> 1;
+            }
+        }
+
+        vec2 vu = uv_inside ? sample_vu(local_uv_x, local_uv_y, hdr_enabled)
+                            : vec2(pc.bg_v, pc.bg_u);
+        if (pc.opacity >= 0.999) {
+            imageStore(uv_img, uv_dst, vec4(vu, 0.0, 1.0));
+        } else {
+            vec2 old_uv = imageLoad(uv_img, uv_dst).rg;
+            imageStore(uv_img, uv_dst, vec4(mix(old_uv, vu, pc.opacity), 0.0, 1.0));
+        }
+    }
+}

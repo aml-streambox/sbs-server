@@ -1,0 +1,51 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, r8) uniform readonly image2D src_y_img;
+layout(set = 0, binding = 1, rg8) uniform readonly image2D src_uv_img;
+layout(set = 0, binding = 2, r8) uniform writeonly image2D dst_y_img;
+layout(set = 0, binding = 3, rg8) uniform writeonly image2D dst_uv_img;
+
+layout(push_constant) uniform PushConstants {
+    uint src_w;
+    uint src_h;
+    uint dst_w;
+    uint dst_h;
+} pc;
+
+uint scale_nearest(uint pos, uint src_extent, uint dst_extent) {
+    if (src_extent <= 1u || dst_extent <= 1u) return 0u;
+    float f = (float(pos) + 0.5) * float(src_extent) / float(dst_extent);
+    return min(uint(f), src_extent - 1u);
+}
+
+void write_y(uint x, uint y) {
+    if (x >= pc.dst_w || y >= pc.dst_h) return;
+    uint sx = scale_nearest(x, pc.src_w, pc.dst_w);
+    uint sy = scale_nearest(y, pc.src_h, pc.dst_h);
+    imageStore(dst_y_img, ivec2(x, y), imageLoad(src_y_img, ivec2(sx, sy)));
+}
+
+void main() {
+    uvec2 base = gl_GlobalInvocationID.xy * 2u;
+    if (base.x >= pc.dst_w || base.y >= pc.dst_h) return;
+
+    write_y(base.x, base.y);
+    write_y(base.x + 1u, base.y);
+    write_y(base.x, base.y + 1u);
+    write_y(base.x + 1u, base.y + 1u);
+
+    uint src_uv_w = max(pc.src_w >> 1u, 1u);
+    uint src_uv_h = max(pc.src_h >> 1u, 1u);
+    uint dst_uv_w = max(pc.dst_w >> 1u, 1u);
+    uint dst_uv_h = max(pc.dst_h >> 1u, 1u);
+    uint dst_uv_x = base.x >> 1u;
+    uint dst_uv_y = base.y >> 1u;
+    if (dst_uv_x >= dst_uv_w || dst_uv_y >= dst_uv_h) return;
+
+    uint src_uv_x = scale_nearest(dst_uv_x, src_uv_w, dst_uv_w);
+    uint src_uv_y = scale_nearest(dst_uv_y, src_uv_h, dst_uv_h);
+    imageStore(dst_uv_img, ivec2(dst_uv_x, dst_uv_y),
+               imageLoad(src_uv_img, ivec2(src_uv_x, src_uv_y)));
+}

@@ -1,0 +1,105 @@
+#version 450
+
+/*
+ * RGBA → NV21 compute shader (reverse of yuv_to_rgba.comp)
+ *
+ * Reads RGBA from a storage image (the compositor render target),
+ * writes NV21 to an SSBO (DMA-BUF backed buffer for amlvenc).
+ *
+ * BT.601 full-range coefficients matching the existing CPU conversion.
+ *
+ * Y plane:  width × height bytes, one Y per pixel
+ * VU plane: width × (height/2) bytes, one VU pair per 2×2 block
+ * NV21 = VU order (V first, then U)
+ *
+ * IMPORTANT: The output buffer must be zeroed (vkCmdFillBuffer) before dispatch,
+ * because we use atomicOr to pack bytes into uint32 words.
+ */
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, rgba8) uniform readonly image2D in_img;
+
+layout(std430, set = 0, binding = 1) buffer NV21Buf {
+    uint data[];
+} nv21_buf;
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint y_stride;
+    uint uv_stride;
+    uint uv_offset;
+} pc;
+
+shared vec4 tile_rgba[17][17];
+
+const vec3 kRgbToY  = vec3(0.299, 0.587, 0.114);
+const vec3 kRgbToCb = vec3(-0.168736, -0.331264, 0.5);
+const vec3 kRgbToCr = vec3(0.5, -0.418688, -0.081312);
+
+void write_byte(uint byte_addr, uint val) {
+    uint word_idx = byte_addr >> 2u;
+    uint byte_in_word = byte_addr & 3u;
+    uint shift = byte_in_word * 8u;
+    atomicOr(nv21_buf.data[word_idx], (val & 0xFFu) << shift);
+}
+
+vec4 load_clamped_rgba(uvec2 coord) {
+    return imageLoad(in_img, ivec2(min(coord.x, pc.width - 1u), min(coord.y, pc.height - 1u)));
+}
+
+void main() {
+    uvec2 coord = gl_GlobalInvocationID.xy;
+    if (coord.x >= pc.width || coord.y >= pc.height) return;
+
+    uvec2 local = gl_LocalInvocationID.xy;
+
+    tile_rgba[local.y][local.x] = imageLoad(in_img, ivec2(coord));
+
+    if (local.x == 15u) {
+        tile_rgba[local.y][16] = load_clamped_rgba(uvec2(coord.x + 1u, coord.y));
+    }
+    if (local.y == 15u) {
+        tile_rgba[16][local.x] = load_clamped_rgba(uvec2(coord.x, coord.y + 1u));
+    }
+    if (local.x == 15u && local.y == 15u) {
+        tile_rgba[16][16] = load_clamped_rgba(uvec2(coord.x + 1u, coord.y + 1u));
+    }
+
+    barrier();
+
+    vec4 rgba = tile_rgba[local.y][local.x];
+
+    vec3 rgb255 = rgba.rgb * 255.0;
+
+    /* BT.601 full-range RGB → YCbCr */
+    float Y = dot(rgb255, kRgbToY);
+
+    /* Write Y */
+    uint y_byte = coord.y * pc.y_stride + coord.x;
+    write_byte(y_byte, uint(clamp(Y, 0.0, 255.0)));
+
+    /* Write VU for top-left pixel of each 2×2 block only */
+    if ((coord.x & 1u) == 0u && (coord.y & 1u) == 0u) {
+        /* Average 2×2 block for chroma */
+        vec4 r00 = rgba;
+        vec4 r10 = (coord.x + 1u < pc.width) ? tile_rgba[local.y][local.x + 1u] : r00;
+        vec4 r01 = (coord.y + 1u < pc.height) ? tile_rgba[local.y + 1u][local.x] : r00;
+        vec4 r11 = (coord.x + 1u < pc.width && coord.y + 1u < pc.height)
+                    ? tile_rgba[local.y + 1u][local.x + 1u] : r00;
+
+        vec3 avg_rgb255 = (r00.rgb + r10.rgb + r01.rgb + r11.rgb) * 63.75;
+
+        float Cb = dot(avg_rgb255, kRgbToCb) + 128.0;
+        float Cr = dot(avg_rgb255, kRgbToCr) + 128.0;
+
+        uint uv_row = coord.y >> 1u;
+        uint uv_col = coord.x >> 1u;
+        uint uv_byte = pc.uv_offset + uv_row * pc.uv_stride + uv_col * 2u;
+
+        /* NV21: V first, then U */
+        write_byte(uv_byte,      uint(clamp(Cr, 0.0, 255.0)));
+        write_byte(uv_byte + 1u, uint(clamp(Cb, 0.0, 255.0)));
+    }
+}

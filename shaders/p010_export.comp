@@ -1,0 +1,85 @@
+#version 450
+
+/*
+ * P010 compute conversion — RGBA render target to P010 (BT.2020 HDR10).
+ *
+ * Each invocation processes one 2x2 pixel block:
+ *   - Reads 4 RGBA pixels from the composed render target
+ *   - Writes 2 packed Y words (4 Y values, 10-bit left-shifted by 6)
+ *   - Writes 1 packed CbCr word (averaged chroma)
+ *
+ * No atomics needed — each invocation owns its output words exclusively.
+ * Targets a HOST_VISIBLE SSBO (not DMA-BUF), so Mali G52 compute works.
+ *
+ * Dispatch: local_size = (8, 8), grid = ((w+15)/16, (h+15)/16)
+ *   where w = width/2, h = height/2 (block coordinates).
+ */
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_image;
+
+layout(std430, set = 0, binding = 1) buffer P010Output {
+    uint data[];
+} p010;
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint y_stride;
+    uint uv_stride;
+    uint uv_offset;
+    float inv_width;
+    float inv_height;
+} pc;
+
+const vec3 kRgbToY  = vec3(0.2627, 0.6780, 0.0593);
+const vec3 kRgbToCb = vec3(-0.1396, -0.3604, 0.5);
+const vec3 kRgbToCr = vec3(0.5, -0.4598, -0.0402);
+
+vec3 sample_at(uint x, uint y) {
+    vec2 uv = (vec2(float(x), float(y)) + 0.5) * vec2(pc.inv_width, pc.inv_height);
+    return textureLod(u_image, uv, 0.0).rgb;
+}
+
+uint to_y10(vec3 rgb) {
+    float y = dot(rgb, kRgbToY);
+    return uint(clamp(round(y * 1023.0), 0.0, 1023.0)) << 6u;
+}
+
+void main() {
+    uint bx = gl_GlobalInvocationID.x;
+    uint by = gl_GlobalInvocationID.y;
+    uint x0 = bx * 2u;
+    uint y0 = by * 2u;
+
+    if (x0 >= pc.width || y0 >= pc.height) return;
+
+    uint x1 = min(x0 + 1u, pc.width - 1u);
+    uint y1 = min(y0 + 1u, pc.height - 1u);
+
+    vec3 c00 = sample_at(x0, y0);
+    vec3 c10 = sample_at(x1, y0);
+    vec3 c01 = sample_at(x0, y1);
+    vec3 c11 = sample_at(x1, y1);
+
+    uint y00 = to_y10(c00);
+    uint y10 = to_y10(c10);
+    uint y01 = to_y10(c01);
+    uint y11 = to_y10(c11);
+
+    p010.data[(y0 * pc.y_stride + x0) / 2u] = y00 | (y10 << 16u);
+
+    if (y0 + 1u < pc.height) {
+        p010.data[(y1 * pc.y_stride + x0) / 2u] = y01 | (y11 << 16u);
+    }
+
+    vec3 avg = (c00 + c10 + c01 + c11) * 0.25;
+    float cb = dot(avg, kRgbToCb);
+    float cr = dot(avg, kRgbToCr);
+    uint cb10 = uint(clamp(round((cb + 0.5) * 1023.0), 0.0, 1023.0)) << 6u;
+    uint cr10 = uint(clamp(round((cr + 0.5) * 1023.0), 0.0, 1023.0)) << 6u;
+
+    uint uv_byte = pc.uv_offset + (by * pc.uv_stride + bx * 2u) * 2u;
+    p010.data[uv_byte / 4u] = cb10 | (cr10 << 16u);
+}

@@ -1,0 +1,18 @@
+api_sources = files(
+    'ws_server.c',
+    'jsonrpc.c',
+    'pubsub.c',
+    'handlers/system.c',
+    'handlers/command.c',
+    'handlers/preview.c',
+    'handlers/source.c',
+    'handlers/audio.c',
+    'handlers/config.c',
+    'handlers/scene.c',
+    'handlers/snapshot.c',
+    'handlers/output.c',
+    'handlers/canvas.c',
+    'handlers/pubsub.c',
+    'handlers/instance.c',
+    'handlers/encoder.c',
+)

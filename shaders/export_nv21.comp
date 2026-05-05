@@ -1,0 +1,92 @@
+#version 450
+
+/*
+ * Destination-oriented NV21 export compute shader
+ *
+ * Uses a combined image sampler (not storage image) to sample the
+ * composed RGBA render target with hardware bilinear filtering.
+ * This fuses resize + RGBA→NV21 conversion into a single GPU pass,
+ * eliminating the separate blit step for preview export.
+ *
+ * Push constants specify both source and destination dimensions,
+ * allowing a single shader to handle any resolution combination:
+ * - Output: 1920x1080 → 1920x1080 (identity)
+ * - Preview: 1920x1080 → 640x360 (downscale with bilinear)
+ *
+ * NV21 layout: Y plane (w*h bytes) + VU plane (w*h/2 bytes)
+ * Uses atomicOr for byte packing into uint32 words.
+ * Buffer must be zeroed (vkCmdFillBuffer) before dispatch.
+ *
+ * BT.601 full-range coefficients.
+ */
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform sampler2D in_tex;
+
+layout(std430, set = 0, binding = 1) buffer NV21Buf {
+    uint data[];
+} nv21_buf;
+
+layout(push_constant) uniform PushConstants {
+    uint dst_width;
+    uint dst_height;
+    uint y_stride;
+    uint uv_stride;
+    uint uv_offset;
+    /* Source dimensions for computing sample coordinates */
+    float inv_dst_width;   /* 1.0 / dst_width */
+    float inv_dst_height;  /* 1.0 / dst_height */
+} pc;
+
+const vec3 kRgbToY  = vec3(0.299, 0.587, 0.114);
+const vec3 kRgbToCb = vec3(-0.168736, -0.331264, 0.5);
+const vec3 kRgbToCr = vec3(0.5, -0.418688, -0.081312);
+
+void write_byte(uint byte_addr, uint val) {
+    uint word_idx = byte_addr >> 2u;
+    uint byte_in_word = byte_addr & 3u;
+    uint shift = byte_in_word * 8u;
+    atomicOr(nv21_buf.data[word_idx], (val & 0xFFu) << shift);
+}
+
+void main() {
+    uvec2 coord = gl_GlobalInvocationID.xy;
+    if (coord.x >= pc.dst_width || coord.y >= pc.dst_height) return;
+
+    /* Compute normalized UV for sampling the source texture.
+     * Add 0.5 pixel offset for center-of-pixel sampling. */
+    vec2 uv = (vec2(coord) + 0.5) * vec2(pc.inv_dst_width, pc.inv_dst_height);
+    vec4 rgba = texture(in_tex, uv);
+
+    vec3 rgb255 = rgba.rgb * 255.0;
+    float Y = dot(rgb255, kRgbToY);
+
+    /* Write Y */
+    uint y_byte = coord.y * pc.y_stride + coord.x;
+    write_byte(y_byte, uint(clamp(Y, 0.0, 255.0)));
+
+    /* Write VU for top-left pixel of each 2×2 block */
+    if ((coord.x & 1u) == 0u && (coord.y & 1u) == 0u) {
+        /* Sample the 2x2 block's neighbor pixels for chroma averaging */
+        vec2 uv10 = (vec2(coord) + vec2(1.5, 0.5)) * vec2(pc.inv_dst_width, pc.inv_dst_height);
+        vec2 uv01 = (vec2(coord) + vec2(0.5, 1.5)) * vec2(pc.inv_dst_width, pc.inv_dst_height);
+        vec2 uv11 = (vec2(coord) + vec2(1.5, 1.5)) * vec2(pc.inv_dst_width, pc.inv_dst_height);
+
+        vec4 r10 = texture(in_tex, uv10);
+        vec4 r01 = texture(in_tex, uv01);
+        vec4 r11 = texture(in_tex, uv11);
+
+        vec3 avg_rgb255 = (rgba.rgb + r10.rgb + r01.rgb + r11.rgb) * 63.75;
+
+        float Cb = dot(avg_rgb255, kRgbToCb) + 128.0;
+        float Cr = dot(avg_rgb255, kRgbToCr) + 128.0;
+
+        uint uv_row = coord.y >> 1u;
+        uint uv_col = coord.x >> 1u;
+        uint uv_byte = pc.uv_offset + uv_row * pc.uv_stride + uv_col * 2u;
+
+        write_byte(uv_byte,      uint(clamp(Cr, 0.0, 255.0)));
+        write_byte(uv_byte + 1u, uint(clamp(Cb, 0.0, 255.0)));
+    }
+}

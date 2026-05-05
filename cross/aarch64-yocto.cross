@@ -1,0 +1,16 @@
+[binaries]
+c = 'aarch64-linux-gnu-gcc'
+cpp = 'aarch64-linux-gnu-g++'
+ar = 'aarch64-linux-gnu-ar'
+strip = 'aarch64-linux-gnu-strip'
+pkgconfig = 'pkg-config'
+
+[built-in options]
+c_args = ['--sysroot=/usr/aarch64-linux-gnu', '-D_GNU_SOURCE']
+c_link_args = ['--sysroot=/usr/aarch64-linux-gnu']
+
+[host_machine]
+system = 'linux'
+cpu_family = 'aarch64'
+cpu = 'cortex-a73'
+endian = 'little'

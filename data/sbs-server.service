@@ -1,0 +1,33 @@
+[Unit]
+Description=StreamBox Broadcast System
+After=network-online.target weston.service audioserver.service
+Wants=network-online.target
+Conflicts=audioserver.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+ExecStart=/usr/bin/sbs-server
+ExecStop=/bin/kill -SIGTERM $MAINPID
+TimeoutStopSec=15
+
+Restart=on-failure
+RestartSec=3
+
+LimitNOFILE=4096
+LimitMEMLOCK=infinity
+
+Environment=GST_DEBUG=2
+Environment=VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/mali.json
+Environment=XDG_RUNTIME_DIR=/run/sbs
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sbs-server
+
+[Install]
+WantedBy=multi-user.target

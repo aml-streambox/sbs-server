@@ -1,0 +1,20 @@
+/*
+ * SBS - StreamBox Broadcast System
+ * Auto-generated version header — do not edit
+ */
+#ifndef SBS_VERSION_H
+#define SBS_VERSION_H
+
+#define SBS_VERSION_MAJOR   @SBS_VERSION_MAJOR@
+#define SBS_VERSION_MINOR   @SBS_VERSION_MINOR@
+#define SBS_VERSION_PATCH   @SBS_VERSION_PATCH@
+#define SBS_VERSION_STRING  @SBS_VERSION_STRING@
+#define SBS_BUILD_DATE      @SBS_BUILD_DATE@
+
+#define SBS_VERSION_CHECK(major, minor, patch) \
+    ((major) < SBS_VERSION_MAJOR || \
+     ((major) == SBS_VERSION_MAJOR && (minor) < SBS_VERSION_MINOR) || \
+     ((major) == SBS_VERSION_MAJOR && (minor) == SBS_VERSION_MINOR && \
+      (patch) <= SBS_VERSION_PATCH))
+
+#endif /* SBS_VERSION_H */

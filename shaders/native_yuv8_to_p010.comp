@@ -1,0 +1,245 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer SrcYUV8 {
+    uint data[];
+} src;
+layout(set = 0, binding = 1, r16) uniform image2D y_img;
+layout(set = 0, binding = 2, rg16) uniform image2D uv_img;
+
+layout(push_constant) uniform PushConstants {
+    uint canvas_width;
+    uint canvas_height;
+    int dst_x;
+    int dst_y;
+    uint dst_w;
+    uint dst_h;
+    uint src_w;
+    uint src_h;
+    float opacity;
+    uint flags;
+    uint y_stride;
+    uint uv_stride;
+    uint uv_offset;
+    float y_scale_x;
+    float y_scale_y;
+    float uv_scale_x;
+    float uv_scale_y;
+    float bg_y;
+    float bg_u;
+    float bg_v;
+    uint filter_flags;
+    float hdr_to_sdr_amount;
+    uint pad0;
+    uint pad1;
+} pc;
+
+const uint FLAG_FULL_CANVAS = 1u;
+const uint FLAG_SOURCE_NV21 = 4u;
+const uint FLAG_DST_IN_BOUNDS = 8u;
+const uint FILTER_HDR_TO_SDR = 32u;
+const float HDR_Y_OFFSET = 64.0 / 1023.0;
+const float HDR_Y_SCALE = 876.0 / (1023.0 * 255.0);
+const float HDR_UV_OFFSET = 64.0 / 1023.0;
+const float HDR_UV_SCALE = 896.0 / (1023.0 * 255.0);
+
+bool source_is_nv21() { return (pc.flags & FLAG_SOURCE_NV21) != 0u; }
+bool dst_in_bounds() { return (pc.flags & FLAG_DST_IN_BOUNDS) != 0u; }
+bool filter_hdr_to_sdr() { return (pc.filter_flags & FILTER_HDR_TO_SDR) != 0u; }
+
+float direct_hdr_amount() {
+    return filter_hdr_to_sdr() ? clamp(pc.hdr_to_sdr_amount, 0.0, 1.0) : 0.0;
+}
+
+float tone_map_y8_value(float y8) {
+    float amount = direct_hdr_amount();
+    if (amount <= 0.0) return y8;
+    float contrast = mix(1.0, 1.35, amount);
+    float lift = mix(0.0, -7.6, amount);
+    return clamp((y8 - 128.0) * contrast + 128.0 + lift, 0.0, 255.0);
+}
+
+vec2 tone_map_uv8_values(vec2 uv8) {
+    float amount = direct_hdr_amount();
+    if (amount <= 0.0) return uv8;
+    float sat = mix(1.0, 1.35, amount);
+    return clamp(vec2(128.0) + (uv8 - vec2(128.0)) * sat, 0.0, 255.0);
+}
+
+uint read_u8(uint byte_addr) {
+    uint word = src.data[byte_addr >> 2];
+    return (word >> ((byte_addr & 3u) * 8u)) & 0xFFu;
+}
+
+uint scale_nearest(uint pos, uint src_extent, float scale) {
+    if (src_extent <= 1u) return 0u;
+    float f = (float(pos) + 0.5) * scale;
+    uint v = uint(f);
+    return min(v, src_extent - 1u);
+}
+
+float sample_hdr_y(uint local_x, uint local_y) {
+    uint src_x = scale_nearest(local_x, pc.src_w, pc.y_scale_x);
+    uint src_y = scale_nearest(local_y, pc.src_h, pc.y_scale_y);
+    return HDR_Y_OFFSET + tone_map_y8_value(float(read_u8(src_y * pc.y_stride + src_x))) * HDR_Y_SCALE;
+}
+
+vec2 sample_hdr_uv(uint local_uv_x, uint local_uv_y) {
+    /* Fast overlay path: map 8-bit YUV ranges into P010 without an RGB round-trip. */
+    uint src_uv_w = max((pc.src_w + 1u) >> 1, 1u);
+    uint src_uv_h = max((pc.src_h + 1u) >> 1, 1u);
+    uint src_uv_x = scale_nearest(local_uv_x, src_uv_w, pc.uv_scale_x);
+    uint src_uv_y = scale_nearest(local_uv_y, src_uv_h, pc.uv_scale_y);
+    uint uv_addr = pc.uv_offset + src_uv_y * pc.uv_stride + src_uv_x * 2u;
+    float a = float(read_u8(uv_addr));
+    float b = float(read_u8(uv_addr + 1u));
+    float u = source_is_nv21() ? b : a;
+    float v = source_is_nv21() ? a : b;
+    return HDR_UV_OFFSET + tone_map_uv8_values(vec2(u, v)) * HDR_UV_SCALE;
+}
+
+void main() {
+    bool full_canvas = (pc.flags & FLAG_FULL_CANVAS) != 0u;
+    uvec2 base = gl_GlobalInvocationID.xy * 2u;
+    uint limit_w = full_canvas ? pc.canvas_width : pc.dst_w;
+    uint limit_h = full_canvas ? pc.canvas_height : pc.dst_h;
+    if (base.x >= limit_w || base.y >= limit_h) return;
+
+    ivec2 dst_base = full_canvas
+        ? ivec2(int(base.x), int(base.y))
+        : ivec2(pc.dst_x + int(base.x), pc.dst_y + int(base.y));
+
+    if (!full_canvas && pc.opacity >= 0.999 && dst_in_bounds()) {
+        uint x0 = base.x;
+        uint y0 = base.y;
+        uint x1 = min(base.x + 1u, limit_w - 1u);
+        uint y1 = min(base.y + 1u, limit_h - 1u);
+        uint src_x0 = scale_nearest(x0, pc.src_w, pc.y_scale_x);
+        uint src_x1 = scale_nearest(x1, pc.src_w, pc.y_scale_x);
+        uint src_y0 = scale_nearest(y0, pc.src_h, pc.y_scale_y);
+        uint src_y1 = scale_nearest(y1, pc.src_h, pc.y_scale_y);
+        ivec2 dst = dst_base;
+
+        float y00 = HDR_Y_OFFSET +
+            tone_map_y8_value(float(read_u8(src_y0 * pc.y_stride + src_x0))) * HDR_Y_SCALE;
+        imageStore(y_img, dst, vec4(y00, 0.0, 0.0, 1.0));
+
+        if (base.x + 1u < limit_w) {
+            float y10 = HDR_Y_OFFSET +
+                tone_map_y8_value(float(read_u8(src_y0 * pc.y_stride + src_x1))) * HDR_Y_SCALE;
+            imageStore(y_img, dst + ivec2(1, 0), vec4(y10, 0.0, 0.0, 1.0));
+        }
+        if (base.y + 1u < limit_h) {
+            float y01 = HDR_Y_OFFSET +
+                tone_map_y8_value(float(read_u8(src_y1 * pc.y_stride + src_x0))) * HDR_Y_SCALE;
+            imageStore(y_img, dst + ivec2(0, 1), vec4(y01, 0.0, 0.0, 1.0));
+            if (base.x + 1u < limit_w) {
+                float y11 = HDR_Y_OFFSET +
+                    tone_map_y8_value(float(read_u8(src_y1 * pc.y_stride + src_x1))) * HDR_Y_SCALE;
+                imageStore(y_img, dst + ivec2(1, 1), vec4(y11, 0.0, 0.0, 1.0));
+            }
+        }
+
+        vec2 uv = sample_hdr_uv(base.x >> 1, base.y >> 1);
+        imageStore(uv_img, dst_base >> 1, vec4(uv, 0.0, 1.0));
+        return;
+    }
+
+    if (!full_canvas && pc.opacity >= 0.999) {
+        for (uint yy = 0u; yy < 2u; yy++) {
+            uint pos_y = base.y + yy;
+            if (pos_y >= limit_h) continue;
+
+            for (uint xx = 0u; xx < 2u; xx++) {
+                uint pos_x = base.x + xx;
+                if (pos_x >= limit_w) continue;
+
+                ivec2 dst = ivec2(pc.dst_x + int(pos_x), pc.dst_y + int(pos_y));
+                if (dst.x < 0 || dst.y < 0 ||
+                    dst.x >= int(pc.canvas_width) || dst.y >= int(pc.canvas_height)) continue;
+
+                imageStore(y_img, dst, vec4(sample_hdr_y(pos_x, pos_y), 0.0, 0.0, 1.0));
+            }
+        }
+
+        ivec2 uv_dst = dst_base >> 1;
+        if (uv_dst.x >= 0 && uv_dst.y >= 0 &&
+            uv_dst.x < int(pc.canvas_width >> 1) &&
+            uv_dst.y < int(pc.canvas_height >> 1) &&
+            dst_base.x >= 0 && dst_base.y >= 0 &&
+            dst_base.x < int(pc.canvas_width) && dst_base.y < int(pc.canvas_height)) {
+            vec2 uv = sample_hdr_uv(base.x >> 1, base.y >> 1);
+            imageStore(uv_img, uv_dst, vec4(uv, 0.0, 1.0));
+        }
+        return;
+    }
+
+    for (uint yy = 0u; yy < 2u; yy++) {
+        uint pos_y = base.y + yy;
+        if (pos_y >= limit_h) continue;
+
+        for (uint xx = 0u; xx < 2u; xx++) {
+            uint pos_x = base.x + xx;
+            if (pos_x >= limit_w) continue;
+
+            ivec2 dst = full_canvas
+                ? ivec2(int(pos_x), int(pos_y))
+                : ivec2(pc.dst_x + int(pos_x), pc.dst_y + int(pos_y));
+            if (dst.x < 0 || dst.y < 0 ||
+                dst.x >= int(pc.canvas_width) || dst.y >= int(pc.canvas_height)) continue;
+
+            bool inside = true;
+            uint local_x = pos_x;
+            uint local_y = pos_y;
+            if (full_canvas) {
+                inside = dst.x >= pc.dst_x && dst.y >= pc.dst_y &&
+                         dst.x < pc.dst_x + int(pc.dst_w) &&
+                         dst.y < pc.dst_y + int(pc.dst_h);
+                if (inside) {
+                    local_x = uint(dst.x - pc.dst_x);
+                    local_y = uint(dst.y - pc.dst_y);
+                }
+            }
+
+            float y = inside ? sample_hdr_y(local_x, local_y) : pc.bg_y;
+            if (pc.opacity >= 0.999) {
+                imageStore(y_img, dst, vec4(y, 0.0, 0.0, 1.0));
+            } else {
+                float old_y = imageLoad(y_img, dst).r;
+                imageStore(y_img, dst, vec4(mix(old_y, y, pc.opacity), 0.0, 0.0, 1.0));
+            }
+        }
+    }
+
+    ivec2 uv_dst = full_canvas ? ivec2(int(base.x >> 1), int(base.y >> 1))
+                               : (dst_base >> 1);
+    if (uv_dst.x >= 0 && uv_dst.y >= 0 &&
+        uv_dst.x < int(pc.canvas_width >> 1) &&
+        uv_dst.y < int(pc.canvas_height >> 1) &&
+        (full_canvas || (dst_base.x >= 0 && dst_base.y >= 0 &&
+         dst_base.x < int(pc.canvas_width) && dst_base.y < int(pc.canvas_height)))) {
+        bool uv_inside = true;
+        uint local_uv_x = base.x >> 1;
+        uint local_uv_y = base.y >> 1;
+        if (full_canvas) {
+            ivec2 uv_sample = ivec2(int(base.x + 1u), int(base.y + 1u));
+            uv_inside = uv_sample.x >= pc.dst_x && uv_sample.y >= pc.dst_y &&
+                        uv_sample.x < pc.dst_x + int(pc.dst_w) &&
+                        uv_sample.y < pc.dst_y + int(pc.dst_h);
+            if (uv_inside) {
+                local_uv_x = uint(uv_sample.x - pc.dst_x) >> 1;
+                local_uv_y = uint(uv_sample.y - pc.dst_y) >> 1;
+            }
+        }
+
+        vec2 uv = uv_inside ? sample_hdr_uv(local_uv_x, local_uv_y)
+                            : vec2(pc.bg_u, pc.bg_v);
+        if (pc.opacity >= 0.999) {
+            imageStore(uv_img, uv_dst, vec4(uv, 0.0, 1.0));
+        } else {
+            vec2 old_uv = imageLoad(uv_img, uv_dst).rg;
+            imageStore(uv_img, uv_dst, vec4(mix(old_uv, uv, pc.opacity), 0.0, 1.0));
+        }
+    }
+}

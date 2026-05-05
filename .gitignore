@@ -1,0 +1,16 @@
+build/
+build-*/
+.cache/
+.sdk/
+artifacts/
+cross/generated/
+
+*.o
+*.a
+*.so
+*.spv
+
+.env
+*.local
+*.log
+*.tmp

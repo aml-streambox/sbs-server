@@ -1,0 +1,16 @@
+engine_sources = files(
+    'audio_mixer.c',
+    'frame_slot.c',
+    'compositor.c',
+    'compositor_ge2d.c',
+    'compositor_scene.c',
+    'compositor_thread.c',
+    'ge2d.c',
+    'output_router.c',
+    'preview.c',
+    'snapshot.c',
+    'scene_graph.c',
+    'direct_venc.c',
+    'encoder_manager.c',
+    'export_dest.c',
+)

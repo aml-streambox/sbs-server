@@ -1,0 +1,215 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D src_tex;
+layout(set = 0, binding = 1, r8) uniform image2D y_img;
+layout(set = 0, binding = 2, rg8) uniform image2D uv_img;
+
+layout(push_constant) uniform PushConstants {
+    uint canvas_width;
+    uint canvas_height;
+    int dst_x;
+    int dst_y;
+    uint dst_w;
+    uint dst_h;
+    uint src_w;
+    uint src_h;
+    uint src_x;
+    uint src_y;
+    uint src_rect_w;
+    uint src_rect_h;
+    float opacity;
+    uint flags;
+    uint filter_flags;
+    uint filter_pad;
+    vec4 filter_params_a;
+    vec4 filter_params_b;
+} pc;
+
+const vec3 kRgbToY  = vec3(0.299, 0.587, 0.114);
+const vec3 kRgbToCb = vec3(-0.168736, -0.331264, 0.5);
+const vec3 kRgbToCr = vec3(0.5, -0.418688, -0.081312);
+const vec3 kBt2020Luma = vec3(0.2627, 0.6780, 0.0593);
+
+float pq_to_nits(float v) {
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 128.0;
+    const float c3 = 2392.0 / 128.0;
+    float vp = pow(clamp(v, 0.0, 1.0), 1.0 / m2);
+    float num = max(vp - c1, 0.0);
+    float den = max(c2 - c3 * vp, 0.000001);
+    return 10000.0 * pow(num / den, 1.0 / m1);
+}
+
+float tone_map_sdr_linear(float nits) {
+    float x = max(nits, 0.0) / 203.0;
+    const float white = 1000.0 / 203.0;
+    float y = x / (1.0 + x);
+    float yw = white / (1.0 + white);
+    return clamp(y / yw, 0.0, 1.0);
+}
+
+float linear_to_bt709(float v) {
+    v = clamp(v, 0.0, 1.0);
+    return v < 0.018 ? 4.5 * v : 1.099 * pow(v, 0.45) - 0.099;
+}
+
+vec3 bt2020_to_bt709(vec3 linear2020) {
+    return clamp(vec3(
+         1.6605 * linear2020.r - 0.5876 * linear2020.g - 0.0728 * linear2020.b,
+        -0.1246 * linear2020.r + 1.1329 * linear2020.g - 0.0083 * linear2020.b,
+        -0.0182 * linear2020.r - 0.1006 * linear2020.g + 1.1187 * linear2020.b),
+        0.0, 1.0);
+}
+
+vec3 hdr_to_sdr(vec3 pq_color) {
+    vec3 nits = vec3(
+        pq_to_nits(pq_color.r),
+        pq_to_nits(pq_color.g),
+        pq_to_nits(pq_color.b));
+    float luma = dot(nits, kBt2020Luma);
+    float mapped = tone_map_sdr_linear(luma);
+    float scale = luma > 0.0001 ? mapped / luma : 0.0;
+    vec3 linear709 = bt2020_to_bt709(nits * scale);
+    return vec3(
+        linear_to_bt709(linear709.r),
+        linear_to_bt709(linear709.g),
+        linear_to_bt709(linear709.b));
+}
+
+vec3 apply_color_correction(vec3 color) {
+    float gray = dot(color, vec3(0.299, 0.587, 0.114));
+    float saturation = clamp(pc.filter_params_a.x, 0.0, 3.0);
+    float brightness = clamp(pc.filter_params_a.y, -1.0, 1.0);
+    float contrast = clamp(pc.filter_params_a.z, 0.0, 4.0);
+    float gamma = clamp(pc.filter_params_a.w, 0.1, 4.0);
+    color = vec3(gray) + (color - vec3(gray)) * saturation;
+    color = ((color - 0.5) * contrast) + 0.5 + brightness;
+    return pow(clamp(color, vec3(0.0), vec3(1.0)), vec3(1.0 / gamma));
+}
+
+float luma_key_alpha(vec3 color) {
+    float luma = dot(color, vec3(0.299, 0.587, 0.114));
+    float min_luma = clamp(pc.filter_params_a.w, 0.0, 1.0);
+    float max_luma = clamp(pc.filter_params_b.z, min_luma, 1.0);
+    float smoothness = clamp(pc.filter_params_b.w, 0.001, 1.0);
+    return clamp(smoothstep(min_luma, min_luma + smoothness, luma) *
+                 (1.0 - smoothstep(max_luma - smoothness, max_luma, luma)), 0.0, 1.0);
+}
+
+float chroma_key_alpha(inout vec3 color) {
+    vec3 key_color = clamp(pc.filter_params_a.rgb, vec3(0.0), vec3(1.0));
+    float similarity = clamp(pc.filter_params_a.w, 0.0, 1.0);
+    float smoothness = clamp(pc.filter_params_b.z, 0.001, 1.0);
+    float spill = clamp(pc.filter_params_b.w, 0.0, 1.0);
+    float keep = smoothstep(similarity, similarity + smoothness, distance(color, key_color));
+    float gray = dot(color, vec3(0.299, 0.587, 0.114));
+    color = mix(color, vec3(gray), spill * (1.0 - keep));
+    return keep;
+}
+
+vec3 apply_filters(vec3 color) {
+    if (pc.filter_flags == 0u)
+        return color;
+    if (((pc.filter_flags >> 0u) & 1u) != 0u) {
+        float gray = dot(color, vec3(0.299, 0.587, 0.114));
+        color = mix(color, vec3(gray), clamp(pc.filter_params_a.x, 0.0, 1.0));
+    }
+    if (((pc.filter_flags >> 1u) & 1u) != 0u) {
+        color = clamp(color + vec3(pc.filter_params_a.y), 0.0, 1.0);
+    }
+    if (((pc.filter_flags >> 2u) & 1u) != 0u) {
+        color = ((color - 0.5) * pc.filter_params_a.z) + 0.5;
+    }
+    if (((pc.filter_flags >> 5u) & 1u) != 0u) {
+        float amount = clamp(pc.filter_params_b.y, 0.0, 1.0);
+        color = mix(color, hdr_to_sdr(color), amount);
+    }
+    if (((pc.filter_flags >> 6u) & 1u) != 0u) {
+        color = apply_color_correction(color);
+    }
+    return clamp(color, 0.0, 1.0);
+}
+
+vec4 apply_alpha_filters(vec4 color) {
+    if ((pc.filter_flags & ((1u << 7u) | (1u << 8u))) == 0u)
+        return color;
+    if (((pc.filter_flags >> 7u) & 1u) != 0u)
+        color.a *= luma_key_alpha(color.rgb);
+    if (((pc.filter_flags >> 8u) & 1u) != 0u) {
+        vec3 keyed = color.rgb;
+        color.a *= chroma_key_alpha(keyed);
+        color.rgb = keyed;
+    }
+    return color;
+}
+
+vec4 sample_src(uint lx, uint ly) {
+    vec2 src_pos = vec2(float(pc.src_x), float(pc.src_y)) +
+        (vec2(float(lx), float(ly)) + 0.5) *
+        (vec2(float(pc.src_rect_w), float(pc.src_rect_h)) /
+         vec2(float(pc.dst_w), float(pc.dst_h)));
+    vec2 uv = src_pos / vec2(float(pc.src_w), float(pc.src_h));
+    vec4 color = texture(src_tex, uv);
+    return apply_alpha_filters(vec4(apply_filters(color.rgb), color.a));
+}
+
+void store_y(uint lx, uint ly, vec4 rgba) {
+    if (lx >= pc.dst_w || ly >= pc.dst_h) return;
+
+    ivec2 dst = ivec2(pc.dst_x + int(lx), pc.dst_y + int(ly));
+    if (dst.x < 0 || dst.y < 0 ||
+        dst.x >= int(pc.canvas_width) || dst.y >= int(pc.canvas_height)) return;
+
+    float alpha = clamp(pc.opacity * rgba.a, 0.0, 1.0);
+    if (alpha <= 0.0) return;
+
+    float y = clamp((16.0 / 255.0) + dot(rgba.rgb, kRgbToY) * (219.0 / 255.0), 0.0, 1.0);
+    if (alpha >= 0.999) {
+        imageStore(y_img, dst, vec4(y, 0.0, 0.0, 1.0));
+    } else {
+        float old_y = imageLoad(y_img, dst).r;
+        imageStore(y_img, dst, vec4(mix(old_y, y, alpha), 0.0, 0.0, 1.0));
+    }
+}
+
+void main() {
+    uvec2 base = gl_GlobalInvocationID.xy * 2u;
+    if (base.x >= pc.dst_w || base.y >= pc.dst_h) return;
+
+    uint x1 = min(base.x + 1u, pc.dst_w - 1u);
+    uint y1 = min(base.y + 1u, pc.dst_h - 1u);
+    vec4 c00 = sample_src(base.x, base.y);
+    vec4 c10 = sample_src(x1, base.y);
+    vec4 c01 = sample_src(base.x, y1);
+    vec4 c11 = sample_src(x1, y1);
+
+    store_y(base.x, base.y, c00);
+    store_y(base.x + 1u, base.y, c10);
+    store_y(base.x, base.y + 1u, c01);
+    store_y(base.x + 1u, base.y + 1u, c11);
+
+    ivec2 dst_base = ivec2(pc.dst_x + int(base.x), pc.dst_y + int(base.y));
+    if (dst_base.x >= 0 && dst_base.y >= 0 &&
+        dst_base.x < int(pc.canvas_width) && dst_base.y < int(pc.canvas_height)) {
+        vec3 avg = (c00.rgb + c10.rgb + c01.rgb + c11.rgb) * 0.25;
+        float alpha = clamp(pc.opacity * (c00.a + c10.a + c01.a + c11.a) * 0.25, 0.0, 1.0);
+        if (alpha <= 0.0) return;
+        float cb = clamp((16.0 / 255.0) + (dot(avg, kRgbToCb) + 0.5) * (224.0 / 255.0), 0.0, 1.0);
+        float cr = clamp((16.0 / 255.0) + (dot(avg, kRgbToCr) + 0.5) * (224.0 / 255.0), 0.0, 1.0);
+        ivec2 uv_dst = dst_base >> 1;
+        if (uv_dst.x >= 0 && uv_dst.y >= 0 &&
+            uv_dst.x < int(pc.canvas_width >> 1) && uv_dst.y < int(pc.canvas_height >> 1)) {
+            /* Native SDR currently follows existing NV21-family VU order. */
+            if (alpha >= 0.999) {
+                imageStore(uv_img, uv_dst, vec4(cr, cb, 0.0, 1.0));
+            } else {
+                vec2 old_uv = imageLoad(uv_img, uv_dst).rg;
+                imageStore(uv_img, uv_dst, vec4(mix(old_uv, vec2(cr, cb), alpha), 0.0, 1.0));
+            }
+        }
+    }
+}

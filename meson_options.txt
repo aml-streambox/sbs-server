@@ -1,0 +1,24 @@
+option('platform',
+    type : 'combo',
+    choices : ['amlogic', 'generic'],
+    value : 'generic',
+    description : 'Target platform (amlogic or generic/x86)',
+)
+
+option('webui',
+    type : 'boolean',
+    value : true,
+    description : 'Install WebUI files',
+)
+
+option('tests',
+    type : 'boolean',
+    value : true,
+    description : 'Build unit tests',
+)
+
+option('shader_compile',
+    type : 'boolean',
+    value : true,
+    description : 'Compile GLSL shaders to SPIR-V during build',
+)

@@ -52,6 +52,7 @@ static GOptionEntry entries[] = {
 int main(int argc, char **argv)
 {
     GError *error = NULL;
+    int exit_code = EXIT_FAILURE;
     GOptionContext *ctx = g_option_context_new("- SBS Worker Process");
     g_option_context_add_main_entries(ctx, entries, NULL);
 
@@ -119,17 +120,18 @@ int main(int argc, char **argv)
     }
 
     LOG_I("sbs-worker exiting (rc=%d)", rc);
+    exit_code = (rc == SBS_OK) ? EXIT_SUCCESS : EXIT_FAILURE;
     sbs_worker_cleanup(&wctx);
 
 cleanup_opts:
 #else
     /* Stub build — no GStreamer available */
-    LOG_I("sbs-worker exiting (stub — GStreamer not available)");
+    LOG_E("sbs-worker cannot run requested mode '%s': GStreamer not available", opt_mode);
 #endif
 
     g_free(opt_mode);
     g_free(opt_id);
     g_free(opt_socket);
 
-    return EXIT_SUCCESS;
+    return exit_code;
 }

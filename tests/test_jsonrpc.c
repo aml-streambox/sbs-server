@@ -257,15 +257,16 @@ SBS_TEST_FIXTURE(jsonrpc, structured_source_create_and_update, setup_api, teardo
     free(response);
 }
 
-SBS_TEST_FIXTURE(jsonrpc, output_rtmp_passcode_round_trip, setup_api, teardown_api)
+SBS_TEST_FIXTURE(jsonrpc, output_rtmp_passcode_redacted, setup_api, teardown_api)
 {
     char *response = NULL;
     SBS_ASSERT_EQ(sbs_api_server_dispatch_json(server, client,
         "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"output.create\",\"params\":{\"id\":\"output-rtmp\",\"name\":\"RTMP\",\"encoder\":{\"sink_type\":\"rtmp\",\"rtmp_uri\":\"rtmp://example.com/live\",\"rtmp_passcode\":\"stream-key\"}}}",
         &response), SBS_OK);
     SBS_ASSERT_NOT_NULL(response);
-    SBS_ASSERT(strstr(response, "rtmp_passcode") != NULL);
-    SBS_ASSERT(strstr(response, "stream-key") != NULL);
+    SBS_ASSERT(strstr(response, "\"rtmp_passcode\":") == NULL);
+    SBS_ASSERT(strstr(response, "rtmp_passcode_set") != NULL);
+    SBS_ASSERT(strstr(response, "stream-key") == NULL);
     free(response);
 
     response = NULL;
@@ -273,8 +274,9 @@ SBS_TEST_FIXTURE(jsonrpc, output_rtmp_passcode_round_trip, setup_api, teardown_a
         "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"output.update\",\"params\":{\"id\":\"output-rtmp\",\"encoder\":{\"sink_type\":\"rtmp\",\"rtmp_uri\":\"rtmp://example.com/live\",\"rtmp_passcode\":\"new-key\"}}}",
         &response), SBS_OK);
     SBS_ASSERT_NOT_NULL(response);
-    SBS_ASSERT(strstr(response, "rtmp_passcode") != NULL);
-    SBS_ASSERT(strstr(response, "new-key") != NULL);
+    SBS_ASSERT(strstr(response, "\"rtmp_passcode\":") == NULL);
+    SBS_ASSERT(strstr(response, "rtmp_passcode_set") != NULL);
+    SBS_ASSERT(strstr(response, "new-key") == NULL);
     free(response);
 }
 

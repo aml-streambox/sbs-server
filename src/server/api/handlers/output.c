@@ -50,7 +50,7 @@ int sbs_api_handle_output_list(sbs_api_server_t *server, sbs_api_client_t *clien
     cJSON *outputs = cJSON_CreateObject();
     g_hash_table_iter_init(&iter, server->scene_graph->outputs);
     while (g_hash_table_iter_next(&iter, &key, &value)) {
-        cJSON_AddItemToObject(outputs, key, sbs_scene_graph_serialize_output(value));
+        cJSON_AddItemToObject(outputs, key, sbs_scene_graph_serialize_output_public(value));
     }
     cJSON_AddItemToObject(*result, "output_groups", outputs);
     return SBS_OK;
@@ -65,7 +65,7 @@ int sbs_api_handle_output_get(sbs_api_server_t *server, sbs_api_client_t *client
         *error = api_error(-32001, "Output not found");
         return SBS_ERR_NOT_FOUND;
     }
-    *result = sbs_scene_graph_serialize_output(output);
+    *result = sbs_scene_graph_serialize_output_public(output);
     return SBS_OK;
 }
 
@@ -98,8 +98,8 @@ int sbs_api_handle_output_create(sbs_api_server_t *server, sbs_api_client_t *cli
         }
     }
 
-    *result = sbs_scene_graph_serialize_output(output);
-    sbs_api_server_publish(server, "output.created", sbs_scene_graph_serialize_output(output));
+    *result = sbs_scene_graph_serialize_output_public(output);
+    sbs_api_server_publish(server, "output.created", sbs_scene_graph_serialize_output_public(output));
     return SBS_OK;
 }
 
@@ -266,8 +266,8 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
     g_free(output->runtime_state);
     output->runtime_state = g_strdup(server->encoder_mgr ? "running" : "starting");
     sbs_config_manager_mark_dirty(server->config, server);
-    *result = sbs_scene_graph_serialize_output(output);
-    sbs_api_server_publish(server, "output.status", sbs_scene_graph_serialize_output(output));
+    *result = sbs_scene_graph_serialize_output_public(output);
+    sbs_api_server_publish(server, "output.status", sbs_scene_graph_serialize_output_public(output));
     return SBS_OK;
 }
 
@@ -296,8 +296,8 @@ int sbs_api_handle_output_stop(sbs_api_server_t *server, sbs_api_client_t *clien
     g_free(output->runtime_state);
     output->runtime_state = g_strdup("disabled");
     sbs_config_manager_mark_dirty(server->config, server);
-    *result = sbs_scene_graph_serialize_output(output);
-    sbs_api_server_publish(server, "output.status", sbs_scene_graph_serialize_output(output));
+    *result = sbs_scene_graph_serialize_output_public(output);
+    sbs_api_server_publish(server, "output.status", sbs_scene_graph_serialize_output_public(output));
     return SBS_OK;
 }
 
@@ -394,7 +394,7 @@ int sbs_api_handle_output_update(sbs_api_server_t *server, sbs_api_client_t *cli
         }
     }
 
-    sbs_api_server_publish(server, "output.updated", sbs_scene_graph_serialize_output(output));
-    *result = sbs_scene_graph_serialize_output(output);
+    sbs_api_server_publish(server, "output.updated", sbs_scene_graph_serialize_output_public(output));
+    *result = sbs_scene_graph_serialize_output_public(output);
     return SBS_OK;
 }

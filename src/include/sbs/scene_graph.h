@@ -349,8 +349,10 @@ void sbs_scene_graph_update_transition_runtime(sbs_scene_graph_t *graph,
 cJSON *sbs_scene_graph_serialize_source(const sbs_source_state_t *source);
 cJSON *sbs_scene_graph_serialize_scene(const sbs_scene_state_t *scene);
 cJSON *sbs_scene_graph_serialize_output(const sbs_output_state_t *output);
+cJSON *sbs_scene_graph_serialize_output_public(const sbs_output_state_t *output);
 cJSON *sbs_scene_graph_serialize_transition(const sbs_transition_state_t *transition);
 cJSON *sbs_scene_graph_serialize_full_state(const sbs_scene_graph_t *graph);
+cJSON *sbs_scene_graph_serialize_full_state_public(const sbs_scene_graph_t *graph);
 int sbs_scene_graph_build_compositor_state(const sbs_scene_graph_t *graph,
                                            sbs_comp_scene_state_t *state);
 

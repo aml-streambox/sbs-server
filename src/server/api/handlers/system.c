@@ -158,7 +158,7 @@ int sbs_api_handle_system_get_state(sbs_api_server_t *server, sbs_api_client_t *
         return SBS_ERR_NOT_FOUND;
     }
     sbs_scene_graph_update_transition_runtime(server->scene_graph, g_get_monotonic_time());
-    *result = sbs_scene_graph_serialize_full_state(server->scene_graph);
+    *result = sbs_scene_graph_serialize_full_state_public(server->scene_graph);
     if (server->preview) {
         cJSON_AddItemToObject(*result, "preview", sbs_preview_serialize_profile_catalog(server->preview));
         cJSON_AddItemToObject(*result, "preview_telemetry", sbs_preview_serialize_telemetry(server->preview));

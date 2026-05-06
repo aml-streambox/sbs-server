@@ -641,6 +641,28 @@ static cJSON *str_map_to_json(GHashTable *map)
     return obj;
 }
 
+static cJSON *output_encoder_to_public_json(GHashTable *map)
+{
+    cJSON *obj = cJSON_CreateObject();
+    if (!map) {
+        return obj;
+    }
+
+    GHashTableIter iter;
+    gpointer key, value;
+    g_hash_table_iter_init(&iter, map);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        if (g_strcmp0((const char *)key, "rtmp_passcode") == 0) {
+            cJSON_AddBoolToObject(obj, "rtmp_passcode_set",
+                                  value && ((const char *)value)[0] != '\0');
+            continue;
+        }
+        cJSON_AddStringToObject(obj, (const char *)key, (const char *)value);
+    }
+
+    return obj;
+}
+
 static cJSON *serialize_filter(const sbs_filter_state_t *filter)
 {
     cJSON *filter_obj = cJSON_CreateObject();
@@ -775,7 +797,7 @@ cJSON *sbs_scene_graph_serialize_scene(const sbs_scene_state_t *scene)
     return obj;
 }
 
-cJSON *sbs_scene_graph_serialize_output(const sbs_output_state_t *output)
+static cJSON *serialize_output_internal(const sbs_output_state_t *output, bool public_view)
 {
     cJSON *obj = cJSON_CreateObject();
     cJSON *sinks = cJSON_CreateArray();
@@ -791,7 +813,9 @@ cJSON *sbs_scene_graph_serialize_output(const sbs_output_state_t *output)
     cJSON_AddBoolToObject(obj, "enabled", output->enabled);
     cJSON_AddBoolToObject(obj, "autostart", output->autostart);
     cJSON_AddStringToObject(obj, "state", output->runtime_state ? output->runtime_state : (output->running ? "running" : "created"));
-    cJSON_AddItemToObject(obj, "encoder", str_map_to_json(output->encoder));
+    cJSON_AddItemToObject(obj, "encoder", public_view
+        ? output_encoder_to_public_json(output->encoder)
+        : str_map_to_json(output->encoder));
 
     for (i = 0; i < output->sinks->len; i++) {
         sbs_sink_state_t *sink = g_ptr_array_index(output->sinks, i);
@@ -804,6 +828,16 @@ cJSON *sbs_scene_graph_serialize_output(const sbs_output_state_t *output)
     }
     cJSON_AddItemToObject(obj, "sinks", sinks);
     return obj;
+}
+
+cJSON *sbs_scene_graph_serialize_output(const sbs_output_state_t *output)
+{
+    return serialize_output_internal(output, false);
+}
+
+cJSON *sbs_scene_graph_serialize_output_public(const sbs_output_state_t *output)
+{
+    return serialize_output_internal(output, true);
 }
 
 cJSON *sbs_scene_graph_serialize_transition(const sbs_transition_state_t *transition)
@@ -819,7 +853,7 @@ cJSON *sbs_scene_graph_serialize_transition(const sbs_transition_state_t *transi
     return obj;
 }
 
-cJSON *sbs_scene_graph_serialize_full_state(const sbs_scene_graph_t *graph)
+static cJSON *serialize_full_state_internal(const sbs_scene_graph_t *graph, bool public_view)
 {
     cJSON *obj = cJSON_CreateObject();
     cJSON *canvas = cJSON_CreateObject();
@@ -857,7 +891,9 @@ cJSON *sbs_scene_graph_serialize_full_state(const sbs_scene_graph_t *graph)
     g_hash_table_iter_init(&iter, graph->outputs);
     while (g_hash_table_iter_next(&iter, &key, &value)) {
         cJSON_AddItemToObject(outputs, (const char *)key,
-                              sbs_scene_graph_serialize_output(value));
+                              public_view
+                                  ? sbs_scene_graph_serialize_output_public(value)
+                                  : sbs_scene_graph_serialize_output(value));
     }
     cJSON_AddItemToObject(obj, "output_groups", outputs);
 
@@ -888,6 +924,16 @@ cJSON *sbs_scene_graph_serialize_full_state(const sbs_scene_graph_t *graph)
     cJSON_AddItemToObject(obj, "state", state);
 
     return obj;
+}
+
+cJSON *sbs_scene_graph_serialize_full_state(const sbs_scene_graph_t *graph)
+{
+    return serialize_full_state_internal(graph, false);
+}
+
+cJSON *sbs_scene_graph_serialize_full_state_public(const sbs_scene_graph_t *graph)
+{
+    return serialize_full_state_internal(graph, true);
 }
 
 int sbs_scene_graph_build_compositor_state(const sbs_scene_graph_t *graph,

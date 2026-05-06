@@ -3,7 +3,6 @@
 
 #include "sbs/scene_graph.h"
 #include "sbs/log.h"
-#include "sbs/log.h"
 #include <cjson/cJSON.h>
 
 #include <stdlib.h>
@@ -15,6 +14,21 @@
 static char *dup_or_null(const char *s)
 {
     return s ? g_strdup(s) : NULL;
+}
+
+static bool valid_graph_id(const char *id)
+{
+    size_t len;
+
+    if (!id || !*id) return false;
+    len = strlen(id);
+    if (len > 96) return false;
+    for (const char *p = id; *p; p++) {
+        if (!g_ascii_isalnum(*p) && *p != '-' && *p != '_' && *p != '.') {
+            return false;
+        }
+    }
+    return true;
 }
 
 static GHashTable *str_map_new(void)
@@ -1008,7 +1022,7 @@ int sbs_scene_graph_create_source(sbs_scene_graph_t *graph,
 {
     sbs_source_state_t *source;
 
-    if (!graph || !params || !params->id) {
+    if (!graph || !params || !valid_graph_id(params->id)) {
         return SBS_ERR_INVAL;
     }
     if (g_hash_table_contains(graph->sources, params->id)) {
@@ -1133,7 +1147,7 @@ int sbs_scene_graph_create_scene(sbs_scene_graph_t *graph,
 {
     sbs_scene_state_t *scene;
 
-    if (!graph || !params || !params->id) {
+    if (!graph || !params || !valid_graph_id(params->id)) {
         return SBS_ERR_INVAL;
     }
     if (g_hash_table_contains(graph->scenes, params->id)) {
@@ -1510,7 +1524,7 @@ int sbs_scene_graph_create_output(sbs_scene_graph_t *graph,
                                   sbs_output_state_t **out_output)
 {
     sbs_output_state_t *output;
-    if (!graph || !params || !params->id) {
+    if (!graph || !params || !valid_graph_id(params->id)) {
         return SBS_ERR_INVAL;
     }
     if (g_hash_table_contains(graph->outputs, params->id)) {
@@ -1550,7 +1564,7 @@ int sbs_scene_graph_create_transition(sbs_scene_graph_t *graph,
                                       sbs_transition_state_t **out_transition)
 {
     sbs_transition_state_t *transition;
-    if (!graph || !params || !params->id) {
+    if (!graph || !params || !valid_graph_id(params->id)) {
         return SBS_ERR_INVAL;
     }
     if (g_hash_table_contains(graph->transitions, params->id)) {

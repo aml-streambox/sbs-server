@@ -326,6 +326,28 @@ SBS_TEST_FIXTURE(jsonrpc, unsupported_source_kind_returns_error, setup_api, tear
     free(response);
 }
 
+SBS_TEST_FIXTURE(jsonrpc, source_create_rejects_unsafe_id, setup_api, teardown_api)
+{
+    char *response = NULL;
+    SBS_ASSERT_EQ(sbs_api_server_dispatch_json(server, client,
+        "{\"jsonrpc\":\"2.0\",\"id\":25,\"method\":\"source.create\",\"params\":{\"id\":\"../source\",\"name\":\"Bad\",\"type\":\"videotestsrc\"}}",
+        &response), SBS_OK);
+    SBS_ASSERT_NOT_NULL(response);
+    SBS_ASSERT(strstr(response, "Unable to create source") != NULL);
+    free(response);
+}
+
+SBS_TEST_FIXTURE(jsonrpc, output_create_rejects_unsafe_id, setup_api, teardown_api)
+{
+    char *response = NULL;
+    SBS_ASSERT_EQ(sbs_api_server_dispatch_json(server, client,
+        "{\"jsonrpc\":\"2.0\",\"id\":26,\"method\":\"output.create\",\"params\":{\"id\":\"bad/output\",\"name\":\"Bad\"}}",
+        &response), SBS_OK);
+    SBS_ASSERT_NOT_NULL(response);
+    SBS_ASSERT(strstr(response, "Unable to create output") != NULL);
+    free(response);
+}
+
 SBS_TEST_FIXTURE(jsonrpc, structured_text_source_preserves_font_config, setup_api, teardown_api)
 {
     char *response = NULL;

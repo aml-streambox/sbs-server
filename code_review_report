@@ -1,0 +1,216 @@
+# SBS Server Code Review Report
+
+Review stance: strict handoff review, assuming the code was written by a junior/co-op developer and now needs a cleanup/refactor pass before more HDR/streaming work. Primary focus is unnecessary code, dead/stub/fallback branches, hidden compatibility paths, duplicated logic, silent failure, and private/local defaults.
+
+Validation baseline during review:
+
+1. `meson compile -C build-test`: passed, no rebuild needed.
+2. `meson test -C build-test`: 14/14 passed.
+
+Passing tests do not reduce the severity of the findings below. Several issues are architectural or production-path risks that current tests do not cover.
+
+## Executive Summary
+
+The server has working pieces, but too much runtime behavior is split across old and new paths. There is a direct encoder manager path, a legacy output worker path, a legacy output supervisor path, direct preview paths, export destinations, and config restore paths that duplicate API behavior. This makes the code hard to reason about and leaves dangerous branches reachable.
+
+The highest-risk cleanup is to remove or hard-disable unsupported fallback paths. In particular, the YUV DMA-BUF encoder path is still callable even though the known safe path is VMALLOC for YUV. The output stack also silently falls back to `fakesink`, so an output can report success while producing no stream. Config restore and API start logic have diverged, so reboot behavior can differ from interactive API behavior.
+
+Do not start by extracting generic abstractions everywhere. First delete or disable branches that should not exist, then consolidate duplicated helpers.
+
+## Critical / High-Severity Findings
+
+1. YUV DMA-BUF direct encoder path remains reachable even though YUV must use VMALLOC.
+   - Files: `src/server/engine/direct_venc.c:580`, `src/server/engine/direct_venc.c:603`, `src/server/engine/encoder_manager.c:1415`, `src/server/engine/output_router.c:313`, `src/server/engine/output_router.c:805`.
+   - Problem: `sbs_direct_venc_submit_dmabuf()` sets `DMA_TYPE` for NV21/P010. The current known constraint is that `libvpcodec.so` does not support `DMA_TYPE` for YUV formats; YUV submissions must use `VMALLOC_TYPE`.
+   - Impact: A supposedly fixed pipeline still has a branch that can reintroduce encoder hangs/failures when an output path uses DMA-BUF submission.
+    - Cleanup: Remove `sbs_direct_venc_submit_dmabuf()` for YUV or make it return `SBS_ERR_UNSUPPORTED`. Route all encoder submissions through `sbs_direct_venc_submit_ptr()` using mapped/exported CPU-visible memory until a real RGB DMA path exists.
+    - Regression note: A first attempt to wrap `sbs_direct_venc_submit_dmabuf()` with per-frame `mmap` plus DMA-BUF sync caused a severe 4K performance regression and made the 2D/export engine unstable. Treat that approach as dangerous. Revisit only with a design that avoids per-frame mapping/sync and is benchmarked on target before deploy.
+
+2. Router marks encoder submissions successful even when encoding fails.
+   - Files: `src/server/engine/output_router.c:313`, `src/server/engine/output_router.c:315`, `src/server/engine/output_router.c:327`, `src/server/engine/encoder_manager.c:1415`.
+   - Problem: `sbs_encoder_manager_consume_frame_dmabuf()` returns `void`, so the router sets `submitted = true` after handing off an fd, regardless of whether the direct encoder rejected the frame.
+   - Impact: Metrics lie. A failing encode path can appear healthy, making HDR/streaming diagnostics misleading.
+   - Cleanup: Make consume functions return `SBS_OK`/error and only increment submitted counters on actual encoded packet success.
+
+3. Legacy CPU consumer path can copy from `NULL` after export DMA-BUF mmap failure.
+   - Files: `src/server/engine/export_dest.c:134`, `src/server/engine/export_dest.c:136`, `src/server/engine/output_router.c:819`, `src/server/engine/output_router.c:826`.
+   - Problem: Export slot mmap failure logs that legacy CPU consumers are disabled, but the router still calls `memcpy(dst, slot->nv21_mapped, fsize)` for snapshot/legacy output when `slot->nv21_mapped` is `NULL`.
+   - Impact: A recoverable mmap failure can become a crash in snapshot or legacy output paths.
+   - Cleanup: Gate legacy memfd copy on `slot->nv21_mapped != NULL`; otherwise fail the snapshot/output frame explicitly.
+
+4. Output creation silently falls back to `fakesink`.
+   - Files: `src/server/engine/encoder_manager.c:888`, `src/worker/output_worker.c:290`, `src/worker/output_worker.c:395`, `src/worker/output_worker.c:411`, `src/worker/output_worker.c:423`, `src/worker/output_worker.c:428`.
+   - Problem: Missing or invalid sink/encoder elements become `fakesink`. The caller can see output start success while no actual stream/file exists.
+   - Impact: This is exactly the kind of fallback that hides real SRT/RTMP failures.
+   - Cleanup: Only allow `fakesink` when `sink_type == "fakesink"` is explicitly requested. Missing `srtsink`, RTMP sink, file sink, muxer, or encoder should return an error.
+
+5. Config restore silently coerces unknown source types to `videotestsrc`.
+   - Files: `src/server/config/config_manager.c:207`, `src/server/config/config_manager.c:216`, `src/server/config/config_manager.c:480`.
+   - Problem: Unknown persisted source types become `SBS_SOURCE_KIND_VIDEOTESTSRC`. API source creation rejects unsupported source kinds, so restore behavior is less strict than live API behavior.
+   - Impact: Corrupt or old configs can boot into the wrong source type without an error. This is dangerous for capture pipelines.
+   - Cleanup: Share the API source-kind parser or return a restore error with a clear migration path.
+
+6. Source start configuration is duplicated and already diverged.
+   - Files: `src/server/config/config_manager.c:61`, `src/server/api/handlers/source.c:294`.
+   - Problem: Config restore and API start both build `sbs_source_start_config_t`, but VFM capture output format differs. Restore forces canvas-derived `p010`/`raw`; API start respects saved `output_format` first.
+   - Impact: A source can behave differently after restart than it did when started through the API. This is especially risky for HDR10 and vfmcap flows.
+   - Cleanup: Move source-start-config derivation into one shared helper and call it from both restore and API paths.
+
+7. RTMP passcodes are persisted and returned through normal output serialization.
+   - Files: `src/server/api/handlers/output.c:196`, `src/server/api/handlers/output.c:198`, `src/server/api/handlers/output.c:256`, `src/server/api/handlers/output.c:258`, `src/server/engine/scene_graph.c:780`, `tests/test_jsonrpc.c:247`.
+   - Problem: `rtmp_passcode` is stored in `output->encoder` and serialized back to clients as part of output state. Tests currently assert this exposure.
+   - Impact: Secrets leak to any client that can call output/system state APIs. It also persists passcodes in general scene/config state.
+   - Cleanup: Redact secrets in API responses. Store sensitive values separately, or at minimum serialize `rtmp_passcode_set: true` instead of the passcode.
+
+8. Output supervisor hand-builds JSON with unescaped user-controlled strings and a fixed 1 KiB buffer.
+   - Files: `src/server/supervisor/output_supervisor.c:601`, `src/server/supervisor/output_supervisor.c:605`, `src/server/supervisor/output_supervisor.c:637`, `src/server/supervisor/output_supervisor.c:645`, `src/server/supervisor/output_supervisor.c:649`, `src/server/supervisor/output_supervisor.c:653`.
+   - Problem: Values such as output ID, socket path, sink type, SRT URI, RTMP URI, passcode, and file path are inserted with `snprintf` without JSON escaping. Long strings can also truncate the config.
+   - Impact: A quote or backslash in a user-controlled field can produce invalid JSON or alter worker config semantics.
+   - Cleanup: Build worker config with `cJSON`, then `cJSON_PrintUnformatted`, or use the same escaping helper everywhere.
+
+9. IDs flow into Unix socket paths without validation.
+   - Files: `src/server/engine/scene_graph.c:1005`, `src/server/supervisor/source_supervisor.c:260`, `src/server/supervisor/source_supervisor.c:267`, `src/server/supervisor/output_supervisor.c:236`, `src/server/supervisor/output_supervisor.c:243`.
+   - Problem: Source/output IDs are used inside socket filenames. Scene graph creation does not constrain IDs to a safe character set.
+   - Impact: Slash, traversal-like, extremely long, or special-character IDs can break supervisor socket paths or collide with unexpected files.
+   - Cleanup: Validate all IDs at creation using one helper, e.g. `[A-Za-z0-9._-]+` with max length.
+
+10. Stub worker exits success even when it cannot perform requested work.
+    - File: `src/worker/main.c:126`, `src/worker/main.c:134`.
+    - Problem: In builds without worker dependencies, `sbs-worker` logs that it is a stub and returns `EXIT_SUCCESS`.
+    - Impact: Supervisors/tests can treat an unusable worker as a clean exit. This is a classic fake-success branch.
+    - Cleanup: Return failure when invoked in stub mode for `source` or `output`; only allow success for a specific `--version`/help path.
+
+## Medium-Severity Findings
+
+1. Output worker is largely legacy duplicate runtime.
+   - Files: `src/worker/output_worker.c`, `src/server/supervisor/output_supervisor.c`, `src/server/engine/encoder_manager.c`.
+   - Problem: Output worker duplicates mux/sink/RTMP/SRT/fakesink logic now also handled by `encoder_manager.c`.
+   - Impact: Fixes must be duplicated, and behavior already differs between direct encoder manager and legacy supervisor paths.
+   - Cleanup: Decide if output worker is supported. If not, remove the legacy supervisor path from production builds. If it is supported, consolidate sink/mux config and sanitizer helpers.
+
+2. H.265 sanitizer logic is duplicated.
+   - Files: `src/server/engine/encoder_manager.c:261`, `src/worker/output_worker.c:144`.
+   - Problem: Both paths contain similar VPS/SPS/PPS gating logic.
+   - Impact: One path can be fixed while the other stays stale, especially during SRT debugging.
+   - Cleanup: Extract a shared helper or delete the stale worker-side path.
+
+3. Preview and snapshot URLs contain local assumptions.
+   - Files: `src/server/engine/preview.c:247`, `src/server/engine/preview.c:258`, `src/server/engine/preview.c:287`, `src/server/engine/snapshot.c:230`, `src/server/engine/snapshot.c:246`.
+   - Problem: Stream/snapshot URLs and snapshot directory are hardcoded to local defaults.
+   - Impact: API clients receive URLs that are not necessarily reachable from the browser or operator machine.
+   - Cleanup: Return relative URLs or derive public base URL/snapshot dir from config/environment.
+
+4. API instance inventory exposes local filesystem and socket paths.
+   - Files: `src/server/instance_manager.c:352`, `src/server/instance_manager.c:353`, `src/server/instance_manager.c:354`, `src/server/instance_manager.c:368`, `src/server/instance_manager.c:369`, `src/server/instance_manager.c:370`.
+   - Problem: `config_dir`, `control_socket_path`, and `log_path` are returned in public inventory.
+   - Impact: Leaks machine layout to clients and ties UI/API consumers to local internals.
+   - Cleanup: Remove from normal API output or gate behind an explicit debug/admin method.
+
+5. Hardcoded device/audio defaults are repeated in runtime code.
+   - Files: `src/server/config/config_manager.c:85`, `src/server/config/config_manager.c:156`, `src/server/engine/audio_mixer.c:126`, `src/server/engine/audio_mixer.c:725`, `src/server/api/handlers/source.c:319`.
+   - Problem: The server bakes in specific capture and audio defaults.
+   - Impact: Device-specific assumptions leak into tracked source and restored configs.
+   - Cleanup: Read from config/env or use empty/default values that force explicit device selection.
+
+6. `cjson_stub.c` is always part of `sbs-common` despite optional libcjson dependency.
+   - Files: `src/common/meson.build:1`, `src/common/cjson_stub.c`, `src/worker/meson.build:4`, `src/worker/meson.build:30`.
+   - Problem: The project has a local cJSON implementation called a stub, but the worker also depends on real libcjson when available. This makes ownership of JSON behavior unclear.
+   - Impact: Server and worker may not parse/print exactly the same JSON edge cases. The local parser does not fully implement JSON string escapes such as unicode sequences.
+   - Cleanup: Prefer real libcjson everywhere when available, or rename/own the local implementation as a deliberate minimal JSON library with tests for expected behavior.
+
+7. Export slot initialization leaks partial resources on failure.
+   - Files: `src/server/engine/export_dest.c:82`, `src/server/engine/export_dest.c:97`, `src/server/engine/export_dest.c:104`, `src/server/engine/export_dest.c:122`, `src/server/engine/export_dest.c:127`, `src/server/engine/export_dest.c:151`.
+   - Problem: Multiple early `return -1` paths occur after Vulkan buffers, DMA-BUF fds, or dup fds are created.
+   - Impact: Initialization failures leak resources and make retry behavior unreliable.
+   - Cleanup: Use a single `fail:` path that calls the same cleanup logic used by slot destruction.
+
+8. Direct VENC header generation is a no-op API.
+   - Files: `src/server/engine/direct_venc.c:516`, `src/server/engine/encoder_manager.c:690`.
+   - Problem: `sbs_direct_venc_generate_header()` returns success without generating anything.
+   - Impact: This is dead compatibility surface and can mislead future code into thinking headers are available.
+   - Cleanup: Remove the API and callsite, or implement real header extraction.
+
+9. Source and output supervisors duplicate lifecycle code with different stop semantics.
+   - Files: `src/server/supervisor/source_supervisor.c:304`, `src/server/supervisor/output_supervisor.c:287`.
+   - Problem: Both implement socket setup, fork/exec, child watch, restart, shutdown, and cleanup independently. Source stop removes from the hash table immediately; output stop defers cleanup differently.
+   - Impact: Behavior drift is likely, and lifecycle bugs must be fixed twice.
+   - Cleanup: Extract common worker-supervisor lifecycle code or document differences with tests.
+
+10. Output start marks state running before real sink success is proven.
+    - Files: `src/server/api/handlers/output.c:264`, `src/server/api/handlers/output.c:267`, `src/server/config/config_manager.c:416`, `src/server/config/config_manager.c:440`.
+    - Problem: Output state is updated based on branch/worker launch rather than confirmed downstream stream readiness.
+    - Impact: UI can show `running` even when the sink branch is dead/faked/misconfigured.
+    - Cleanup: Use a real output health transition: `starting` until sink branch reaches PLAYING and no bus error occurs.
+
+## Low-Severity / Cleanup Findings
+
+1. Small memory leak in instance path derivation.
+   - File: `src/server/instance_manager.c:67`.
+   - Problem: `g_strdup_printf("instance-%u.sock", ...)` is passed directly into `g_build_filename()` and never freed.
+   - Cleanup: Store it in a temporary variable and free it after `g_build_filename()`.
+
+2. Upload API falls back to global config dir when no config manager exists.
+   - Files: `src/server/api/handlers/source.c:433`, `src/server/api/handlers/source.c:434`.
+   - Problem: This hides missing server config wiring.
+   - Cleanup: Require a config manager for uploads, or centralize default config-dir resolution.
+
+3. Tests assert secret round-trip behavior.
+   - File: `tests/test_jsonrpc.c:247`.
+   - Problem: The test locks in a behavior that should be removed.
+   - Cleanup: Change expected behavior to `rtmp_passcode_set` or redacted value after API redaction is implemented.
+
+4. Tests use stubbed binaries/paths and may not cover real instance routing.
+   - File: `tests/test_jsonrpc.c:76`.
+   - Problem: Instance manager tests use a trivial executable and temporary roots, so control-socket routing is not exercised.
+   - Cleanup: Add one fake controllable child server/socket responder test.
+
+5. `SBS_FRAME_FLAG_CORRUPTED` appears overloaded for CPU-buffer signaling.
+   - File: `src/worker/source_worker.c:1056`.
+   - Problem: A corruption flag should not mean non-DMA/CPU buffer.
+   - Cleanup: Add a dedicated frame flag or rely on `buffer_type`.
+
+## Suggested Refactor Order
+
+1. Remove or hard-disable unsafe YUV DMA-BUF encode submission.
+    - This should be first because it can reintroduce known pipeline hangs.
+    - Danger marker: Do not implement this by mapping/syncing the encoder DMA-BUF per frame. That path regressed badly on target and must be redesigned later.
+
+2. Make encoder/router frame submission return real status.
+   - Fix counters and logs so streaming diagnostics are truthful.
+
+3. Stop silent `fakesink` fallback.
+   - Fail output creation/start unless `fakesink` is explicitly requested.
+
+4. Consolidate source-start-config derivation.
+   - One helper for API starts and config restore.
+
+5. Redact/passcode handling.
+   - Stop returning secrets in serialized output state and update tests.
+
+6. Replace output supervisor JSON string building with cJSON.
+   - Also validate IDs before they enter socket paths.
+
+7. Decide output worker fate.
+   - Either delete legacy output worker/supervisor path from production, or make it a first-class tested path with shared helpers.
+
+8. Move public/local URL and device defaults into config.
+   - Preview URL, snapshot URL/dir, capture device, and audio device should not be hardcoded in runtime code.
+
+9. Cleanup resource failure paths.
+   - Export slot init and similar Vulkan/fd setup should use single cleanup labels.
+
+10. Tighten tests.
+    - Add tests for redaction, bad sink behavior, config restore unknown source type, source-start-config parity, and invalid IDs.
+
+## Quick Wins
+
+1. Make `sbs_direct_venc_submit_dmabuf()` immediately return `SBS_ERR_UNSUPPORTED` for NV21/P010.
+2. Change `create_sink()` to return `NULL` unless `sink_type == "fakesink"` explicitly.
+3. Delete `sbs_direct_venc_generate_header()` if no caller needs it.
+4. Fix the `g_strdup_printf` leak in `derive_paths()`.
+5. Add ID validation before source/output creation.
+6. Replace `build_config_json()` with cJSON in `output_supervisor.c`.
+
+## Bottom Line
+
+The server needs a deletion-first refactor. The largest risk is not missing abstractions; it is too many half-supported paths staying callable. Remove fake-success branches, centralize duplicated config derivation, and make metrics reflect actual encode/output success before deeper pipeline work continues.

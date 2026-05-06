@@ -837,12 +837,18 @@ static GstElement *create_muxer(const char *codec, const char *sink_type,
 }
 
 static GstElement *create_sink(const sbs_sink_branch_config_t *config,
-                                const char *muxer_format)
+                                 const char *muxer_format)
 {
     GstElement *sink = NULL;
     const char *sink_type = config->sink_type;
 
-    if (!sink_type || strcmp(sink_type, "srt") == 0) {
+    if (sink_type && strcmp(sink_type, "fakesink") == 0) {
+        sink = gst_element_factory_make("fakesink", NULL);
+        if (sink) {
+            g_object_set(sink, "sync", FALSE, NULL);
+            LOG_I("fakesink selected for output");
+        }
+    } else if (!sink_type || strcmp(sink_type, "srt") == 0) {
         if (config->srt_uri && strlen(config->srt_uri) > 0) {
             sink = gst_element_factory_make("srtsink", NULL);
             if (sink) {
@@ -857,6 +863,8 @@ static GstElement *create_sink(const sbs_sink_branch_config_t *config,
                     NULL);
                 LOG_I("SRT sink: %s latency=%ums sync=0", config->srt_uri, latency_ms);
             }
+        } else {
+            LOG_E("SRT sink requested without srt_uri");
         }
     } else if (strcmp(sink_type, "rtmp") == 0) {
         if (config->rtmp_uri && strlen(config->rtmp_uri) > 0) {
@@ -874,6 +882,8 @@ static GstElement *create_sink(const sbs_sink_branch_config_t *config,
                       config->rtmp_passcode && *config->rtmp_passcode ? " (passcode set)" : "");
             }
             g_free(location);
+        } else {
+            LOG_E("RTMP sink requested without rtmp_uri");
         }
     } else if (strcmp(sink_type, "file") == 0) {
         if (config->file_path && strlen(config->file_path) > 0) {
@@ -882,13 +892,15 @@ static GstElement *create_sink(const sbs_sink_branch_config_t *config,
                 g_object_set(sink, "location", config->file_path, "sync", FALSE, NULL);
                 LOG_I("File sink: %s", config->file_path);
             }
+        } else {
+            LOG_E("file sink requested without file_path");
         }
+    } else {
+        LOG_E("unsupported sink_type='%s'", sink_type);
     }
 
     if (!sink) {
-        sink = gst_element_factory_make("fakesink", NULL);
-        if (sink) g_object_set(sink, "sync", FALSE, NULL);
-        LOG_I("using fakesink for output");
+        LOG_E("failed to create requested output sink '%s'", sink_type ? sink_type : "srt");
     }
 
     return sink;

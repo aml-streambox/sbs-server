@@ -5,7 +5,7 @@
  * Pipeline: appsrc ! [encoder] ! [parser] ! mpegtsmux ! srtsink
  *
  * For target (A311D2): appsrc ! amlvenc ! h265parse ! mpegtsmux ! srtsink
- * For host fallback:   appsrc ! x264enc/x265enc ! parser ! mpegtsmux ! srtsink/fakesink
+ * For host fallback:   appsrc ! x264enc/x265enc ! parser ! mpegtsmux ! srtsink
  *
  * References: document/06-output-manager.md sections 5-7
  */
@@ -287,29 +287,11 @@ static GstElement *build_output_pipeline(sbs_worker_config_t *config)
                                           config->output.encoder,
                                           &parser_name);
     if (!encoder) {
-        /* Fall back to fakesink for testing */
-        LOG_W("no encoder available, using fakesink");
-        GstElement *queue = gst_element_factory_make("queue", "q");
-        GstElement *sink  = gst_element_factory_make("fakesink", "sink");
-
-        if (!queue || !sink) {
-            gst_object_unref(pipeline);
-            gst_object_unref(appsrc);
-            if (queue) gst_object_unref(queue);
-            if (sink) gst_object_unref(sink);
-            return NULL;
-        }
-
-        g_object_set(sink, "sync", FALSE, NULL);
-
-        gst_bin_add_many(GST_BIN(pipeline), appsrc, queue, sink, NULL);
-        if (!gst_element_link_many(appsrc, queue, sink, NULL)) {
-            LOG_E("failed to link fakesink pipeline");
-            gst_object_unref(pipeline);
-            return NULL;
-        }
-
-        return pipeline;
+        LOG_E("no encoder available for output worker");
+        gst_object_unref(pipeline);
+        gst_object_unref(appsrc);
+        gst_object_unref(audio_appsrc);
+        return NULL;
     }
 
     /* Create parser — config-interval=-1 inserts SPS/PPS before every
@@ -391,8 +373,6 @@ static GstElement *build_output_pipeline(sbs_worker_config_t *config)
                 "sync",               FALSE,
                 NULL);
             LOG_I("SRT sink: %s", srt_uri);
-        } else {
-            LOG_W("srtsink not available, using fakesink");
         }
     } else if (sink_type && strcmp(sink_type, "rtmp") == 0 && rtmp_uri && strlen(rtmp_uri) > 0) {
         char *location = build_rtmp_location(rtmp_uri, rtmp_passcode);
@@ -407,8 +387,6 @@ static GstElement *build_output_pipeline(sbs_worker_config_t *config)
                 NULL);
             LOG_I("RTMP sink: %s%s", rtmp_uri,
                   rtmp_passcode && *rtmp_passcode ? " (passcode set)" : "");
-        } else {
-            LOG_W("rtmp2sink/rtmpsink not available, using fakesink");
         }
         g_free(location);
     } else if (sink_type && strcmp(sink_type, "file") == 0 && file_path && strlen(file_path) > 0) {
@@ -419,20 +397,17 @@ static GstElement *build_output_pipeline(sbs_worker_config_t *config)
                 "sync",     FALSE,
                 NULL);
             LOG_I("File sink: %s", file_path);
-        } else {
-            LOG_W("filesink not available, using fakesink");
+        }
+    } else if (sink_type && strcmp(sink_type, "fakesink") == 0) {
+        sink = gst_element_factory_make("fakesink", "sink");
+        if (sink) {
+            g_object_set(sink, "sync", FALSE, NULL);
+            LOG_I("fakesink selected");
         }
     }
 
     if (!sink) {
-        sink = gst_element_factory_make("fakesink", "sink");
-        g_object_set(sink, "sync", FALSE, NULL);
-        if (sink_type && strcmp(sink_type, "fakesink") != 0) {
-            LOG_I("sink_type='%s' falling back to fakesink",
-                  sink_type ? sink_type : "(null)");
-        } else {
-            LOG_I("fakesink selected");
-        }
+        LOG_E("failed to create requested output sink '%s'", sink_type ? sink_type : "srt");
     }
 
     if (!muxer || !sink || !q1 || !q2 || !aq1 || !aconv || !aresample || !aenc || !aparse) {

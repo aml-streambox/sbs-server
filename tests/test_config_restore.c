@@ -7,6 +7,9 @@ static sbs_api_server_t *server;
 static sbs_config_manager_t *mgr;
 static char *tmpdir;
 
+void test_api_stubs_reset_last_source_start(void);
+const char *test_api_stubs_last_source_output_format(void);
+
 static void setup_restore(void)
 {
     graph = sbs_scene_graph_new_default();
@@ -119,6 +122,44 @@ SBS_TEST_FIXTURE(config_restore, older_schema_bundle_migrates, setup_restore, te
     cJSON_AddItemToObject(state, "state", cJSON_CreateObject());
     cJSON_AddItemToObject(bundle, "state", state);
     SBS_ASSERT_EQ(sbs_config_manager_apply_bundle(mgr, server, bundle), SBS_OK);
+    cJSON_Delete(bundle);
+}
+
+SBS_TEST_FIXTURE(config_restore, vfmcap_restore_preserves_output_format, setup_restore, teardown_restore)
+{
+    cJSON *bundle = cJSON_CreateObject();
+    cJSON *state = cJSON_CreateObject();
+    cJSON *canvas = cJSON_CreateObject();
+    cJSON *sources = cJSON_CreateObject();
+    cJSON *source = cJSON_CreateObject();
+    cJSON *config = cJSON_CreateObject();
+
+    cJSON_AddNumberToObject(bundle, "schema_version", 1);
+    cJSON_AddStringToObject(bundle, "kind", "sbs-config");
+    cJSON_AddNumberToObject(canvas, "width", 3840);
+    cJSON_AddNumberToObject(canvas, "height", 2160);
+    cJSON_AddNumberToObject(canvas, "fps_num", 60);
+    cJSON_AddNumberToObject(canvas, "fps_den", 1);
+    cJSON_AddStringToObject(canvas, "color_mode", "hdr10");
+    cJSON_AddStringToObject(canvas, "background_color", "#000000");
+    cJSON_AddStringToObject(source, "type", "vfmcap");
+    cJSON_AddBoolToObject(source, "enabled", true);
+    cJSON_AddStringToObject(config, "output_format", "nv12");
+    cJSON_AddItemToObject(source, "config", config);
+    cJSON_AddItemToObject(sources, "cap", source);
+    cJSON_AddItemToObject(state, "canvas", canvas);
+    cJSON_AddItemToObject(state, "sources", sources);
+    cJSON_AddItemToObject(state, "scenes", cJSON_CreateObject());
+    cJSON_AddItemToObject(state, "output_groups", cJSON_CreateObject());
+    cJSON_AddItemToObject(state, "transitions", cJSON_CreateObject());
+    cJSON_AddItemToObject(state, "state", cJSON_CreateObject());
+    cJSON_AddItemToObject(bundle, "state", state);
+
+    server->source_sup = (sbs_source_supervisor_t *)0x1;
+    test_api_stubs_reset_last_source_start();
+    SBS_ASSERT_EQ(sbs_config_manager_apply_bundle(mgr, server, bundle), SBS_OK);
+    SBS_ASSERT_STR_EQ(test_api_stubs_last_source_output_format(), "nv12");
+    server->source_sup = NULL;
     cJSON_Delete(bundle);
 }
 

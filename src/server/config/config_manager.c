@@ -82,7 +82,8 @@ static void fill_source_start_config(sbs_api_server_t *server,
 
     if (source->kind == SBS_SOURCE_KIND_VFMCAP) {
         cfg->capture_mode = "passthrough";
-        cfg->output_format = canvas_vfmcap_output_format(server);
+        cfg->output_format = source_config_string(source, "output_format");
+        if (!cfg->output_format) cfg->output_format = canvas_vfmcap_output_format(server);
         if (!cfg->device_path) cfg->device_path = "/dev/video_cap";
     } else if (source->kind == SBS_SOURCE_KIND_VIDEOTESTSRC) {
         uint32_t default_w = MIN(cfg->width, 1280u);

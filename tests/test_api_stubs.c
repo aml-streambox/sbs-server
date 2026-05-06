@@ -6,6 +6,18 @@
 
 #include <string.h>
 
+static char last_source_output_format[32];
+
+void test_api_stubs_reset_last_source_start(void)
+{
+    last_source_output_format[0] = '\0';
+}
+
+const char *test_api_stubs_last_source_output_format(void)
+{
+    return last_source_output_format[0] ? last_source_output_format : NULL;
+}
+
 int sbs_compositor_thread_set_scene(sbs_compositor_thread_t *ct,
                                     const sbs_comp_scene_state_t *state)
 {
@@ -106,12 +118,14 @@ void sbs_output_router_set_color_mode(sbs_output_router_t *router,
 }
 
 int sbs_source_supervisor_start_source(sbs_source_supervisor_t *sup,
-                                       const sbs_source_start_config_t *config,
-                                       sbs_frame_slot_t *slot)
+                                        const sbs_source_start_config_t *config,
+                                        sbs_frame_slot_t *slot)
 {
     (void)sup;
-    (void)config;
     (void)slot;
+    g_strlcpy(last_source_output_format,
+              config && config->output_format ? config->output_format : "",
+              sizeof(last_source_output_format));
     return 0;
 }
 

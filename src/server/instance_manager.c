@@ -366,9 +366,6 @@ static cJSON *serialize_entry(sbs_instance_entry_t *entry)
     cJSON_AddNumberToObject(obj, "pid", (double)entry->pid);
     cJSON_AddNumberToObject(obj, "api_port", (double)entry->api_port);
     cJSON_AddNumberToObject(obj, "preview_port", (double)entry->preview_port);
-    cJSON_AddStringToObject(obj, "config_dir", entry->config_dir ? entry->config_dir : "");
-    cJSON_AddStringToObject(obj, "control_socket_path", entry->control_socket_path ? entry->control_socket_path : "");
-    cJSON_AddStringToObject(obj, "log_path", entry->log_path ? entry->log_path : "");
     return obj;
 }
 

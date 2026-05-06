@@ -210,6 +210,19 @@ SBS_TEST_FIXTURE(jsonrpc, source_upload_requires_data, setup_api, teardown_api)
     free(response);
 }
 
+SBS_TEST_FIXTURE(jsonrpc, source_upload_requires_config_manager, setup_api, teardown_api)
+{
+    char *response = NULL;
+    sbs_config_manager_free(server->config);
+    server->config = NULL;
+    SBS_ASSERT_EQ(sbs_api_server_dispatch_json(server, client,
+        "{\"jsonrpc\":\"2.0\",\"id\":29,\"method\":\"source.uploadAsset\",\"params\":{\"asset_kind\":\"image\",\"filename\":\"x.png\",\"data_base64\":\"aGk=\"}}",
+        &response), SBS_OK);
+    SBS_ASSERT_NOT_NULL(response);
+    SBS_ASSERT(strstr(response, "config manager not initialized") != NULL);
+    free(response);
+}
+
 SBS_TEST_FIXTURE(jsonrpc, source_upload_sanitizes_path_traversal_filename, setup_api, teardown_api)
 {
     char *response = NULL;
@@ -348,6 +361,9 @@ SBS_TEST_FIXTURE(jsonrpc, instance_list_returns_inventory, setup_controller_api,
     SBS_ASSERT(strstr(response, "instances") != NULL);
     SBS_ASSERT(strstr(response, "instance_id") != NULL);
     SBS_ASSERT(strstr(response, "Default") != NULL);
+    SBS_ASSERT(strstr(response, "config_dir") == NULL);
+    SBS_ASSERT(strstr(response, "control_socket_path") == NULL);
+    SBS_ASSERT(strstr(response, "log_path") == NULL);
     free(response);
 }
 

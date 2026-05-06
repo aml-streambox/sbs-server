@@ -22,6 +22,7 @@
 #include "sbs/ipc_transport.h"
 #include "sbs/log.h"
 
+#include <cjson/cJSON.h>
 #include <glib-unix.h>
 
 #include <errno.h>
@@ -601,66 +602,53 @@ static void output_entry_free(sbs_output_entry_t *entry)
 static char *build_config_json(const sbs_output_entry_t *entry)
 {
     const sbs_output_start_config_t *cfg = &entry->config_copy;
-    char buf[1024];
-    int n = snprintf(buf, sizeof(buf),
-        "{"
-        "\"mode\":\"output\","
-        "\"worker_id\":\"%s\","
-        "\"socket_path\":\"%s\","
-        "\"width\":%u,"
-        "\"height\":%u,"
-        "\"framerate_num\":%u,"
-        "\"framerate_den\":%u",
-        entry->output_id,
-        entry->socket_path,
-        cfg->width,
-        cfg->height,
-        cfg->framerate_num,
-        cfg->framerate_den > 0 ? cfg->framerate_den : 1);
+    cJSON *obj = cJSON_CreateObject();
+    char *json;
+
+    if (!obj) return NULL;
+
+    cJSON_AddStringToObject(obj, "mode", "output");
+    cJSON_AddStringToObject(obj, "worker_id", entry->output_id ? entry->output_id : "");
+    cJSON_AddStringToObject(obj, "socket_path", entry->socket_path ? entry->socket_path : "");
+    cJSON_AddNumberToObject(obj, "width", cfg->width);
+    cJSON_AddNumberToObject(obj, "height", cfg->height);
+    cJSON_AddNumberToObject(obj, "framerate_num", cfg->framerate_num);
+    cJSON_AddNumberToObject(obj, "framerate_den", cfg->framerate_den > 0 ? cfg->framerate_den : 1);
 
     if (cfg->codec) {
-        n += snprintf(buf + n, sizeof(buf) - (size_t)n,
-                      ",\"codec\":\"%s\"", cfg->codec);
+        cJSON_AddStringToObject(obj, "codec", cfg->codec);
     }
     if (cfg->bitrate_kbps > 0) {
-        n += snprintf(buf + n, sizeof(buf) - (size_t)n,
-                      ",\"bitrate_kbps\":%u", cfg->bitrate_kbps);
+        cJSON_AddNumberToObject(obj, "bitrate_kbps", cfg->bitrate_kbps);
     }
     if (cfg->encoder) {
-        n += snprintf(buf + n, sizeof(buf) - (size_t)n,
-                      ",\"encoder\":\"%s\"", cfg->encoder);
+        cJSON_AddStringToObject(obj, "encoder", cfg->encoder);
     }
     if (cfg->sink_type) {
-        n += snprintf(buf + n, sizeof(buf) - (size_t)n,
-                      ",\"sink_type\":\"%s\"", cfg->sink_type);
+        cJSON_AddStringToObject(obj, "sink_type", cfg->sink_type);
     }
     if (cfg->srt_uri) {
-        n += snprintf(buf + n, sizeof(buf) - (size_t)n,
-                      ",\"srt_uri\":\"%s\"", cfg->srt_uri);
+        cJSON_AddStringToObject(obj, "srt_uri", cfg->srt_uri);
     }
     if (cfg->srt_latency_ms > 0) {
-        n += snprintf(buf + n, sizeof(buf) - (size_t)n,
-                      ",\"srt_latency_ms\":%u", cfg->srt_latency_ms);
+        cJSON_AddNumberToObject(obj, "srt_latency_ms", cfg->srt_latency_ms);
     }
     if (cfg->rtmp_uri) {
-        n += snprintf(buf + n, sizeof(buf) - (size_t)n,
-                      ",\"rtmp_uri\":\"%s\"", cfg->rtmp_uri);
+        cJSON_AddStringToObject(obj, "rtmp_uri", cfg->rtmp_uri);
     }
     if (cfg->rtmp_passcode) {
-        n += snprintf(buf + n, sizeof(buf) - (size_t)n,
-                      ",\"rtmp_passcode\":\"%s\"", cfg->rtmp_passcode);
+        cJSON_AddStringToObject(obj, "rtmp_passcode", cfg->rtmp_passcode);
     }
     if (cfg->file_path) {
-        n += snprintf(buf + n, sizeof(buf) - (size_t)n,
-                      ",\"file_path\":\"%s\"", cfg->file_path);
+        cJSON_AddStringToObject(obj, "file_path", cfg->file_path);
     }
     if (cfg->gop_size > 0) {
-        n += snprintf(buf + n, sizeof(buf) - (size_t)n,
-                      ",\"gop_size\":%u", cfg->gop_size);
+        cJSON_AddNumberToObject(obj, "gop_size", cfg->gop_size);
     }
 
-    snprintf(buf + n, sizeof(buf) - (size_t)n, "}");
-    return strdup(buf);
+    json = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+    return json;
 }
 
 /**

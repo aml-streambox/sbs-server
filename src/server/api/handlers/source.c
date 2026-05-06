@@ -431,7 +431,11 @@ int sbs_api_handle_source_upload_asset(sbs_api_server_t *server, sbs_api_client_
     }
 
     config_dir = server && server->config ? sbs_config_manager_config_dir(server->config) : NULL;
-    if (!config_dir) config_dir = "/var/lib/sbs";
+    if (!config_dir) {
+        g_free(decoded);
+        *error = api_error(-32006, "Upload unavailable: config manager not initialized");
+        return SBS_ERR_INVAL;
+    }
     safe = sanitize_filename(filename);
     stamp = g_get_real_time();
     stored_name = g_strdup_printf("%" G_GINT64_FORMAT "-%s", stamp, safe);

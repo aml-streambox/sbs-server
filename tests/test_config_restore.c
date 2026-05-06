@@ -11,6 +11,9 @@ void test_api_stubs_reset_last_source_start(void);
 const char *test_api_stubs_last_source_output_format(void);
 void test_api_stubs_set_source_start_result(int result);
 unsigned test_api_stubs_source_start_count(void);
+void test_api_stubs_reset_output_start(void);
+void test_api_stubs_set_output_start_result(int result);
+unsigned test_api_stubs_output_start_count(void);
 
 static void setup_restore(void)
 {
@@ -204,6 +207,76 @@ SBS_TEST_FIXTURE(config_restore, source_restore_start_failure_marks_error, setup
     SBS_ASSERT_STR_EQ(restored->runtime_state, "error");
     SBS_ASSERT_EQ(test_api_stubs_source_start_count(), 1u);
     server->source_sup = NULL;
+    cJSON_Delete(bundle);
+}
+
+SBS_TEST_FIXTURE(config_restore, output_restore_preserves_encoder_config, setup_restore, teardown_restore)
+{
+    cJSON *bundle = cJSON_CreateObject();
+    cJSON *state = cJSON_CreateObject();
+    cJSON *outputs = cJSON_CreateObject();
+    cJSON *output = cJSON_CreateObject();
+    cJSON *encoder = cJSON_CreateObject();
+    sbs_output_state_t *restored = NULL;
+
+    cJSON_AddNumberToObject(bundle, "schema_version", 1);
+    cJSON_AddStringToObject(bundle, "kind", "sbs-config");
+    cJSON_AddStringToObject(output, "name", "Output");
+    cJSON_AddBoolToObject(output, "enabled", true);
+    cJSON_AddBoolToObject(output, "autostart", false);
+    cJSON_AddStringToObject(encoder, "sink_type", "fakesink");
+    cJSON_AddStringToObject(encoder, "bitrate_kbps", "1234");
+    cJSON_AddItemToObject(output, "encoder", encoder);
+    cJSON_AddItemToObject(outputs, "out", output);
+    cJSON_AddItemToObject(state, "sources", cJSON_CreateObject());
+    cJSON_AddItemToObject(state, "scenes", cJSON_CreateObject());
+    cJSON_AddItemToObject(state, "output_groups", outputs);
+    cJSON_AddItemToObject(state, "transitions", cJSON_CreateObject());
+    cJSON_AddItemToObject(state, "state", cJSON_CreateObject());
+    cJSON_AddItemToObject(bundle, "state", state);
+
+    SBS_ASSERT_EQ(sbs_config_manager_apply_bundle(mgr, server, bundle), SBS_OK);
+    restored = sbs_scene_graph_get_output(server->scene_graph, "out");
+    SBS_ASSERT_NOT_NULL(restored);
+    SBS_ASSERT_STR_EQ(g_hash_table_lookup(restored->encoder, "sink_type"), "fakesink");
+    SBS_ASSERT_STR_EQ(g_hash_table_lookup(restored->encoder, "bitrate_kbps"), "1234");
+    cJSON_Delete(bundle);
+}
+
+SBS_TEST_FIXTURE(config_restore, output_restore_start_failure_marks_error, setup_restore, teardown_restore)
+{
+    cJSON *bundle = cJSON_CreateObject();
+    cJSON *state = cJSON_CreateObject();
+    cJSON *outputs = cJSON_CreateObject();
+    cJSON *output = cJSON_CreateObject();
+    cJSON *encoder = cJSON_CreateObject();
+    sbs_output_state_t *restored = NULL;
+
+    cJSON_AddNumberToObject(bundle, "schema_version", 1);
+    cJSON_AddStringToObject(bundle, "kind", "sbs-config");
+    cJSON_AddStringToObject(output, "name", "Output");
+    cJSON_AddBoolToObject(output, "enabled", true);
+    cJSON_AddBoolToObject(output, "autostart", true);
+    cJSON_AddStringToObject(encoder, "sink_type", "fakesink");
+    cJSON_AddItemToObject(output, "encoder", encoder);
+    cJSON_AddItemToObject(outputs, "out", output);
+    cJSON_AddItemToObject(state, "sources", cJSON_CreateObject());
+    cJSON_AddItemToObject(state, "scenes", cJSON_CreateObject());
+    cJSON_AddItemToObject(state, "output_groups", outputs);
+    cJSON_AddItemToObject(state, "transitions", cJSON_CreateObject());
+    cJSON_AddItemToObject(state, "state", cJSON_CreateObject());
+    cJSON_AddItemToObject(bundle, "state", state);
+
+    server->output_sup = (sbs_output_supervisor_t *)0x1;
+    test_api_stubs_reset_output_start();
+    test_api_stubs_set_output_start_result(-1);
+    SBS_ASSERT_EQ(sbs_config_manager_apply_bundle(mgr, server, bundle), SBS_OK);
+    restored = sbs_scene_graph_get_output(server->scene_graph, "out");
+    SBS_ASSERT_NOT_NULL(restored);
+    SBS_ASSERT_EQ(restored->running, false);
+    SBS_ASSERT_STR_EQ(restored->runtime_state, "error");
+    SBS_ASSERT_EQ(test_api_stubs_output_start_count(), 1u);
+    server->output_sup = NULL;
     cJSON_Delete(bundle);
 }
 

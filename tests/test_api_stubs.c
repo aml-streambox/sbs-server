@@ -9,6 +9,8 @@
 static char last_source_output_format[32];
 static int source_start_result;
 static unsigned source_start_count;
+static int output_start_result;
+static unsigned output_start_count;
 
 void test_api_stubs_reset_last_source_start(void)
 {
@@ -30,6 +32,22 @@ void test_api_stubs_set_source_start_result(int result)
 unsigned test_api_stubs_source_start_count(void)
 {
     return source_start_count;
+}
+
+void test_api_stubs_reset_output_start(void)
+{
+    output_start_result = 0;
+    output_start_count = 0;
+}
+
+void test_api_stubs_set_output_start_result(int result)
+{
+    output_start_result = result;
+}
+
+unsigned test_api_stubs_output_start_count(void)
+{
+    return output_start_count;
 }
 
 int sbs_compositor_thread_set_scene(sbs_compositor_thread_t *ct,
@@ -190,7 +208,8 @@ int sbs_output_supervisor_start_output(sbs_output_supervisor_t *sup,
 {
     (void)sup;
     (void)config;
-    return 0;
+    output_start_count++;
+    return output_start_result;
 }
 
 int sbs_output_supervisor_stop_output(sbs_output_supervisor_t *sup,

@@ -429,6 +429,7 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
 
             if (server->encoder_mgr) {
                 sbs_sink_branch_config_t sink_cfg = {0};
+                int rc;
                 sink_cfg.output_id      = output->id;
                 sink_cfg.sink_type      = sink_type;
                 sink_cfg.srt_uri        = srt_uri;
@@ -436,7 +437,14 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
                 sink_cfg.rtmp_uri       = rtmp_uri;
                 sink_cfg.rtmp_passcode  = rtmp_passcode;
                 sink_cfg.file_path      = file_path;
-                sbs_encoder_manager_add_sink(server->encoder_mgr, &sink_cfg);
+                rc = sbs_encoder_manager_add_sink(server->encoder_mgr, &sink_cfg);
+                if (rc != SBS_OK) {
+                    LOG_E("failed to restore output '%s': %d", output->id, rc);
+                    output->running = false;
+                    g_free(output->runtime_state);
+                    output->runtime_state = g_strdup("error");
+                    continue;
+                }
                 output->running = true;
                 g_free(output->runtime_state);
                 output->runtime_state = g_strdup("running");
@@ -460,7 +468,14 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
                 cfg.rtmp_passcode = rtmp_passcode;
                 cfg.file_path     = file_path;
                 cfg.gop_size      = gop_str ? (uint32_t)strtoul(gop_str, NULL, 10) : fps_num;
-                sbs_output_supervisor_start_output(server->output_sup, &cfg);
+                int rc = sbs_output_supervisor_start_output(server->output_sup, &cfg);
+                if (rc != SBS_OK) {
+                    LOG_E("failed to restore output '%s': %d", output->id, rc);
+                    output->running = false;
+                    g_free(output->runtime_state);
+                    output->runtime_state = g_strdup("error");
+                    continue;
+                }
                 output->running = true;
                 g_free(output->runtime_state);
                 output->runtime_state = g_strdup("starting");
@@ -597,7 +612,13 @@ static int apply_scene_graph_bundle(sbs_api_server_t *server, cJSON *bundle)
 
     for (entry = outputs ? outputs->child : NULL; entry; entry = entry->next) {
         sbs_output_create_params_t op = { entry->string, json_str(entry, "name"), json_bool(entry, "enabled", true), json_bool(entry, "autostart", false) };
-        sbs_scene_graph_create_output(graph, &op, NULL);
+        sbs_output_state_t *output = NULL;
+        sbs_scene_graph_create_output(graph, &op, &output);
+        if (output) {
+            cJSON *encoder = cJSON_GetObjectItemCaseSensitive(entry, "encoder");
+            g_hash_table_destroy(output->encoder);
+            output->encoder = json_object_to_map(encoder);
+        }
     }
 
     if (state && cJSON_IsObject(state)) {

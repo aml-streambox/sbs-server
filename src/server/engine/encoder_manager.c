@@ -687,10 +687,6 @@ static int ensure_pipeline(sbs_encoder_manager_t *mgr)
     mgr->audio_pts_origin_ns = 0;
     mgr->audio_running_origin_ns = 0;
 
-    sbs_direct_venc_packet_t header = {0};
-    if (sbs_direct_venc_generate_header(mgr->video_encoder, &header) == SBS_OK && header.size > 0)
-        push_encoded_packet(mgr, &header);
-
     LOG_I("encoder pipeline PLAYING: %ux%u@%u/%u codec=%s bitrate=%u",
           mgr->width, mgr->height, mgr->fps_num, mgr->fps_den,
           mgr->codec ? mgr->codec : "h265", mgr->bitrate_kbps);

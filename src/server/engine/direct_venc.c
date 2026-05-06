@@ -513,14 +513,6 @@ void sbs_direct_venc_free(sbs_direct_venc_t *enc)
     g_free(enc);
 }
 
-int sbs_direct_venc_generate_header(sbs_direct_venc_t *enc,
-                                    sbs_direct_venc_packet_t *packet)
-{
-    (void)enc;
-    (void)packet;
-    return SBS_OK;
-}
-
 int sbs_direct_venc_submit_ptr(sbs_direct_venc_t *enc,
                                 const sbs_video_frame_msg_t *msg,
                                 const void *data,

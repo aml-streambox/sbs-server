@@ -57,6 +57,7 @@ static uint16_t instance_api_port(uint32_t instance_id)
 static void derive_paths(sbs_instance_manager_t *mgr, sbs_instance_entry_t *entry)
 {
     char *id_str;
+    char *socket_name;
     entry->api_port = instance_api_port(entry->instance_id);
     entry->preview_port = (uint16_t)(entry->api_port + 1U);
     g_free(entry->config_dir);
@@ -64,10 +65,10 @@ static void derive_paths(sbs_instance_manager_t *mgr, sbs_instance_entry_t *entr
     g_free(entry->log_path);
     id_str = g_strdup_printf("%u", entry->instance_id);
     entry->config_dir = g_build_filename(mgr->instances_root, id_str, NULL);
-    entry->control_socket_path = g_build_filename(mgr->socket_root,
-                                                  g_strdup_printf("instance-%u.sock", entry->instance_id),
-                                                  NULL);
+    socket_name = g_strdup_printf("instance-%u.sock", entry->instance_id);
+    entry->control_socket_path = g_build_filename(mgr->socket_root, socket_name, NULL);
     entry->log_path = g_build_filename(entry->config_dir, "instance.log", NULL);
+    g_free(socket_name);
     g_free(id_str);
 }
 

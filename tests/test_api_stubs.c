@@ -7,15 +7,29 @@
 #include <string.h>
 
 static char last_source_output_format[32];
+static int source_start_result;
+static unsigned source_start_count;
 
 void test_api_stubs_reset_last_source_start(void)
 {
     last_source_output_format[0] = '\0';
+    source_start_result = 0;
+    source_start_count = 0;
 }
 
 const char *test_api_stubs_last_source_output_format(void)
 {
     return last_source_output_format[0] ? last_source_output_format : NULL;
+}
+
+void test_api_stubs_set_source_start_result(int result)
+{
+    source_start_result = result;
+}
+
+unsigned test_api_stubs_source_start_count(void)
+{
+    return source_start_count;
 }
 
 int sbs_compositor_thread_set_scene(sbs_compositor_thread_t *ct,
@@ -123,10 +137,11 @@ int sbs_source_supervisor_start_source(sbs_source_supervisor_t *sup,
 {
     (void)sup;
     (void)slot;
+    source_start_count++;
     g_strlcpy(last_source_output_format,
               config && config->output_format ? config->output_format : "",
               sizeof(last_source_output_format));
-    return 0;
+    return source_start_result;
 }
 
 int sbs_source_supervisor_stop_source(sbs_source_supervisor_t *sup,

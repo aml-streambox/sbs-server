@@ -388,8 +388,17 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
         sbs_source_state_t *source = value;
         if (source->enabled && server->source_sup) {
             sbs_source_start_config_t cfg = {0};
+            int rc;
             fill_source_start_config(server, source, &cfg);
-            sbs_source_supervisor_start_source(server->source_sup, &cfg, &source->frame_slot);
+            rc = sbs_source_supervisor_start_source(server->source_sup, &cfg, &source->frame_slot);
+            if (rc != SBS_OK) {
+                LOG_E("failed to restore source '%s': %d", source->id, rc);
+                source->running = false;
+                g_free(source->runtime_state);
+                source->runtime_state = g_strdup("error");
+                continue;
+            }
+            source->running = true;
             source->frame_width = cfg.width;
             source->frame_height = cfg.height;
             source->color_depth = source->kind == SBS_SOURCE_KIND_VFMCAP &&
@@ -398,6 +407,8 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
             g_strlcpy(source->color_space, source->color_depth > 8 ? "BT.2020" : "BT.709",
                       sizeof(source->color_space));
             g_strlcpy(source->hdr_eotf, "SDR", sizeof(source->hdr_eotf));
+            g_free(source->runtime_state);
+            source->runtime_state = g_strdup("starting");
         }
     }
 
@@ -606,30 +617,6 @@ static int apply_scene_graph_bundle(sbs_api_server_t *server, cJSON *bundle)
 
     if (audio && server->audio) {
         sbs_audio_mixer_set_master(server->audio, json_num(audio, "master_volume", 1.0), json_bool(audio, "master_mute", false));
-    }
-
-    {
-        GHashTableIter src_iter;
-        gpointer skey, svalue;
-        g_hash_table_iter_init(&src_iter, graph->sources);
-        while (g_hash_table_iter_next(&src_iter, &skey, &svalue)) {
-            sbs_source_state_t *src = (sbs_source_state_t *)svalue;
-            bool should_start = src->keep_alive;
-            if (!should_start) {
-                int refs = sbs_scene_graph_count_source_refs(graph, src->id);
-                should_start = refs > 0;
-            }
-            if (should_start && !src->running) {
-                cJSON *sp = cJSON_CreateObject();
-                cJSON_AddStringToObject(sp, "id", src->id);
-                cJSON *sr = NULL;
-                cJSON *se = NULL;
-                sbs_api_handle_source_start(server, NULL, sp, &sr, &se);
-                cJSON_Delete(sp);
-                if (sr) cJSON_Delete(sr);
-                if (se) cJSON_Delete(se);
-            }
-        }
     }
 
     return SBS_OK;

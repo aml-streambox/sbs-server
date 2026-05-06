@@ -2,6 +2,13 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+if [ -f "$ROOT_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$ROOT_DIR/.env"
+    set +a
+fi
+
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build-sdk}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/artifacts/sdk-package}"
 GENERATED_CROSS_DIR="$ROOT_DIR/cross/generated"

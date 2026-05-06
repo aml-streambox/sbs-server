@@ -614,6 +614,20 @@ const char *sbs_scene_graph_source_kind_name(sbs_source_kind_t kind)
     }
 }
 
+bool sbs_scene_graph_parse_source_kind(const char *type, sbs_source_kind_t *out_kind)
+{
+    if (!out_kind) return false;
+    if (!type || strcmp(type, "videotestsrc") == 0) *out_kind = SBS_SOURCE_KIND_VIDEOTESTSRC;
+    else if (strcmp(type, "streamboxsrc") == 0) *out_kind = SBS_SOURCE_KIND_STREAMBOXSRC;
+    else if (strcmp(type, "v4l2src") == 0) *out_kind = SBS_SOURCE_KIND_V4L2SRC;
+    else if (strcmp(type, "uridecodebin") == 0) *out_kind = SBS_SOURCE_KIND_URIDECODEBIN;
+    else if (strcmp(type, "image") == 0) *out_kind = SBS_SOURCE_KIND_IMAGE;
+    else if (strcmp(type, "text") == 0) *out_kind = SBS_SOURCE_KIND_TEXT;
+    else if (strcmp(type, "vfmcap") == 0) *out_kind = SBS_SOURCE_KIND_VFMCAP;
+    else return false;
+    return true;
+}
+
 const char *sbs_scene_graph_transition_kind_name(sbs_transition_kind_t kind)
 {
     switch (kind) {

@@ -4,6 +4,7 @@
 #include "sbs/api_server.h"
 #include "sbs/audio_mixer.h"
 #include "sbs/log.h"
+#include "sbs/source_start_config.h"
 
 #include <cjson/cJSON.h>
 #include <glib/gstdio.h>
@@ -22,103 +23,6 @@ struct sbs_config_manager {
 static const char *json_str(cJSON *obj, const char *key);
 static bool json_bool(cJSON *obj, const char *key, bool fallback);
 static double json_num(cJSON *obj, const char *key, double fallback);
-static bool parse_source_kind(const char *type, sbs_source_kind_t *out_kind);
-
-static const char *source_config_string(sbs_source_state_t *source, const char *key)
-{
-    if (!source || !source->config || !key) return NULL;
-    return g_hash_table_lookup(source->config, key);
-}
-
-static bool source_config_bool(sbs_source_state_t *source, const char *key, bool fallback)
-{
-    const char *value = source_config_string(source, key);
-    if (!value) return fallback;
-    return g_ascii_strcasecmp(value, "true") == 0 ||
-           g_ascii_strcasecmp(value, "yes") == 0 ||
-           strcmp(value, "1") == 0;
-}
-
-static uint32_t source_config_u32(sbs_source_state_t *source, const char *key,
-                                  uint32_t fallback, uint32_t min_value,
-                                  uint32_t max_value)
-{
-    const char *value = source_config_string(source, key);
-    char *end = NULL;
-    guint64 parsed;
-    if (!value || !value[0]) return fallback;
-    parsed = g_ascii_strtoull(value, &end, 10);
-    if (end == value || parsed < min_value || parsed > max_value) return fallback;
-    return (uint32_t)parsed;
-}
-
-static const char *canvas_vfmcap_output_format(sbs_api_server_t *server)
-{
-    return (server && server->scene_graph &&
-            server->scene_graph->canvas.color_mode == SBS_SCENE_COLOR_MODE_HDR10)
-        ? "p010" : "raw";
-}
-
-static void fill_source_start_config(sbs_api_server_t *server,
-                                     sbs_source_state_t *source,
-                                     sbs_source_start_config_t *cfg)
-{
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->source_id = source->id;
-    cfg->source_type = sbs_scene_graph_source_kind_name(source->kind);
-    cfg->width = server->scene_graph->canvas.width;
-    cfg->height = server->scene_graph->canvas.height;
-    cfg->framerate_num = server->scene_graph->canvas.fps_num;
-    cfg->framerate_den = server->scene_graph->canvas.fps_den;
-    cfg->pattern = source_config_string(source, "pattern");
-    if (!cfg->pattern) cfg->pattern = "smpte";
-    cfg->device_path = source_config_string(source, "device");
-    if (!cfg->device_path) cfg->device_path = source_config_string(source, "device_path");
-    cfg->uri = source_config_string(source, "uri");
-    if (!cfg->uri) cfg->uri = source_config_string(source, "path");
-    cfg->loop = source_config_bool(source, "loop",
-                                   source->kind == SBS_SOURCE_KIND_IMAGE ||
-                                   source->kind == SBS_SOURCE_KIND_URIDECODEBIN);
-
-    if (source->kind == SBS_SOURCE_KIND_VFMCAP) {
-        cfg->capture_mode = "passthrough";
-        cfg->output_format = source_config_string(source, "output_format");
-        if (!cfg->output_format) cfg->output_format = canvas_vfmcap_output_format(server);
-        if (!cfg->device_path) cfg->device_path = "/dev/video_cap";
-    } else if (source->kind == SBS_SOURCE_KIND_VIDEOTESTSRC) {
-        uint32_t default_w = MIN(cfg->width, 1280u);
-        uint32_t default_h = MIN(cfg->height, 720u);
-        uint32_t default_fps = MIN(cfg->framerate_num > 0 ? cfg->framerate_num : 30u, 30u);
-        cfg->width = source_config_u32(source, "width", default_w, 16, server->scene_graph->canvas.width);
-        cfg->height = source_config_u32(source, "height", default_h, 16, server->scene_graph->canvas.height);
-        cfg->framerate_num = source_config_u32(source, "fps", default_fps, 1, 120);
-        cfg->framerate_den = 1;
-        cfg->capture_mode = source_config_string(source, "color_mode");
-        cfg->output_format = source_config_string(source, "output_format");
-    } else if (source->kind == SBS_SOURCE_KIND_IMAGE) {
-        uint32_t default_w = MIN(cfg->width, 1280u);
-        uint32_t default_h = MIN(cfg->height, 720u);
-        cfg->width = source_config_u32(source, "width", default_w, 16, server->scene_graph->canvas.width);
-        cfg->height = source_config_u32(source, "height", default_h, 16, server->scene_graph->canvas.height);
-        cfg->framerate_num = source_config_u32(source, "fps", 1u, 1, 30);
-        cfg->framerate_den = 1;
-    } else if (source->kind == SBS_SOURCE_KIND_TEXT) {
-        uint32_t default_w = MIN(cfg->width, 1280u);
-        cfg->width = source_config_u32(source, "width", default_w, 16, server->scene_graph->canvas.width);
-        cfg->height = source_config_u32(source, "height", 256u, 16, server->scene_graph->canvas.height);
-        cfg->framerate_num = source_config_u32(source, "fps", 1u, 1, 30);
-        cfg->framerate_den = 1;
-        cfg->text = source_config_string(source, "text");
-        cfg->font_family = source_config_string(source, "font_family");
-        cfg->font_path = source_config_string(source, "font_path");
-        cfg->text_color = source_config_string(source, "text_color");
-        cfg->text_align = source_config_string(source, "text_align");
-        cfg->font_size = source_config_u32(source, "font_size", 72u, 4, 512);
-    } else {
-        cfg->capture_mode = source_config_string(source, "color_mode");
-        cfg->output_format = source_config_string(source, "output_format");
-    }
-}
 
 static void seed_default_graph(sbs_scene_graph_t *graph)
 {
@@ -180,7 +84,7 @@ static int validate_bundle(cJSON *bundle)
     if (!cJSON_IsObject(scenes) || !cJSON_IsObject(sources)) return SBS_ERR_INVAL;
     for (cJSON *source = sources->child; source; source = source->next) {
         sbs_source_kind_t kind;
-        if (!parse_source_kind(json_str(source, "type"), &kind)) {
+        if (!sbs_scene_graph_parse_source_kind(json_str(source, "type"), &kind)) {
             LOG_W("persisted source '%s' has unsupported type '%s'",
                   source->string ? source->string : "(unknown)",
                   json_str(source, "type") ? json_str(source, "type") : "(null)");
@@ -213,20 +117,6 @@ static int migrate_bundle(cJSON *bundle)
         return SBS_OK;
     }
     return SBS_ERR_INVAL;
-}
-
-static bool parse_source_kind(const char *type, sbs_source_kind_t *out_kind)
-{
-    if (!out_kind) return false;
-    if (!type || strcmp(type, "videotestsrc") == 0) *out_kind = SBS_SOURCE_KIND_VIDEOTESTSRC;
-    else if (strcmp(type, "streamboxsrc") == 0) *out_kind = SBS_SOURCE_KIND_STREAMBOXSRC;
-    else if (strcmp(type, "v4l2src") == 0) *out_kind = SBS_SOURCE_KIND_V4L2SRC;
-    else if (strcmp(type, "uridecodebin") == 0) *out_kind = SBS_SOURCE_KIND_URIDECODEBIN;
-    else if (strcmp(type, "image") == 0) *out_kind = SBS_SOURCE_KIND_IMAGE;
-    else if (strcmp(type, "text") == 0) *out_kind = SBS_SOURCE_KIND_TEXT;
-    else if (strcmp(type, "vfmcap") == 0) *out_kind = SBS_SOURCE_KIND_VFMCAP;
-    else return false;
-    return true;
 }
 
 static const char *json_str(cJSON *obj, const char *key)
@@ -389,7 +279,7 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
         if (source->enabled && server->source_sup) {
             sbs_source_start_config_t cfg = {0};
             int rc;
-            fill_source_start_config(server, source, &cfg);
+            sbs_source_start_config_fill(&server->scene_graph->canvas, source, &cfg);
             rc = sbs_source_supervisor_start_source(server->source_sup, &cfg, &source->frame_slot);
             if (rc != SBS_OK) {
                 LOG_E("failed to restore source '%s': %d", source->id, rc);
@@ -517,7 +407,7 @@ static int apply_scene_graph_bundle(sbs_api_server_t *server, cJSON *bundle)
 
     for (entry = sources ? sources->child : NULL; entry; entry = entry->next) {
         sbs_source_kind_t kind;
-        if (!parse_source_kind(json_str(entry, "type"), &kind)) return SBS_ERR_INVAL;
+        if (!sbs_scene_graph_parse_source_kind(json_str(entry, "type"), &kind)) return SBS_ERR_INVAL;
         sbs_source_create_params_t create = {
             .id = entry->string,
             .name = json_str(entry, "name"),

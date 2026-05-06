@@ -2,6 +2,7 @@
 
 #include "sbs/api_server.h"
 #include "sbs/log.h"
+#include "sbs/source_start_config.h"
 
 #include <glib/gstdio.h>
 #include <unistd.h>
@@ -18,40 +19,6 @@ static const char *json_str(cJSON *obj, const char *key)
 {
     cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
     return cJSON_IsString(item) ? cJSON_GetStringValue(item) : NULL;
-}
-
-static bool parse_source_kind(const char *type, sbs_source_kind_t *kind)
-{
-    if (!kind) return false;
-    if (!type || strcmp(type, "videotestsrc") == 0) {
-        *kind = SBS_SOURCE_KIND_VIDEOTESTSRC;
-        return true;
-    }
-    if (strcmp(type, "streamboxsrc") == 0) {
-        *kind = SBS_SOURCE_KIND_STREAMBOXSRC;
-        return true;
-    }
-    if (strcmp(type, "v4l2src") == 0) {
-        *kind = SBS_SOURCE_KIND_V4L2SRC;
-        return true;
-    }
-    if (strcmp(type, "uridecodebin") == 0) {
-        *kind = SBS_SOURCE_KIND_URIDECODEBIN;
-        return true;
-    }
-    if (strcmp(type, "image") == 0) {
-        *kind = SBS_SOURCE_KIND_IMAGE;
-        return true;
-    }
-    if (strcmp(type, "text") == 0) {
-        *kind = SBS_SOURCE_KIND_TEXT;
-        return true;
-    }
-    if (strcmp(type, "vfmcap") == 0) {
-        *kind = SBS_SOURCE_KIND_VFMCAP;
-        return true;
-    }
-    return false;
 }
 
 static cJSON *source_field_string(const char *key, const char *label, const char *def)
@@ -256,102 +223,6 @@ static char *file_uri_from_path(const char *path)
     return uri;
 }
 
-static const char *source_config_string(sbs_source_state_t *source, const char *key)
-{
-    if (!source || !source->config || !key) return NULL;
-    return g_hash_table_lookup(source->config, key);
-}
-
-static bool source_config_bool(sbs_source_state_t *source, const char *key, bool fallback)
-{
-    const char *value = source_config_string(source, key);
-    if (!value) return fallback;
-    return g_ascii_strcasecmp(value, "true") == 0 ||
-           g_ascii_strcasecmp(value, "yes") == 0 ||
-           strcmp(value, "1") == 0;
-}
-
-static uint32_t source_config_u32(sbs_source_state_t *source, const char *key,
-                                  uint32_t fallback, uint32_t min_value,
-                                  uint32_t max_value)
-{
-    const char *value = source_config_string(source, key);
-    char *end = NULL;
-    guint64 parsed;
-    if (!value || !value[0]) return fallback;
-    parsed = g_ascii_strtoull(value, &end, 10);
-    if (end == value || parsed < min_value || parsed > max_value) return fallback;
-    return (uint32_t)parsed;
-}
-
-static const char *canvas_vfmcap_output_format(sbs_api_server_t *server)
-{
-    return (server && server->scene_graph &&
-            server->scene_graph->canvas.color_mode == SBS_SCENE_COLOR_MODE_HDR10)
-        ? "p010" : "raw";
-}
-
-static void fill_source_start_config(sbs_api_server_t *server,
-                                     sbs_source_state_t *source,
-                                     sbs_source_start_config_t *cfg)
-{
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->source_id = source->id;
-    cfg->source_type = sbs_scene_graph_source_kind_name(source->kind);
-    cfg->width = server->scene_graph->canvas.width;
-    cfg->height = server->scene_graph->canvas.height;
-    cfg->framerate_num = server->scene_graph->canvas.fps_num;
-    cfg->framerate_den = server->scene_graph->canvas.fps_den;
-    cfg->pattern = source_config_string(source, "pattern");
-    if (!cfg->pattern) cfg->pattern = "smpte";
-    cfg->device_path = source_config_string(source, "device");
-    if (!cfg->device_path) cfg->device_path = source_config_string(source, "device_path");
-    cfg->uri = source_config_string(source, "uri");
-    if (!cfg->uri) cfg->uri = source_config_string(source, "path");
-    cfg->loop = source_config_bool(source, "loop",
-                                   source->kind == SBS_SOURCE_KIND_IMAGE ||
-                                   source->kind == SBS_SOURCE_KIND_URIDECODEBIN);
-
-    if (source->kind == SBS_SOURCE_KIND_VFMCAP) {
-        cfg->capture_mode = "passthrough";
-        cfg->output_format = source_config_string(source, "output_format");
-        if (!cfg->output_format) cfg->output_format = canvas_vfmcap_output_format(server);
-        if (!cfg->device_path) cfg->device_path = "/dev/video_cap";
-    } else if (source->kind == SBS_SOURCE_KIND_VIDEOTESTSRC) {
-        uint32_t default_w = MIN(cfg->width, 1280u);
-        uint32_t default_h = MIN(cfg->height, 720u);
-        uint32_t default_fps = MIN(cfg->framerate_num > 0 ? cfg->framerate_num : 30u, 30u);
-        cfg->width = source_config_u32(source, "width", default_w, 16, server->scene_graph->canvas.width);
-        cfg->height = source_config_u32(source, "height", default_h, 16, server->scene_graph->canvas.height);
-        cfg->framerate_num = source_config_u32(source, "fps", default_fps, 1, 120);
-        cfg->framerate_den = 1;
-        cfg->capture_mode = source_config_string(source, "color_mode");
-        cfg->output_format = source_config_string(source, "output_format");
-    } else if (source->kind == SBS_SOURCE_KIND_IMAGE) {
-        uint32_t default_w = MIN(cfg->width, 1280u);
-        uint32_t default_h = MIN(cfg->height, 720u);
-        cfg->width = source_config_u32(source, "width", default_w, 16, server->scene_graph->canvas.width);
-        cfg->height = source_config_u32(source, "height", default_h, 16, server->scene_graph->canvas.height);
-        cfg->framerate_num = source_config_u32(source, "fps", 1u, 1, 30);
-        cfg->framerate_den = 1;
-    } else if (source->kind == SBS_SOURCE_KIND_TEXT) {
-        uint32_t default_w = MIN(cfg->width, 1280u);
-        cfg->width = source_config_u32(source, "width", default_w, 16, server->scene_graph->canvas.width);
-        cfg->height = source_config_u32(source, "height", 256u, 16, server->scene_graph->canvas.height);
-        cfg->framerate_num = source_config_u32(source, "fps", 1u, 1, 30);
-        cfg->framerate_den = 1;
-        cfg->text = source_config_string(source, "text");
-        cfg->font_family = source_config_string(source, "font_family");
-        cfg->font_path = source_config_string(source, "font_path");
-        cfg->text_color = source_config_string(source, "text_color");
-        cfg->text_align = source_config_string(source, "text_align");
-        cfg->font_size = source_config_u32(source, "font_size", 72u, 4, 512);
-    } else {
-        cfg->capture_mode = source_config_string(source, "color_mode");
-        cfg->output_format = source_config_string(source, "output_format");
-    }
-}
-
 int sbs_api_handle_source_list_kinds(sbs_api_server_t *server, sbs_api_client_t *client,
                                      cJSON *params, cJSON **result, cJSON **error)
 {
@@ -383,7 +254,7 @@ int sbs_api_handle_source_describe_kind(sbs_api_server_t *server, sbs_api_client
     sbs_source_kind_t kind;
     (void)server; (void)client;
 
-    if (!parse_source_kind(kind_id, &kind)) {
+    if (!sbs_scene_graph_parse_source_kind(kind_id, &kind)) {
         *error = api_error(-32004, "Unsupported source kind");
         return SBS_ERR_INVAL;
     }
@@ -518,7 +389,7 @@ int sbs_api_handle_source_create(sbs_api_server_t *server, sbs_api_client_t *cli
     memset(&create, 0, sizeof(create));
     create.id = id;
     create.name = name;
-    if (!parse_source_kind(type, &create.kind)) {
+    if (!sbs_scene_graph_parse_source_kind(type, &create.kind)) {
         *error = api_error(-32004, "Unsupported source kind");
         return SBS_ERR_INVAL;
     }
@@ -618,7 +489,7 @@ int sbs_api_handle_source_update(sbs_api_server_t *server, sbs_api_client_t *cli
         source->running = false;
 
         sbs_source_start_config_t cfg;
-        fill_source_start_config(server, source, &cfg);
+        sbs_source_start_config_fill(&server->scene_graph->canvas, source, &cfg);
 
         rc = sbs_source_supervisor_start_source(server->source_sup, &cfg, &source->frame_slot);
         if (rc != SBS_OK) {
@@ -691,7 +562,7 @@ int sbs_api_handle_source_start(sbs_api_server_t *server, sbs_api_client_t *clie
         return SBS_ERR_NOT_FOUND;
     }
 
-    fill_source_start_config(server, source, &cfg);
+    sbs_source_start_config_fill(&server->scene_graph->canvas, source, &cfg);
 
     rc = sbs_source_supervisor_start_source(server->source_sup, &cfg, &source->frame_slot);
     if (rc != SBS_OK) {

@@ -357,6 +357,7 @@ int sbs_scene_graph_build_compositor_state(const sbs_scene_graph_t *graph,
                                            sbs_comp_scene_state_t *state);
 
 const char *sbs_scene_graph_source_kind_name(sbs_source_kind_t kind);
+bool sbs_scene_graph_parse_source_kind(const char *type, sbs_source_kind_t *out_kind);
 const char *sbs_scene_graph_transition_kind_name(sbs_transition_kind_t kind);
 int sbs_scene_graph_count_source_refs(const sbs_scene_graph_t *graph, const char *source_id);
 

@@ -40,6 +40,25 @@ static uint32_t encoder_num(GHashTable *encoder, const char *key, uint32_t fallb
     return (uint32_t)strtoul(val, NULL, 10);
 }
 
+static void output_replace_encoder_from_json(sbs_output_state_t *output, cJSON *encoder_obj)
+{
+    cJSON *entry = NULL;
+
+    if (!output || !cJSON_IsObject(encoder_obj)) return;
+    if (output->encoder) g_hash_table_destroy(output->encoder);
+    output->encoder = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    for (entry = encoder_obj->child; entry; entry = entry->next) {
+        if (cJSON_IsString(entry)) {
+            g_hash_table_insert(output->encoder, g_strdup(entry->string),
+                                g_strdup(cJSON_GetStringValue(entry)));
+        } else if (cJSON_IsNumber(entry)) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%u", (uint32_t)entry->valuedouble);
+            g_hash_table_insert(output->encoder, g_strdup(entry->string), g_strdup(buf));
+        }
+    }
+}
+
 int sbs_api_handle_output_list(sbs_api_server_t *server, sbs_api_client_t *client,
                                cJSON *params, cJSON **result, cJSON **error)
 {
@@ -82,21 +101,7 @@ int sbs_api_handle_output_create(sbs_api_server_t *server, sbs_api_client_t *cli
         return rc;
     }
 
-    cJSON *encoder_obj = cJSON_GetObjectItemCaseSensitive(params, "encoder");
-    if (output && cJSON_IsObject(encoder_obj)) {
-        if (output->encoder) g_hash_table_destroy(output->encoder);
-        output->encoder = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
-        cJSON *entry = NULL;
-        for (entry = encoder_obj->child; entry; entry = entry->next) {
-            if (cJSON_IsString(entry)) {
-                g_hash_table_insert(output->encoder, g_strdup(entry->string), g_strdup(cJSON_GetStringValue(entry)));
-            } else if (cJSON_IsNumber(entry)) {
-                char buf[32];
-                snprintf(buf, sizeof(buf), "%u", (uint32_t)entry->valuedouble);
-                g_hash_table_insert(output->encoder, g_strdup(entry->string), g_strdup(buf));
-            }
-        }
-    }
+    output_replace_encoder_from_json(output, cJSON_GetObjectItemCaseSensitive(params, "encoder"));
 
     *result = sbs_scene_graph_serialize_output_public(output);
     sbs_api_server_publish(server, "output.created", sbs_scene_graph_serialize_output_public(output));
@@ -322,18 +327,7 @@ int sbs_api_handle_output_update(sbs_api_server_t *server, sbs_api_client_t *cli
 
     cJSON *encoder_obj = cJSON_GetObjectItemCaseSensitive(params, "encoder");
     if (cJSON_IsObject(encoder_obj)) {
-        if (output->encoder) g_hash_table_destroy(output->encoder);
-        output->encoder = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
-        cJSON *entry = NULL;
-        for (entry = encoder_obj->child; entry; entry = entry->next) {
-            if (cJSON_IsString(entry)) {
-                g_hash_table_insert(output->encoder, g_strdup(entry->string), g_strdup(cJSON_GetStringValue(entry)));
-            } else if (cJSON_IsNumber(entry)) {
-                char buf[32];
-                snprintf(buf, sizeof(buf), "%u", (uint32_t)entry->valuedouble);
-                g_hash_table_insert(output->encoder, g_strdup(entry->string), g_strdup(buf));
-            }
-        }
+        output_replace_encoder_from_json(output, encoder_obj);
         needs_restart = output->running;
     }
 

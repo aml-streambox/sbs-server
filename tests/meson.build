@@ -71,6 +71,7 @@ if get_option('tests')
         '../src/server/engine/snapshot.c',
         '../src/server/instance_manager.c',
         '../src/server/config/config_manager.c',
+        '../src/server/config/source_start_config.c',
         '../src/server/api/ws_server.c',
         '../src/server/api/jsonrpc.c',
         '../src/server/api/pubsub.c',

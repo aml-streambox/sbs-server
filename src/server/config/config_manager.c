@@ -22,6 +22,7 @@ struct sbs_config_manager {
 static const char *json_str(cJSON *obj, const char *key);
 static bool json_bool(cJSON *obj, const char *key, bool fallback);
 static double json_num(cJSON *obj, const char *key, double fallback);
+static bool parse_source_kind(const char *type, sbs_source_kind_t *out_kind);
 
 static const char *source_config_string(sbs_source_state_t *source, const char *key)
 {
@@ -176,6 +177,15 @@ static int validate_bundle(cJSON *bundle)
     scenes = cJSON_GetObjectItemCaseSensitive(state, "scenes");
     sources = cJSON_GetObjectItemCaseSensitive(state, "sources");
     if (!cJSON_IsObject(scenes) || !cJSON_IsObject(sources)) return SBS_ERR_INVAL;
+    for (cJSON *source = sources->child; source; source = source->next) {
+        sbs_source_kind_t kind;
+        if (!parse_source_kind(json_str(source, "type"), &kind)) {
+            LOG_W("persisted source '%s' has unsupported type '%s'",
+                  source->string ? source->string : "(unknown)",
+                  json_str(source, "type") ? json_str(source, "type") : "(null)");
+            return SBS_ERR_INVAL;
+        }
+    }
     for (scene = scenes->child; scene; scene = scene->next) {
         cJSON *items = cJSON_GetObjectItemCaseSensitive(scene, "items");
         int i;
@@ -204,16 +214,18 @@ static int migrate_bundle(cJSON *bundle)
     return SBS_ERR_INVAL;
 }
 
-static sbs_source_kind_t parse_source_kind(const char *type)
+static bool parse_source_kind(const char *type, sbs_source_kind_t *out_kind)
 {
-    if (!type || strcmp(type, "videotestsrc") == 0) return SBS_SOURCE_KIND_VIDEOTESTSRC;
-    if (strcmp(type, "streamboxsrc") == 0) return SBS_SOURCE_KIND_STREAMBOXSRC;
-    if (strcmp(type, "v4l2src") == 0) return SBS_SOURCE_KIND_V4L2SRC;
-    if (strcmp(type, "uridecodebin") == 0) return SBS_SOURCE_KIND_URIDECODEBIN;
-    if (strcmp(type, "image") == 0) return SBS_SOURCE_KIND_IMAGE;
-    if (strcmp(type, "text") == 0) return SBS_SOURCE_KIND_TEXT;
-    if (strcmp(type, "vfmcap") == 0) return SBS_SOURCE_KIND_VFMCAP;
-    return SBS_SOURCE_KIND_VIDEOTESTSRC;
+    if (!out_kind) return false;
+    if (!type || strcmp(type, "videotestsrc") == 0) *out_kind = SBS_SOURCE_KIND_VIDEOTESTSRC;
+    else if (strcmp(type, "streamboxsrc") == 0) *out_kind = SBS_SOURCE_KIND_STREAMBOXSRC;
+    else if (strcmp(type, "v4l2src") == 0) *out_kind = SBS_SOURCE_KIND_V4L2SRC;
+    else if (strcmp(type, "uridecodebin") == 0) *out_kind = SBS_SOURCE_KIND_URIDECODEBIN;
+    else if (strcmp(type, "image") == 0) *out_kind = SBS_SOURCE_KIND_IMAGE;
+    else if (strcmp(type, "text") == 0) *out_kind = SBS_SOURCE_KIND_TEXT;
+    else if (strcmp(type, "vfmcap") == 0) *out_kind = SBS_SOURCE_KIND_VFMCAP;
+    else return false;
+    return true;
 }
 
 static const char *json_str(cJSON *obj, const char *key)
@@ -477,7 +489,15 @@ static int apply_scene_graph_bundle(sbs_api_server_t *server, cJSON *bundle)
     graph->canvas.color_mode = g_strcmp0(json_str(canvas, "color_mode"), "hdr10") == 0 ? SBS_SCENE_COLOR_MODE_HDR10 : SBS_SCENE_COLOR_MODE_SDR;
 
     for (entry = sources ? sources->child : NULL; entry; entry = entry->next) {
-        sbs_source_create_params_t create = { entry->string, json_str(entry, "name"), parse_source_kind(json_str(entry, "type")), json_bool(entry, "enabled", true), json_bool(entry, "keep_alive", false) };
+        sbs_source_kind_t kind;
+        if (!parse_source_kind(json_str(entry, "type"), &kind)) return SBS_ERR_INVAL;
+        sbs_source_create_params_t create = {
+            .id = entry->string,
+            .name = json_str(entry, "name"),
+            .kind = kind,
+            .enabled = json_bool(entry, "enabled", true),
+            .keep_alive = json_bool(entry, "keep_alive", false),
+        };
         sbs_source_state_t *source = NULL;
         sbs_scene_graph_create_source(graph, &create, &source);
         if (source && (create.kind == SBS_SOURCE_KIND_STREAMBOXSRC ||

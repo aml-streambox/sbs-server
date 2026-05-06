@@ -130,4 +130,33 @@ SBS_TEST_FIXTURE(config_restore, invalid_bundle_rejected, setup_restore, teardow
     cJSON_Delete(bundle);
 }
 
+SBS_TEST_FIXTURE(config_restore, unknown_source_type_rejected, setup_restore, teardown_restore)
+{
+    sbs_source_create_params_t existing = {
+        .id = "src-existing",
+        .name = "Existing",
+        .kind = SBS_SOURCE_KIND_VIDEOTESTSRC,
+        .enabled = true,
+    };
+    cJSON *bundle = cJSON_CreateObject();
+    cJSON *state = cJSON_CreateObject();
+    cJSON *sources = cJSON_CreateObject();
+    cJSON *bad_source = cJSON_CreateObject();
+
+    SBS_ASSERT_EQ(sbs_scene_graph_create_source(graph, &existing, NULL), SBS_OK);
+
+    cJSON_AddNumberToObject(bundle, "schema_version", 1);
+    cJSON_AddStringToObject(bundle, "kind", "sbs-config");
+    cJSON_AddStringToObject(bad_source, "type", "mysterysrc");
+    cJSON_AddItemToObject(sources, "src-bad", bad_source);
+    cJSON_AddItemToObject(state, "sources", sources);
+    cJSON_AddItemToObject(state, "scenes", cJSON_CreateObject());
+    cJSON_AddItemToObject(bundle, "state", state);
+
+    SBS_ASSERT_EQ(sbs_config_manager_apply_bundle(mgr, server, bundle), SBS_ERR_INVAL);
+    SBS_ASSERT_NOT_NULL(sbs_scene_graph_get_source(server->scene_graph, "src-existing"));
+    SBS_ASSERT_EQ(sbs_scene_graph_get_source(server->scene_graph, "src-bad"), NULL);
+    cJSON_Delete(bundle);
+}
+
 SBS_TEST_MAIN()

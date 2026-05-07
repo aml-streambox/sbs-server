@@ -344,6 +344,7 @@ typedef struct sbs_compositor {
         uint32_t                   width;
         uint32_t                   height;
         uint32_t                   frame_interval;
+        uint64_t                   last_submit_frame;
         sbs_export_color_mode_t    color_mode;
         uint32_t                   write_idx;
         _Atomic uint32_t           last_rendered_entry;
@@ -467,6 +468,7 @@ int  sbs_compositor_render_native_frame(sbs_compositor_t *comp,
                                          const sbs_comp_scene_state_t *scene,
                                          uint64_t frame_number,
                                          uint64_t content_frame_number,
+                                         uint32_t transition_prev_entry_idx,
                                          uint32_t *entry_idx_out);
 int  sbs_compositor_load_shaders(sbs_compositor_t *comp, const char *shader_dir);
 int  sbs_compositor_configure_native_preview(sbs_compositor_t *comp,

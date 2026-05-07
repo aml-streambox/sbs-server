@@ -750,7 +750,10 @@ static preview_runtime_t *start_webrtc_runtime(sbs_preview_engine_t *engine,
 
     parser = gst_element_factory_make(parser_name, NULL);
     if (parser) {
-        g_object_set(parser, "config-interval", -1, NULL);
+        g_object_set(parser,
+            "config-interval", -1,
+            "disable-passthrough", TRUE,
+            NULL);
     }
 
     payloader = gst_element_factory_make(payloader_name, NULL);
@@ -1168,7 +1171,8 @@ void sbs_preview_engine_consume_frame_ptr(sbs_preview_engine_t *engine,
         }
 
         runtime->frames_pushed++;
-        if (runtime->frames_pushed <= 3 || runtime->frames_pushed % 300 == 0) {
+        if (runtime->frames_pushed <= 3 || packet.is_keyframe ||
+            runtime->frames_pushed % 300 == 0) {
             LOG_I("preview encoded frame pushed #%lu (%zu bytes key=%d)",
                   (unsigned long)runtime->frames_pushed,
                   packet.size, packet.is_keyframe ? 1 : 0);
@@ -1371,7 +1375,8 @@ void sbs_preview_engine_consume_frame_dmabuf(sbs_preview_engine_t *engine,
         }
 
         runtime->frames_pushed++;
-        if (runtime->frames_pushed <= 3 || runtime->frames_pushed % 300 == 0) {
+        if (runtime->frames_pushed <= 3 || packet.is_keyframe ||
+            runtime->frames_pushed % 300 == 0) {
             LOG_I("preview encoded dmabuf frame pushed #%lu (%zu bytes key=%d)",
                   (unsigned long)runtime->frames_pushed,
                   packet.size, packet.is_keyframe ? 1 : 0);

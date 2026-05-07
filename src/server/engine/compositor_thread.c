@@ -100,6 +100,7 @@ typedef struct sbs_compositor_thread {
     int64_t             last_render_start_ns;
     int64_t             last_loop_start_ns;
     uint64_t            native_content_serial;
+    uint32_t            transition_cached_entry_idx;
 } sbs_compositor_thread_t;
 
 static void close_ge2d_source_fds(sbs_compositor_thread_t *ct)
@@ -190,6 +191,30 @@ static void release_all_pending_source_frames(sbs_compositor_thread_t *ct)
         return;
     for (uint32_t i = 0; i < SBS_NATIVE_CANVAS_RING_SIZE; i++)
         release_pending_source_frames_for_entry(ct, i);
+}
+
+static void release_transition_cached_entry(sbs_compositor_thread_t *ct)
+{
+    if (!ct || ct->transition_cached_entry_idx >= SBS_NATIVE_CANVAS_RING_SIZE)
+        return;
+    sbs_compositor_native_canvas_unref(&ct->compositor,
+                                       ct->transition_cached_entry_idx);
+    ct->transition_cached_entry_idx = UINT32_MAX;
+}
+
+static void capture_transition_cached_entry(sbs_compositor_thread_t *ct)
+{
+    if (!ct || !ct->compositor.native_canvas.initialized)
+        return;
+
+    release_transition_cached_entry(ct);
+    uint32_t entry_idx = atomic_load_explicit(
+        &ct->compositor.native_canvas.last_rendered_entry,
+        memory_order_acquire);
+    if (entry_idx >= SBS_NATIVE_CANVAS_RING_SIZE)
+        return;
+    if (sbs_compositor_native_canvas_ref(&ct->compositor, entry_idx))
+        ct->transition_cached_entry_idx = entry_idx;
 }
 
 static bool item_has_vulkan_only_filters(const sbs_compositor_thread_t *ct,
@@ -286,35 +311,6 @@ static uint32_t source_texture_slot_for_active_item(const sbs_compositor_thread_
 
     const sbs_comp_scene_item_t *item = &scene->active_items[item_idx];
     uint32_t base_slot;
-    if (scene->transition_active) {
-        for (uint32_t i = 0; i < scene->previous_item_count && i < SBS_COMP_SCENE_MAX_ITEMS; i++) {
-            const sbs_comp_scene_item_t *prev = &scene->previous_items[i];
-            if (prev->visible && prev->frame_slot &&
-                strcmp(prev->source_id, item->source_id) == 0) {
-                return i;
-            }
-        }
-
-        uint32_t slot = scene->previous_item_count;
-        for (uint32_t i = 0; i < item_idx && i < SBS_COMP_SCENE_MAX_ITEMS; i++) {
-            const sbs_comp_scene_item_t *prev_active = &scene->active_items[i];
-            bool existed_in_previous = false;
-            if (!prev_active->visible || !prev_active->frame_slot)
-                continue;
-            for (uint32_t j = 0; j < scene->previous_item_count && j < SBS_COMP_SCENE_MAX_ITEMS; j++) {
-                const sbs_comp_scene_item_t *prev = &scene->previous_items[j];
-                if (prev->visible && prev->frame_slot &&
-                    strcmp(prev->source_id, prev_active->source_id) == 0) {
-                    existed_in_previous = true;
-                    break;
-                }
-            }
-            if (!existed_in_previous)
-                slot++;
-        }
-        base_slot = slot;
-        goto resolve_slot;
-    }
 
     for (uint32_t i = 0; i < item_idx && i < SBS_COMP_SCENE_MAX_ITEMS; i++) {
         const sbs_comp_scene_item_t *prev = &scene->active_items[i];
@@ -324,8 +320,6 @@ static uint32_t source_texture_slot_for_active_item(const sbs_compositor_thread_
         }
     }
     base_slot = item_idx;
-
-resolve_slot:
     if (!ct || base_slot >= SBS_MAX_SOURCE_TEXTURES || item->source_id[0] == '\0')
         return base_slot;
     if (ct->compositor.sources[base_slot].source_id[0] == '\0' ||
@@ -471,12 +465,16 @@ static void *compositor_thread_func(void *arg)
             }
             if (cmd->type == SBS_COMP_CMD_SET_SCENE) {
                 int64_t previous_transition_start_us = ct->scene_state.transition_start_time_us;
+                bool new_transition = cmd->scene_state.transition_active &&
+                    cmd->scene_state.transition_start_time_us != previous_transition_start_us;
                 close_ge2d_source_fds(ct);
                 ct->scene_state = cmd->scene_state;
-                if (ct->scene_state.transition_active &&
-                    ct->scene_state.transition_start_time_us != previous_transition_start_us) {
+                if (new_transition) {
+                    capture_transition_cached_entry(ct);
                     ct->scene_state.transition_start_time_us = monotonic_time_us();
                     ct->scene_state.transition_progress = 0.0f;
+                } else if (!ct->scene_state.transition_active) {
+                    release_transition_cached_entry(ct);
                 }
                 ct->scene_dirty = true;
                 update_pipeline_mode(ct, &ct->scene_state);
@@ -502,7 +500,12 @@ static void *compositor_thread_func(void *arg)
             free(cmd);
         }
 
+        bool transition_was_active = ct->scene_state.transition_active;
         update_scene_transition(&ct->scene_state);
+        if (transition_was_active && !ct->scene_state.transition_active)
+            ct->scene_dirty = true;
+        if (!ct->scene_state.transition_active)
+            release_transition_cached_entry(ct);
 
         release_ready_source_frames(ct);
 
@@ -740,10 +743,11 @@ retire_done:
                 }
                 if (!native_repeated) {
                     render_rc = sbs_compositor_render_native_frame(&ct->compositor,
-                                                                   &ct->scene_state,
-                                                                   frame_number,
-                                                                   content_frame_number,
-                                                                   &submitted_entry_idx);
+                                                                    &ct->scene_state,
+                                                                    frame_number,
+                                                                    content_frame_number,
+                                                                    ct->transition_cached_entry_idx,
+                                                                    &submitted_entry_idx);
                     if (render_rc == 0) {
                         ct->native_content_serial = content_frame_number;
                         ct->scene_dirty = false;
@@ -839,6 +843,7 @@ retire_done:
 done:
     LOG_I("compositor thread exiting (rendered %lu frames, dropped %u)",
           (unsigned long)ct->frame_count, ct->frames_dropped);
+    release_transition_cached_entry(ct);
     release_all_pending_source_frames(ct);
     close_ge2d_source_fds(ct);
     sbs_ge2d_shutdown(&ct->ge2d);
@@ -864,6 +869,7 @@ sbs_compositor_thread_t *sbs_compositor_thread_new(uint32_t width,
     ct->eventfd_fd = -1;
     ct->stop_fd[0] = -1;
     ct->stop_fd[1] = -1;
+    ct->transition_cached_entry_idx = UINT32_MAX;
 
     return ct;
 }

@@ -181,6 +181,7 @@ typedef struct sbs_pending_frame {
     uint64_t pts_ns;
     uint64_t dts_ns;
     uint64_t duration_ns;
+    bool requested_idr;
 } sbs_pending_frame_t;
 
 /* ---- Encoder instance ---- */
@@ -273,13 +274,16 @@ static sbs_pending_frame_t *pending_frame_take_match(sbs_direct_venc_t *enc, int
     return g_queue_pop_head(enc->pending_frames);
 }
 
-static void pending_frame_push(sbs_direct_venc_t *enc, const sbs_video_frame_msg_t *msg)
+static void pending_frame_push(sbs_direct_venc_t *enc,
+                               const sbs_video_frame_msg_t *msg,
+                               bool requested_idr)
 {
     sbs_pending_frame_t *pending = g_new0(sbs_pending_frame_t, 1);
     pending->id = enc->next_submit_id++;
     pending->pts_ns = msg->pts_ns;
     pending->dts_ns = msg->dts_ns;
     pending->duration_ns = msg->duration_ns;
+    pending->requested_idr = requested_idr;
     g_queue_push_tail(enc->pending_frames, pending);
 }
 
@@ -376,10 +380,15 @@ static int submit_common(sbs_direct_venc_t *enc,
 {
     vl_buffer_info_t retbuf;
     encoding_metadata_t meta;
-    vl_frame_type_t frame_type = force_idr ? FRAME_TYPE_IDR : FRAME_TYPE_AUTO;
+    bool request_idr;
+    vl_frame_type_t frame_type;
 
     if (!enc || !msg || !inbuf)
         return SBS_ERR_INVAL;
+
+    request_idr = force_idr || enc->next_submit_id == 0 ||
+        (enc->gop_size > 0 && (enc->next_submit_id % (int)enc->gop_size) == 0);
+    frame_type = request_idr ? FRAME_TYPE_IDR : FRAME_TYPE_AUTO;
 
     memset(packet, 0, sizeof(*packet));
     packet->dts_ns = UINT64_MAX;
@@ -424,7 +433,7 @@ static int submit_common(sbs_direct_venc_t *enc,
         }
     }
 
-    pending_frame_push(enc, msg);
+    pending_frame_push(enc, msg, request_idr);
     sync_dmabuf_write_end(sync_fd);
     sync_dmabuf_read(sync_fd, true);
     meta = enc->encode_fn(enc->handle, frame_type, enc->outbuf, inbuf, &retbuf);
@@ -443,22 +452,25 @@ static int submit_common(sbs_direct_venc_t *enc,
     packet->data = enc->outbuf;
     packet->size = (size_t)meta.encoded_data_length_in_bytes;
 
-    /* Keyframe detection: use extra.frame_type like the amlvenc plugin does.
-     * The firmware's is_key_frame field is unreliable (always 0). */
-    packet->is_keyframe = (meta.extra.frame_type == FRAME_TYPE_IDR ||
-                           meta.extra.frame_type == FRAME_TYPE_I);
-
     sbs_pending_frame_t *pending = pending_frame_take_match(enc, meta.input_frame_num);
     if (pending) {
         packet->pts_ns = pending->pts_ns;
         packet->dts_ns = pending->dts_ns;
         packet->duration_ns = pending->duration_ns;
+        packet->is_keyframe = pending->requested_idr;
         g_free(pending);
     } else {
         packet->pts_ns = 0;
         packet->dts_ns = UINT64_MAX;
         packet->duration_ns = 0;
+        packet->is_keyframe = request_idr;
     }
+
+    /* Keyframe detection: use extra.frame_type like the amlvenc plugin does.
+     * The firmware's is_key_frame field is unreliable (always 0). */
+    packet->is_keyframe = packet->is_keyframe ||
+                           meta.extra.frame_type == FRAME_TYPE_IDR ||
+                           meta.extra.frame_type == FRAME_TYPE_I;
 
     return SBS_OK;
 }

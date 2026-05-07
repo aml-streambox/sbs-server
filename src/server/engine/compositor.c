@@ -731,6 +731,7 @@ static void destroy_native_preview_ring(sbs_compositor_t *comp)
     comp->native_preview.width = 0;
     comp->native_preview.height = 0;
     comp->native_preview.frame_interval = 0;
+    comp->native_preview.last_submit_frame = 0;
     comp->native_preview.color_mode = SBS_EXPORT_COLOR_SDR;
     comp->native_preview.write_idx = 0;
     atomic_store_explicit(&comp->native_preview.last_rendered_entry, UINT32_MAX,
@@ -792,6 +793,7 @@ static int create_native_preview_ring(sbs_compositor_t *comp,
     comp->native_preview.width = width;
     comp->native_preview.height = height;
     comp->native_preview.frame_interval = frame_interval > 0 ? frame_interval : 1;
+    comp->native_preview.last_submit_frame = 0;
     comp->native_preview.color_mode = color_mode;
     comp->native_preview.write_idx = 0;
     atomic_store_explicit(&comp->native_preview.last_rendered_entry, UINT32_MAX,
@@ -7640,6 +7642,8 @@ static bool native_scene_can_full_canvas_direct_yuv(sbs_compositor_t *comp,
 {
     if (!comp || !entry || !scene || scene->transition_active)
         return false;
+    if (scene->active_item_count <= 1)
+        return false;
 
     for (uint32_t i = 0; i < scene->active_item_count && i < SBS_MAX_SOURCE_TEXTURES; i++) {
         const sbs_comp_scene_item_t *item = &scene->active_items[i];
@@ -7899,10 +7903,6 @@ static bool native_scene_needs_rgba_upload(sbs_compositor_t *comp,
         return false;
     if (native_items_need_rgba_upload(comp, entry, scene->active_items,
                                       scene->active_item_count))
-        return true;
-    if (scene->transition_active &&
-        native_items_need_rgba_upload(comp, entry, scene->previous_items,
-                                      scene->previous_item_count))
         return true;
     return false;
 }
@@ -8689,6 +8689,128 @@ static VkPipeline native_downscale_pipeline_for_mode(sbs_compositor_t *comp,
         : comp->native_downscale_sdr_pipeline;
 }
 
+static bool native_record_cached_canvas_copy(sbs_compositor_t *comp,
+                                             VkCommandBuffer cb,
+                                             sbs_native_canvas_entry_t *src_entry,
+                                             sbs_native_canvas_entry_t *dst_entry)
+{
+    if (!comp || cb == VK_NULL_HANDLE || !src_entry || !dst_entry ||
+        src_entry == dst_entry || src_entry->color_mode != dst_entry->color_mode)
+        return false;
+
+    VkImageMemoryBarrier pre[4] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                             VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = src_entry->y.layout,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .image = src_entry->y.image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                             VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = src_entry->uv.layout,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .image = src_entry->uv.image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .image = dst_entry->y.image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .image = dst_entry->uv.image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        },
+    };
+    vkCmdPipelineBarrier(cb,
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, NULL, 0, NULL, 4, pre);
+
+    VkImageCopy y_copy = {
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .extent = { dst_entry->y.width, dst_entry->y.height, 1 },
+    };
+    VkImageCopy uv_copy = {
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .extent = { dst_entry->uv.width, dst_entry->uv.height, 1 },
+    };
+    vkCmdCopyImage(cb,
+                   src_entry->y.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   dst_entry->y.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   1, &y_copy);
+    vkCmdCopyImage(cb,
+                   src_entry->uv.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   dst_entry->uv.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   1, &uv_copy);
+
+    VkImageMemoryBarrier post[4] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .image = src_entry->y.image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .image = src_entry->uv.image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .image = dst_entry->y.image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .image = dst_entry->uv.image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        },
+    };
+    vkCmdPipelineBarrier(cb,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, NULL, 0, NULL, 4, post);
+    src_entry->y.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    src_entry->uv.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    dst_entry->y.layout = VK_IMAGE_LAYOUT_GENERAL;
+    dst_entry->uv.layout = VK_IMAGE_LAYOUT_GENERAL;
+    return true;
+}
+
 static int sbs_compositor_submit_native_preview_from_entry(sbs_compositor_t *comp,
                                                            sbs_native_canvas_entry_t *src_entry,
                                                            uint64_t frame_number,
@@ -8915,6 +9037,7 @@ int sbs_compositor_render_native_frame(sbs_compositor_t *comp,
                                         const sbs_comp_scene_state_t *scene,
                                         uint64_t frame_number,
                                         uint64_t content_frame_number,
+                                        uint32_t transition_prev_entry_idx,
                                         uint32_t *entry_idx_out)
 {
     uint32_t idx = 0;
@@ -8985,19 +9108,36 @@ int sbs_compositor_render_native_frame(sbs_compositor_t *comp,
         .entry = entry,
     };
 
+    sbs_native_canvas_entry_t *transition_prev_entry = NULL;
+    if (scene && scene->transition_active &&
+        transition_prev_entry_idx < SBS_NATIVE_CANVAS_RING_SIZE) {
+        sbs_native_canvas_entry_t *candidate = native_canvas_lookup_entry(
+            comp, transition_prev_entry_idx);
+        if (candidate && candidate != entry && candidate->allocated &&
+            candidate->color_mode == entry->color_mode &&
+            atomic_load_explicit(&candidate->state, memory_order_acquire) ==
+                SBS_NATIVE_CANVAS_ENTRY_READY) {
+            transition_prev_entry = candidate;
+        }
+    }
+
     bool preview_will_render = false;
     if (comp->native_preview.initialized) {
         uint32_t interval = comp->native_preview.frame_interval > 0
             ? comp->native_preview.frame_interval : 1u;
-        preview_will_render = interval <= 1u || ((frame_number - 1u) % interval) == 0;
+        preview_will_render = interval <= 1u ||
+            comp->native_preview.last_submit_frame == 0 ||
+            frame_number - comp->native_preview.last_submit_frame >= interval;
     }
 
     bool need_rgba_upload = native_scene_needs_rgba_upload(comp, entry, scene);
     if (need_rgba_upload)
         native_record_source_uploads(comp, cb);
 
-    bool have_native_layers = scene && scene->active_item_count > 0 &&
+    bool have_active_native_layers = scene && scene->active_item_count > 0 &&
         comp->native_yuv_pipeline_layout != VK_NULL_HANDLE;
+    bool have_cached_transition = transition_prev_entry != NULL;
+    bool have_native_layers = have_active_native_layers || have_cached_transition;
     bool full_canvas_direct = native_scene_can_full_canvas_direct_yuv(comp, entry, scene);
 
     VkImageMemoryBarrier pre[2] = {
@@ -9094,33 +9234,24 @@ int sbs_compositor_render_native_frame(sbs_compositor_t *comp,
         uint32_t layer_descriptor_idx = 0;
         entry->y.layout = VK_IMAGE_LAYOUT_GENERAL;
         entry->uv.layout = VK_IMAGE_LAYOUT_GENERAL;
-        if (scene->transition_active) {
+        if (have_cached_transition) {
+            (void)native_record_cached_canvas_copy(
+                comp, cb, transition_prev_entry, entry);
+        }
+        if (have_active_native_layers) {
             native_dispatch_source_layers(comp, cb, idx,
                                           comp->native_yuv_ds[idx],
                                           comp->native_p010_direct_ds[idx], entry,
                                           comp->width, comp->height,
-                                          scene->previous_items,
-                                          scene->previous_item_count,
-                                          1.0f - scene->transition_progress,
+                                          scene->active_items,
+                                          scene->active_item_count,
+                                          scene->transition_active ? scene->transition_progress : 1.0f,
                                           1.0f, 1.0f,
-                                           false, y, u, v,
-                                           &layer_descriptor_idx,
-                                           timing_base != UINT32_MAX ? &timing_ctx : NULL,
-                                           NULL, 0);
+                                          full_canvas_direct, y, u, v,
+                                          &layer_descriptor_idx,
+                                          timing_base != UINT32_MAX ? &timing_ctx : NULL,
+                                          NULL, 0);
         }
-        native_dispatch_source_layers(comp, cb, idx,
-                                      comp->native_yuv_ds[idx],
-                                      comp->native_p010_direct_ds[idx], entry,
-                                      comp->width, comp->height,
-                                      scene->active_items,
-                                      scene->active_item_count,
-                                      scene->transition_active ? scene->transition_progress : 1.0f,
-                                      1.0f, 1.0f,
-                                      full_canvas_direct, y, u, v,
-                                      &layer_descriptor_idx,
-                                      timing_base != UINT32_MAX ? &timing_ctx : NULL,
-                                      scene->transition_active ? scene->previous_items : NULL,
-                                      scene->transition_active ? scene->previous_item_count : 0);
 
         VkImageMemoryBarrier post[2] = {
             {
@@ -9198,9 +9329,11 @@ int sbs_compositor_render_native_frame(sbs_compositor_t *comp,
     if (entry_idx_out)
         *entry_idx_out = idx;
 
-    if (preview_will_render)
-        (void)sbs_compositor_submit_native_preview_from_entry(
-            comp, entry, frame_number, entry->content_frame_number);
+    if (preview_will_render &&
+        sbs_compositor_submit_native_preview_from_entry(
+            comp, entry, frame_number, entry->content_frame_number) == 0) {
+        comp->native_preview.last_submit_frame = frame_number;
+    }
 
     {
         static uint64_t native_submit_count = 0;

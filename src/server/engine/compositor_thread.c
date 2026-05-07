@@ -192,14 +192,21 @@ static void release_all_pending_source_frames(sbs_compositor_thread_t *ct)
         release_pending_source_frames_for_entry(ct, i);
 }
 
-static bool item_has_vulkan_only_filters(const sbs_comp_scene_item_t *item)
+static bool item_has_vulkan_only_filters(const sbs_compositor_thread_t *ct,
+                                         const sbs_comp_scene_item_t *item)
 {
-    const uint32_t direct_yuv_filter_mask = SBS_COMP_FILTER_GRAYSCALE |
+    uint32_t direct_yuv_filter_mask = SBS_COMP_FILTER_GRAYSCALE |
         SBS_COMP_FILTER_BRIGHTNESS | SBS_COMP_FILTER_CONTRAST |
         SBS_COMP_FILTER_HDR_TO_SDR_LUT | SBS_COMP_FILTER_COLOR_CORRECTION;
 
+    if (ct && ct->color_mode == SBS_EXPORT_COLOR_SDR)
+        direct_yuv_filter_mask |= SBS_COMP_FILTER_LUMA_KEY;
+
     if (!item || item->filter_flags == 0)
         return false;
+    if ((item->filter_flags & SBS_COMP_FILTER_LUMA_KEY) &&
+        (item->filter_flags & SBS_COMP_FILTER_HDR_TO_SDR_LUT))
+        return true;
     if ((item->filter_flags & ~direct_yuv_filter_mask) == 0 && item->lut_path[0] == '\0')
         return false;
     return true;
@@ -677,8 +684,8 @@ retire_done:
                                                        item->drm_modifier,
                                                        item->plane_offset,
                                                        item->plane_stride,
-                                                       item_has_vulkan_only_filters(item),
-                                                       item->filter_flags);
+                                                        item_has_vulkan_only_filters(ct, item),
+                                                        item->filter_flags);
                 uploaded_count++;
                 if (rc != 0) {
                     LOG_W("source upload failed for item %u ('%s')", source_slot, item->source_id);

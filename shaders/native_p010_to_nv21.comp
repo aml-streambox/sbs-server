@@ -46,10 +46,42 @@ const uint FILTER_BRIGHTNESS = 2u;
 const uint FILTER_CONTRAST = 4u;
 const uint FILTER_HDR_TO_SDR = 32u;
 const uint FILTER_COLOR_CORRECTION = 64u;
+const uint FILTER_LUMA_KEY = 128u;
 
 bool dst_in_bounds() { return (pc.flags & FLAG_DST_IN_BOUNDS) != 0u; }
 bool filter_hdr_to_sdr() { return (pc.filter_flags & FILTER_HDR_TO_SDR) != 0u; }
 bool src_offset_enabled() { return (pc.flags & FLAG_SRC_OFFSET) != 0u; }
+bool luma_key_enabled() { return (pc.filter_flags & FILTER_LUMA_KEY) != 0u; }
+
+float luma_key_alpha(float y) {
+    if (!luma_key_enabled())
+        return 1.0;
+    float min_luma = clamp(pc.filter_params[3], 0.0, 1.0);
+    float max_luma = clamp(pc.hdr_hue_cos, min_luma, 1.0);
+    float smoothness = clamp(pc.hdr_hue_sin, 0.001, 1.0);
+    return clamp(smoothstep(min_luma, min_luma + smoothness, y) *
+                 (1.0 - smoothstep(max_luma - smoothness, max_luma, y)), 0.0, 1.0);
+}
+
+void store_y_alpha(ivec2 dst, float y, float alpha) {
+    alpha = clamp(alpha, 0.0, 1.0);
+    if (alpha <= 0.0)
+        return;
+    if (alpha >= 0.999)
+        imageStore(y_img, dst, vec4(y, 0.0, 0.0, 1.0));
+    else
+        imageStore(y_img, dst, vec4(mix(imageLoad(y_img, dst).r, y, alpha), 0.0, 0.0, 1.0));
+}
+
+void store_vu_alpha(ivec2 dst, vec2 vu, float alpha) {
+    alpha = clamp(alpha, 0.0, 1.0);
+    if (alpha <= 0.0)
+        return;
+    if (alpha >= 0.999)
+        imageStore(uv_img, dst, vec4(vu, 0.0, 1.0));
+    else
+        imageStore(uv_img, dst, vec4(mix(imageLoad(uv_img, dst).rg, vu, alpha), 0.0, 1.0));
+}
 
 uint src_local_x(uint x) {
     return src_offset_enabled() && pc.dst_x > 0 ? x + uint(pc.dst_x) : x;
@@ -283,6 +315,19 @@ vec2 sample_vu(uint local_uv_x, uint local_uv_y, bool hdr_enabled) {
     return apply_basic_chroma_filters(adjust_hdr_chroma(vec2(v, u)));
 }
 
+float sample_luma_key_alpha_uv(uint local_uv_x, uint local_uv_y, bool hdr_enabled) {
+    if (!luma_key_enabled())
+        return 1.0;
+    uint x0 = min(local_uv_x * 2u, pc.dst_w - 1u);
+    uint y0 = min(local_uv_y * 2u, pc.dst_h - 1u);
+    uint x1 = min(x0 + 1u, pc.dst_w - 1u);
+    uint y1 = min(y0 + 1u, pc.dst_h - 1u);
+    return 0.25 * (luma_key_alpha(sample_y(x0, y0, hdr_enabled)) +
+                   luma_key_alpha(sample_y(x1, y0, hdr_enabled)) +
+                   luma_key_alpha(sample_y(x0, y1, hdr_enabled)) +
+                   luma_key_alpha(sample_y(x1, y1, hdr_enabled)));
+}
+
 void main() {
     bool full_canvas = (pc.flags & FLAG_FULL_CANVAS) != 0u;
     uvec2 base = gl_GlobalInvocationID.xy * 2u;
@@ -295,7 +340,7 @@ void main() {
         ? ivec2(int(base.x), int(base.y))
         : ivec2(pc.dst_x + int(base.x), pc.dst_y + int(base.y));
 
-    if (full_canvas && pc.opacity >= 0.999 &&
+    if (!luma_key_enabled() && full_canvas && pc.opacity >= 0.999 &&
         dst_base.x >= pc.dst_x && dst_base.y >= pc.dst_y &&
         dst_base.x + 1 < pc.dst_x + int(pc.dst_w) &&
         dst_base.y + 1 < pc.dst_y + int(pc.dst_h)) {
@@ -319,7 +364,7 @@ void main() {
         return;
     }
 
-    if (!full_canvas && pc.opacity >= 0.999 && dst_in_bounds()) {
+    if (!luma_key_enabled() && !full_canvas && pc.opacity >= 0.999 && dst_in_bounds()) {
         uint x1 = min(base.x + 1u, limit_w - 1u);
         uint y1 = min(base.y + 1u, limit_h - 1u);
         uint src_x0 = scale_nearest(src_local_x(base.x), pc.src_w, pc.y_scale_x);
@@ -368,12 +413,8 @@ void main() {
             }
 
             float y = inside ? sample_y(local_x, local_y, hdr_enabled) : pc.bg_y;
-            if (pc.opacity >= 0.999) {
-                imageStore(y_img, dst, vec4(y, 0.0, 0.0, 1.0));
-            } else {
-                float old_y = imageLoad(y_img, dst).r;
-                imageStore(y_img, dst, vec4(mix(old_y, y, pc.opacity), 0.0, 0.0, 1.0));
-            }
+            float alpha = pc.opacity * (inside ? luma_key_alpha(y) : 1.0);
+            store_y_alpha(dst, y, alpha);
         }
     }
 
@@ -400,11 +441,7 @@ void main() {
 
         vec2 vu = uv_inside ? sample_vu(local_uv_x, local_uv_y, hdr_enabled)
                             : vec2(pc.bg_v, pc.bg_u);
-        if (pc.opacity >= 0.999) {
-            imageStore(uv_img, uv_dst, vec4(vu, 0.0, 1.0));
-        } else {
-            vec2 old_uv = imageLoad(uv_img, uv_dst).rg;
-            imageStore(uv_img, uv_dst, vec4(mix(old_uv, vu, pc.opacity), 0.0, 1.0));
-        }
+        float alpha = pc.opacity * (uv_inside ? sample_luma_key_alpha_uv(local_uv_x, local_uv_y, hdr_enabled) : 1.0);
+        store_vu_alpha(uv_dst, vu, alpha);
     }
 }

@@ -7588,13 +7588,19 @@ _Static_assert(sizeof(sbs_native_downscale_pc_t) == SBS_NATIVE_DOWNSCALE_PC_SIZE
 #define SBS_NATIVE_P010_DIRECT_DST_IN_BOUNDS 8u
 #define SBS_NATIVE_P010_DIRECT_SRC_OFFSET 16u
 
-static bool native_item_filters_direct_yuv_compatible(const sbs_comp_scene_item_t *item)
+static bool native_item_filters_direct_yuv_compatible(const sbs_comp_scene_item_t *item,
+                                                      sbs_export_color_mode_t color_mode)
 {
-    const uint32_t direct_filter_mask = SBS_COMP_FILTER_GRAYSCALE |
+    uint32_t direct_filter_mask = SBS_COMP_FILTER_GRAYSCALE |
         SBS_COMP_FILTER_BRIGHTNESS | SBS_COMP_FILTER_CONTRAST |
         SBS_COMP_FILTER_HDR_TO_SDR_LUT | SBS_COMP_FILTER_COLOR_CORRECTION;
+    if (color_mode == SBS_EXPORT_COLOR_SDR)
+        direct_filter_mask |= SBS_COMP_FILTER_LUMA_KEY;
     if (!item || item->filter_flags == 0)
         return true;
+    if ((item->filter_flags & SBS_COMP_FILTER_LUMA_KEY) &&
+        (item->filter_flags & SBS_COMP_FILTER_HDR_TO_SDR_LUT))
+        return false;
     if ((item->filter_flags & ~direct_filter_mask) == 0 && item->lut_path[0] == '\0')
         return true;
     return false;
@@ -7609,7 +7615,7 @@ static bool native_source_can_direct_yuv(const sbs_compositor_t *comp,
         comp->native_p010_direct_pipeline_layout == VK_NULL_HANDLE ||
         !tex->dmabuf_imported || tex->y_buf == VK_NULL_HANDLE)
         return false;
-    if (!native_item_filters_direct_yuv_compatible(item))
+    if (!native_item_filters_direct_yuv_compatible(item, entry->color_mode))
         return false;
 
     if (entry->color_mode == SBS_EXPORT_COLOR_HDR10) {
@@ -8415,6 +8421,8 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                     SBS_NATIVE_P010_DIRECT_SRC_OFFSET |
                     SBS_NATIVE_P010_DIRECT_DST_IN_BOUNDS;
 
+            bool hdr_to_sdr_filter =
+                (item->filter_flags & SBS_COMP_FILTER_HDR_TO_SDR_LUT) != 0;
             float hdr_hue_rad = item->hdr_to_sdr_hue_deg * 0.01745329252f;
 
             sbs_native_p010_direct_pc_t pc = {
@@ -8442,10 +8450,10 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                 .bg_v = bg_v,
                 .filter_flags = item->filter_flags,
                 .hdr_to_sdr_amount = item->filter_params[5],
-                .hdr_saturation = item->hdr_to_sdr_saturation,
-                .hdr_brightness = item->hdr_to_sdr_brightness,
-                .hdr_hue_cos = cosf(hdr_hue_rad),
-                .hdr_hue_sin = sinf(hdr_hue_rad),
+                .hdr_saturation = hdr_to_sdr_filter ? item->hdr_to_sdr_saturation : item->filter_params[4],
+                .hdr_brightness = hdr_to_sdr_filter ? item->hdr_to_sdr_brightness : item->filter_params[5],
+                .hdr_hue_cos = hdr_to_sdr_filter ? cosf(hdr_hue_rad) : item->filter_params[6],
+                .hdr_hue_sin = hdr_to_sdr_filter ? sinf(hdr_hue_rad) : item->filter_params[7],
             };
             memcpy(pc.filter_params, item->filter_params, sizeof(pc.filter_params));
 

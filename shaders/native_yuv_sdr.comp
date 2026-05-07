@@ -31,6 +31,13 @@ const vec3 kRgbToY  = vec3(0.299, 0.587, 0.114);
 const vec3 kRgbToCb = vec3(-0.168736, -0.331264, 0.5);
 const vec3 kRgbToCr = vec3(0.5, -0.418688, -0.081312);
 const vec3 kBt2020Luma = vec3(0.2627, 0.6780, 0.0593);
+const uint FILTER_GRAYSCALE = 1u << 0u;
+const uint FILTER_BRIGHTNESS = 1u << 1u;
+const uint FILTER_CONTRAST = 1u << 2u;
+const uint FILTER_HDR_TO_SDR = 1u << 5u;
+const uint FILTER_COLOR_CORRECTION = 1u << 6u;
+const uint FILTER_LUMA_KEY = 1u << 7u;
+const uint FILTER_CHROMA_KEY = 1u << 8u;
 
 float pq_to_nits(float v) {
     const float m1 = 2610.0 / 16384.0;
@@ -91,13 +98,16 @@ vec3 apply_color_correction(vec3 color) {
     return pow(clamp(color, vec3(0.0), vec3(1.0)), vec3(1.0 / gamma));
 }
 
-float luma_key_alpha(vec3 color) {
-    float luma = dot(color, vec3(0.299, 0.587, 0.114));
+float luma_key_alpha_value(float luma) {
     float min_luma = clamp(pc.filter_params_a.w, 0.0, 1.0);
     float max_luma = clamp(pc.filter_params_b.z, min_luma, 1.0);
     float smoothness = clamp(pc.filter_params_b.w, 0.001, 1.0);
     return clamp(smoothstep(min_luma, min_luma + smoothness, luma) *
                  (1.0 - smoothstep(max_luma - smoothness, max_luma, luma)), 0.0, 1.0);
+}
+
+float luma_key_alpha(vec3 color) {
+    return luma_key_alpha_value(dot(color, vec3(0.299, 0.587, 0.114)));
 }
 
 float chroma_key_alpha(inout vec3 color) {
@@ -176,7 +186,93 @@ void store_y(uint lx, uint ly, vec4 rgba) {
     }
 }
 
+bool fast_luma_only_path() {
+    const uint allowed = FILTER_GRAYSCALE | FILTER_BRIGHTNESS |
+        FILTER_CONTRAST | FILTER_LUMA_KEY;
+    return (pc.filter_flags & FILTER_GRAYSCALE) != 0u &&
+           clamp(pc.filter_params_a.x, 0.0, 1.0) >= 0.999 &&
+           (pc.filter_flags & ~allowed) == 0u;
+}
+
+vec2 sample_luma_only(uint lx, uint ly) {
+    vec2 src_pos = vec2(float(pc.src_x), float(pc.src_y)) +
+        (vec2(float(lx), float(ly)) + 0.5) *
+        (vec2(float(pc.src_rect_w), float(pc.src_rect_h)) /
+         vec2(float(pc.dst_w), float(pc.dst_h)));
+    vec2 uv = src_pos / vec2(float(pc.src_w), float(pc.src_h));
+    vec4 tex = texture(src_tex, uv);
+    float y = dot(tex.rgb, kRgbToY);
+    if ((pc.filter_flags & FILTER_BRIGHTNESS) != 0u)
+        y += pc.filter_params_a.y;
+    if ((pc.filter_flags & FILTER_CONTRAST) != 0u)
+        y = ((y - 0.5) * pc.filter_params_a.z) + 0.5;
+    y = clamp(y, 0.0, 1.0);
+    float alpha = tex.a;
+    if ((pc.filter_flags & FILTER_LUMA_KEY) != 0u)
+        alpha *= luma_key_alpha_value(y);
+    return vec2(y, alpha);
+}
+
+void store_y_luma(uint lx, uint ly, float luma, float src_alpha) {
+    if (lx >= pc.dst_w || ly >= pc.dst_h) return;
+
+    ivec2 dst = ivec2(pc.dst_x + int(lx), pc.dst_y + int(ly));
+    if (dst.x < 0 || dst.y < 0 ||
+        dst.x >= int(pc.canvas_width) || dst.y >= int(pc.canvas_height)) return;
+
+    float alpha = clamp(pc.opacity * src_alpha, 0.0, 1.0);
+    if (alpha <= 0.0) return;
+
+    float y = clamp((16.0 / 255.0) + luma * (219.0 / 255.0), 0.0, 1.0);
+    if (alpha >= 0.999) {
+        imageStore(y_img, dst, vec4(y, 0.0, 0.0, 1.0));
+    } else {
+        float old_y = imageLoad(y_img, dst).r;
+        imageStore(y_img, dst, vec4(mix(old_y, y, alpha), 0.0, 0.0, 1.0));
+    }
+}
+
+void render_luma_only() {
+    uvec2 base = gl_GlobalInvocationID.xy * 2u;
+    if (base.x >= pc.dst_w || base.y >= pc.dst_h) return;
+
+    uint x1 = min(base.x + 1u, pc.dst_w - 1u);
+    uint y1 = min(base.y + 1u, pc.dst_h - 1u);
+    vec2 c00 = sample_luma_only(base.x, base.y);
+    vec2 c10 = sample_luma_only(x1, base.y);
+    vec2 c01 = sample_luma_only(base.x, y1);
+    vec2 c11 = sample_luma_only(x1, y1);
+
+    store_y_luma(base.x, base.y, c00.x, c00.y);
+    store_y_luma(base.x + 1u, base.y, c10.x, c10.y);
+    store_y_luma(base.x, base.y + 1u, c01.x, c01.y);
+    store_y_luma(base.x + 1u, base.y + 1u, c11.x, c11.y);
+
+    ivec2 dst_base = ivec2(pc.dst_x + int(base.x), pc.dst_y + int(base.y));
+    if (dst_base.x >= 0 && dst_base.y >= 0 &&
+        dst_base.x < int(pc.canvas_width) && dst_base.y < int(pc.canvas_height)) {
+        float alpha = clamp(pc.opacity * (c00.y + c10.y + c01.y + c11.y) * 0.25, 0.0, 1.0);
+        if (alpha <= 0.0) return;
+        ivec2 uv_dst = dst_base >> 1;
+        if (uv_dst.x >= 0 && uv_dst.y >= 0 &&
+            uv_dst.x < int(pc.canvas_width >> 1) && uv_dst.y < int(pc.canvas_height >> 1)) {
+            vec2 neutral = vec2(128.0 / 255.0);
+            if (alpha >= 0.999) {
+                imageStore(uv_img, uv_dst, vec4(neutral, 0.0, 1.0));
+            } else {
+                vec2 old_uv = imageLoad(uv_img, uv_dst).rg;
+                imageStore(uv_img, uv_dst, vec4(mix(old_uv, neutral, alpha), 0.0, 1.0));
+            }
+        }
+    }
+}
+
 void main() {
+    if (fast_luma_only_path()) {
+        render_luma_only();
+        return;
+    }
+
     uvec2 base = gl_GlobalInvocationID.xy * 2u;
     if (base.x >= pc.dst_w || base.y >= pc.dst_h) return;
 

@@ -12,6 +12,9 @@ static sbs_api_client_t *client;
 static sbs_instance_manager_t *instance_mgr;
 static char *api_config_dir;
 
+void test_api_stubs_reset_output_start(void);
+void test_api_stubs_set_output_start_result(int result);
+
 static void remove_tree(const char *path)
 {
     GDir *dir;
@@ -278,6 +281,37 @@ SBS_TEST_FIXTURE(jsonrpc, output_rtmp_passcode_redacted, setup_api, teardown_api
     SBS_ASSERT(strstr(response, "rtmp_passcode_set") != NULL);
     SBS_ASSERT(strstr(response, "new-key") == NULL);
     free(response);
+}
+
+SBS_TEST_FIXTURE(jsonrpc, output_update_restart_failure_marks_error, setup_api, teardown_api)
+{
+    sbs_output_state_t *output = NULL;
+    char *response = NULL;
+
+    SBS_ASSERT_EQ(sbs_api_server_dispatch_json(server, client,
+        "{\"jsonrpc\":\"2.0\",\"id\":32,\"method\":\"output.create\",\"params\":{\"id\":\"output-fail\",\"name\":\"Output\",\"encoder\":{\"sink_type\":\"fakesink\"}}}",
+        &response), SBS_OK);
+    SBS_ASSERT_NOT_NULL(response);
+    free(response);
+
+    output = sbs_scene_graph_get_output(server->scene_graph, "output-fail");
+    SBS_ASSERT_NOT_NULL(output);
+    output->running = true;
+    g_free(output->runtime_state);
+    output->runtime_state = g_strdup("running");
+
+    server->output_sup = (sbs_output_supervisor_t *)0x1;
+    test_api_stubs_reset_output_start();
+    test_api_stubs_set_output_start_result(-1);
+
+    response = NULL;
+    SBS_ASSERT_EQ(sbs_api_server_dispatch_json(server, client,
+        "{\"jsonrpc\":\"2.0\",\"id\":33,\"method\":\"output.update\",\"params\":{\"id\":\"output-fail\",\"encoder\":{\"sink_type\":\"fakesink\"}}}",
+        &response), SBS_OK);
+    SBS_ASSERT_NOT_NULL(response);
+    SBS_ASSERT(strstr(response, "\"state\":\"error\"") != NULL);
+    free(response);
+    server->output_sup = NULL;
 }
 
 SBS_TEST_FIXTURE(jsonrpc, obs_style_filters_round_trip, setup_api, teardown_api)

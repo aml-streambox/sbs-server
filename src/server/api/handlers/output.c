@@ -351,6 +351,8 @@ int sbs_api_handle_output_update(sbs_api_server_t *server, sbs_api_client_t *cli
             int rc = sbs_encoder_manager_add_sink(server->encoder_mgr, &sink_cfg);
             if (rc != SBS_OK) {
                 LOG_W("failed to restart output '%s' after config update: %d", id, rc);
+                g_free(output->runtime_state);
+                output->runtime_state = g_strdup("error");
             } else {
                 output->running = true;
                 g_free(output->runtime_state);
@@ -380,6 +382,8 @@ int sbs_api_handle_output_update(sbs_api_server_t *server, sbs_api_client_t *cli
             int rc = sbs_output_supervisor_start_output(server->output_sup, &cfg);
             if (rc != SBS_OK) {
                 LOG_W("failed to restart output '%s' after encoder update: %d", id, rc);
+                g_free(output->runtime_state);
+                output->runtime_state = g_strdup("error");
             } else {
                 output->running = true;
                 g_free(output->runtime_state);

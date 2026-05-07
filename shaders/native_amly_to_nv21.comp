@@ -260,6 +260,55 @@ void main() {
         : ivec2(pc.dst_x + int(base.x), pc.dst_y + int(base.y));
 
     if (!luma_key_enabled() && full_canvas && pc.opacity >= 0.999 &&
+        pc.dst_x == 0 && pc.dst_y == 0 &&
+        pc.dst_w == pc.canvas_width && pc.dst_h == pc.canvas_height &&
+        pc.src_w == pc.canvas_width && pc.src_h == pc.canvas_height) {
+        uint pair_x = base.x >> 1;
+        uint y00, u0, y10, v0, y01, u1, y11, v1;
+        decode_pair(base.y * pairs_per_row() + pair_x, y00, u0, y10, v0);
+        decode_pair((base.y + 1u) * pairs_per_row() + pair_x, y01, u1, y11, v1);
+
+        imageStore(y_img, dst_base, vec4(map_y10(y00, hdr_enabled), 0.0, 0.0, 1.0));
+        imageStore(y_img, dst_base + ivec2(1, 0), vec4(map_y10(y10, hdr_enabled), 0.0, 0.0, 1.0));
+        imageStore(y_img, dst_base + ivec2(0, 1), vec4(map_y10(y01, hdr_enabled), 0.0, 0.0, 1.0));
+        imageStore(y_img, dst_base + ivec2(1, 1), vec4(map_y10(y11, hdr_enabled), 0.0, 0.0, 1.0));
+
+        uint u_avg = (u0 + u1 + 1u) >> 1;
+        uint v_avg = (v0 + v1 + 1u) >> 1;
+        imageStore(uv_img, dst_base >> 1,
+                   vec4(map_vu10(u_avg, v_avg, hdr_enabled), 0.0, 1.0));
+        return;
+    }
+
+    if (!luma_key_enabled() && !full_canvas && src_offset_enabled() &&
+        pc.opacity >= 0.999 && dst_in_bounds() &&
+        pc.dst_x >= 0 && pc.dst_y >= 0 &&
+        pc.src_w == pc.canvas_width && pc.src_h == pc.canvas_height &&
+        abs(pc.y_scale_x - 1.0) < 0.0001 && abs(pc.y_scale_y - 1.0) < 0.0001) {
+        uint src_x0 = uint(pc.dst_x) + base.x;
+        uint src_y0 = uint(pc.dst_y) + base.y;
+        uint pair_x = src_x0 >> 1;
+        uint y00, u0, y10, v0, y01, u1, y11, v1;
+        decode_pair(src_y0 * pairs_per_row() + pair_x, y00, u0, y10, v0);
+        decode_pair((src_y0 + 1u) * pairs_per_row() + pair_x, y01, u1, y11, v1);
+
+        imageStore(y_img, dst_base, vec4(map_y10(y00, hdr_enabled), 0.0, 0.0, 1.0));
+        if (base.x + 1u < limit_w)
+            imageStore(y_img, dst_base + ivec2(1, 0), vec4(map_y10(y10, hdr_enabled), 0.0, 0.0, 1.0));
+        if (base.y + 1u < limit_h) {
+            imageStore(y_img, dst_base + ivec2(0, 1), vec4(map_y10(y01, hdr_enabled), 0.0, 0.0, 1.0));
+            if (base.x + 1u < limit_w)
+                imageStore(y_img, dst_base + ivec2(1, 1), vec4(map_y10(y11, hdr_enabled), 0.0, 0.0, 1.0));
+        }
+
+        uint u_avg = (u0 + u1 + 1u) >> 1;
+        uint v_avg = (v0 + v1 + 1u) >> 1;
+        imageStore(uv_img, dst_base >> 1,
+                   vec4(map_vu10(u_avg, v_avg, hdr_enabled), 0.0, 1.0));
+        return;
+    }
+
+    if (!luma_key_enabled() && full_canvas && pc.opacity >= 0.999 &&
         dst_base.x >= pc.dst_x && dst_base.y >= pc.dst_y &&
         dst_base.x + 1 < pc.dst_x + int(pc.dst_w) &&
         dst_base.y + 1 < pc.dst_y + int(pc.dst_h)) {

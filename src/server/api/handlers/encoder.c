@@ -12,6 +12,41 @@ static cJSON *api_error(int code, const char *message)
     return err;
 }
 
+static const char *gop_preset_from_pattern(int32_t gop_pattern)
+{
+    switch (gop_pattern) {
+    case 0:
+        return "low_delay";
+    case 1:
+    case 2:
+        return "b_frames";
+    default:
+        return "custom";
+    }
+}
+
+static bool gop_pattern_from_preset(const char *preset, int32_t *out_pattern)
+{
+    if (!preset || !out_pattern)
+        return false;
+    if (g_strcmp0(preset, "low_delay") == 0 ||
+        g_strcmp0(preset, "no_b_frames") == 0 ||
+        g_strcmp0(preset, "ip") == 0) {
+        *out_pattern = 0;
+        return true;
+    }
+    if (g_strcmp0(preset, "b_frames") == 0 ||
+        g_strcmp0(preset, "ibp") == 0 ||
+        g_strcmp0(preset, "balanced") == 0) {
+        *out_pattern = 2;
+        return true;
+    }
+    if (g_strcmp0(preset, "custom") == 0) {
+        return false;
+    }
+    return false;
+}
+
 int sbs_api_handle_encoder_get_config(sbs_api_server_t *server,
                                        sbs_api_client_t *client,
                                        cJSON *params,
@@ -39,7 +74,10 @@ int sbs_api_handle_encoder_get_config(sbs_api_server_t *server,
     cJSON_AddStringToObject(obj, "codec", cfg.codec ? cfg.codec : "h265");
     cJSON_AddNumberToObject(obj, "bitrate_kbps", cfg.bitrate_kbps);
     cJSON_AddNumberToObject(obj, "gop_size", cfg.gop_size);
+    cJSON_AddNumberToObject(obj, "keyframe_interval", cfg.gop_size);
     cJSON_AddNumberToObject(obj, "gop_pattern", cfg.gop_pattern);
+    cJSON_AddStringToObject(obj, "gop_preset", gop_preset_from_pattern(cfg.gop_pattern));
+    cJSON_AddBoolToObject(obj, "enable_b_frames", cfg.gop_pattern != 0);
     cJSON_AddNumberToObject(obj, "rc_mode", cfg.rc_mode);
     if (cfg.encoder)
         cJSON_AddStringToObject(obj, "encoder", cfg.encoder);
@@ -85,9 +123,24 @@ int sbs_api_handle_encoder_update_config(sbs_api_server_t *server,
     if (gop_j && cJSON_IsNumber(gop_j))
         cfg.gop_size = (uint32_t)gop_j->valuedouble;
 
+    cJSON *key_interval_j = cJSON_GetObjectItemCaseSensitive(params, "keyframe_interval");
+    if (key_interval_j && cJSON_IsNumber(key_interval_j))
+        cfg.gop_size = (uint32_t)key_interval_j->valuedouble;
+
     cJSON *gop_pattern_j = cJSON_GetObjectItemCaseSensitive(params, "gop_pattern");
     if (gop_pattern_j && cJSON_IsNumber(gop_pattern_j))
         cfg.gop_pattern = (int32_t)gop_pattern_j->valuedouble;
+
+    cJSON *gop_preset_j = cJSON_GetObjectItemCaseSensitive(params, "gop_preset");
+    if (gop_preset_j && cJSON_IsString(gop_preset_j)) {
+        int32_t preset_pattern = cfg.gop_pattern;
+        if (gop_pattern_from_preset(cJSON_GetStringValue(gop_preset_j), &preset_pattern))
+            cfg.gop_pattern = preset_pattern;
+    }
+
+    cJSON *enable_b_frames_j = cJSON_GetObjectItemCaseSensitive(params, "enable_b_frames");
+    if (enable_b_frames_j && cJSON_IsBool(enable_b_frames_j))
+        cfg.gop_pattern = cJSON_IsTrue(enable_b_frames_j) ? 2 : 0;
 
     cJSON *rc_mode_j = cJSON_GetObjectItemCaseSensitive(params, "rc_mode");
     if (rc_mode_j && cJSON_IsNumber(rc_mode_j))

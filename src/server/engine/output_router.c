@@ -43,6 +43,8 @@
 /* ── Output Router ────────────────────────────────────────────── */
 
 #define SBS_NATIVE_ENCODER_QUEUE_CAPACITY 2u
+#define SBS_NATIVE_ENCODER_RETAIN_CAPACITY 16u
+#define SBS_NATIVE_ENCODER_BFRAME_RETAIN_COUNT 8u
 
 struct sbs_output_router {
     sbs_compositor_thread_t  *comp_thread;  /* Borrowed reference */
@@ -93,6 +95,9 @@ struct sbs_output_router {
     uint32_t        encoder_queue_count;
     sbs_native_canvas_lease_t encoder_queue_leases[SBS_NATIVE_ENCODER_QUEUE_CAPACITY];
     sbs_video_frame_msg_t     encoder_queue_msgs[SBS_NATIVE_ENCODER_QUEUE_CAPACITY];
+    uint32_t        encoder_retain_head;
+    uint32_t        encoder_retain_count;
+    sbs_native_canvas_lease_t encoder_retained_leases[SBS_NATIVE_ENCODER_RETAIN_CAPACITY];
     uint64_t        encoder_frames_submitted;
     uint64_t        encoder_frames_dropped;
     uint64_t        encoder_last_content_frame;
@@ -220,6 +225,70 @@ static bool native_encoder_encode_duplicates_enabled(void)
     return !env || env[0] != '0';
 }
 
+static bool native_encoder_bframes_enabled(sbs_encoder_manager_t *encoder_mgr)
+{
+    sbs_encoder_config_t cfg = {0};
+
+    if (!encoder_mgr)
+        return false;
+
+    sbs_encoder_manager_get_config(encoder_mgr, &cfg);
+    switch (cfg.gop_pattern) {
+    case 1:
+    case 2:
+    case 3:
+    case 6:
+    case 7:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void native_encoder_retain_lease(sbs_output_router_t *router,
+                                        sbs_native_canvas_lease_t *lease)
+{
+    if (!router || !native_encoder_lease_valid(lease))
+        return;
+
+    if (router->encoder_retain_count >= SBS_NATIVE_ENCODER_RETAIN_CAPACITY) {
+        native_encoder_release_lease(router,
+            &router->encoder_retained_leases[router->encoder_retain_head]);
+        router->encoder_retain_head = (router->encoder_retain_head + 1u) %
+                                      SBS_NATIVE_ENCODER_RETAIN_CAPACITY;
+        router->encoder_retain_count--;
+    }
+
+    uint32_t tail = (router->encoder_retain_head + router->encoder_retain_count) %
+                    SBS_NATIVE_ENCODER_RETAIN_CAPACITY;
+    router->encoder_retained_leases[tail] = *lease;
+    router->encoder_retain_count++;
+    native_encoder_clear_lease(lease);
+
+    while (router->encoder_retain_count > SBS_NATIVE_ENCODER_BFRAME_RETAIN_COUNT) {
+        native_encoder_release_lease(router,
+            &router->encoder_retained_leases[router->encoder_retain_head]);
+        router->encoder_retain_head = (router->encoder_retain_head + 1u) %
+                                      SBS_NATIVE_ENCODER_RETAIN_CAPACITY;
+        router->encoder_retain_count--;
+    }
+}
+
+static void native_encoder_release_retained_leases(sbs_output_router_t *router)
+{
+    if (!router)
+        return;
+
+    while (router->encoder_retain_count > 0) {
+        native_encoder_release_lease(router,
+            &router->encoder_retained_leases[router->encoder_retain_head]);
+        router->encoder_retain_head = (router->encoder_retain_head + 1u) %
+                                      SBS_NATIVE_ENCODER_RETAIN_CAPACITY;
+        router->encoder_retain_count--;
+    }
+    router->encoder_retain_head = 0;
+}
+
 static void native_encoder_reset_content_gate(sbs_output_router_t *router)
 {
     if (!router)
@@ -325,7 +394,7 @@ static void *native_encoder_thread_func(void *arg)
         int enc_fd = dup(lease.backing_fd);
         if (enc_fd >= 0) {
             sbs_encoder_manager_consume_frame_dmabuf(encoder_mgr, &msg,
-                                                     enc_fd, lease.backing_size);
+                                                      enc_fd, lease.backing_size);
             submitted = true;
         } else {
             LOG_W("native encoder dup(fd=%d) failed: %s",
@@ -353,8 +422,15 @@ static void *native_encoder_thread_func(void *arg)
                    (unsigned long)dropped_total);
         }
 
-        native_encoder_release_lease(router, &lease);
+        if (submitted && native_encoder_bframes_enabled(encoder_mgr)) {
+            native_encoder_retain_lease(router, &lease);
+        } else {
+            native_encoder_release_retained_leases(router);
+            native_encoder_release_lease(router, &lease);
+        }
     }
+
+    native_encoder_release_retained_leases(router);
 
     LOG_I("native encoder handoff thread stopped");
     return NULL;
@@ -1067,6 +1143,8 @@ sbs_output_router_t *sbs_output_router_new(sbs_compositor_thread_t *comp_thread,
     router->export_eventfd = -1;
     for (uint32_t i = 0; i < SBS_NATIVE_ENCODER_QUEUE_CAPACITY; i++)
         native_encoder_clear_lease(&router->encoder_queue_leases[i]);
+    for (uint32_t i = 0; i < SBS_NATIVE_ENCODER_RETAIN_CAPACITY; i++)
+        native_encoder_clear_lease(&router->encoder_retained_leases[i]);
     pthread_mutex_init(&router->encoder_lock, NULL);
     pthread_cond_init(&router->encoder_cond, NULL);
 

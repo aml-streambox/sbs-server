@@ -182,6 +182,8 @@ typedef struct sbs_pending_frame {
     uint64_t dts_ns;
     uint64_t duration_ns;
     bool requested_idr;
+    uint8_t *owned_input;
+    size_t owned_input_size;
 } sbs_pending_frame_t;
 
 /* ---- Encoder instance ---- */
@@ -203,10 +205,13 @@ struct sbs_direct_venc {
     int32_t gop_pattern;
     int32_t rc_mode;
     bool hdr10;
+    bool bframe_enabled;
 
     uint8_t *outbuf;
     size_t outbuf_size;
     int next_submit_id;
+    uint64_t output_counter;
+    uint64_t frame_duration_ns;
     GQueue *pending_frames;
 };
 
@@ -258,6 +263,81 @@ static bool sync_dmabuf_write_end(int fd)
     return false;
 }
 
+static bool gop_pattern_has_bframes(int32_t gop_pattern)
+{
+    switch (gop_pattern) {
+    case 1:
+    case 2:
+    case 3:
+    case 6:
+    case 7:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static uint32_t gop_pattern_delay_frames(int32_t gop_pattern)
+{
+    switch (gop_pattern) {
+    case 1:
+        return 4;
+    case 2:
+        return 2;
+    case 3:
+        return 3;
+    case 6:
+        return 4;
+    case 7:
+        return 8;
+    default:
+        return 0;
+    }
+}
+
+static uint64_t calculate_frame_duration_ns(uint32_t fps_num, uint32_t fps_den)
+{
+    if (fps_num == 0)
+        return 1000000000ull / 60ull;
+
+    if (fps_den == 0)
+        fps_den = 1;
+
+    return (1000000000ull * (uint64_t)fps_den) / (uint64_t)fps_num;
+}
+
+static uint64_t bframe_delay_ns(const sbs_direct_venc_t *enc)
+{
+    uint64_t frames;
+
+    if (!enc || !enc->bframe_enabled || enc->frame_duration_ns == 0)
+        return 0;
+
+    frames = gop_pattern_delay_frames(enc->gop_pattern);
+    return frames * enc->frame_duration_ns;
+}
+
+static uint64_t calculate_packet_dts(sbs_direct_venc_t *enc,
+                                     const sbs_pending_frame_t *pending)
+{
+    if (!enc || !pending)
+        return UINT64_MAX;
+
+    if (!enc->bframe_enabled || enc->frame_duration_ns == 0)
+        return pending->dts_ns;
+
+    return enc->output_counter * enc->frame_duration_ns;
+}
+
+static void pending_frame_free(gpointer data)
+{
+    sbs_pending_frame_t *pending = data;
+    if (!pending)
+        return;
+    g_free(pending->owned_input);
+    g_free(pending);
+}
+
 static sbs_pending_frame_t *pending_frame_take_match(sbs_direct_venc_t *enc, int input_frame_num)
 {
     if (!enc || !enc->pending_frames)
@@ -276,7 +356,9 @@ static sbs_pending_frame_t *pending_frame_take_match(sbs_direct_venc_t *enc, int
 
 static void pending_frame_push(sbs_direct_venc_t *enc,
                                const sbs_video_frame_msg_t *msg,
-                               bool requested_idr)
+                               bool requested_idr,
+                               uint8_t *owned_input,
+                               size_t owned_input_size)
 {
     sbs_pending_frame_t *pending = g_new0(sbs_pending_frame_t, 1);
     pending->id = enc->next_submit_id++;
@@ -284,6 +366,8 @@ static void pending_frame_push(sbs_direct_venc_t *enc,
     pending->dts_ns = msg->dts_ns;
     pending->duration_ns = msg->duration_ns;
     pending->requested_idr = requested_idr;
+    pending->owned_input = owned_input;
+    pending->owned_input_size = owned_input_size;
     g_queue_push_tail(enc->pending_frames, pending);
 }
 
@@ -375,6 +459,8 @@ static int submit_common(sbs_direct_venc_t *enc,
                           const sbs_video_frame_msg_t *msg,
                           vl_buffer_info_t *inbuf,
                           int sync_fd,
+                          uint8_t *owned_input,
+                          size_t owned_input_size,
                           bool force_idr,
                           sbs_direct_venc_packet_t *packet)
 {
@@ -433,7 +519,8 @@ static int submit_common(sbs_direct_venc_t *enc,
         }
     }
 
-    pending_frame_push(enc, msg, request_idr);
+    pending_frame_push(enc, msg, request_idr, owned_input, owned_input_size);
+    owned_input = NULL;
     sync_dmabuf_write_end(sync_fd);
     sync_dmabuf_read(sync_fd, true);
     meta = enc->encode_fn(enc->handle, frame_type, enc->outbuf, inbuf, &retbuf);
@@ -441,7 +528,7 @@ static int submit_common(sbs_direct_venc_t *enc,
 
     if (!meta.is_valid) {
         sbs_pending_frame_t *pending = g_queue_pop_tail(enc->pending_frames);
-        g_free(pending);
+        pending_frame_free(pending);
         LOG_E("vl_multi_encoder_encode failed: err=%d input_frame_num=%d", meta.err_cod, meta.input_frame_num);
         return SBS_ERR_IO;
     }
@@ -454,11 +541,14 @@ static int submit_common(sbs_direct_venc_t *enc,
 
     sbs_pending_frame_t *pending = pending_frame_take_match(enc, meta.input_frame_num);
     if (pending) {
-        packet->pts_ns = pending->pts_ns;
-        packet->dts_ns = pending->dts_ns;
+        uint64_t delay_ns = bframe_delay_ns(enc);
+        packet->pts_ns = enc->bframe_enabled
+            ? ((uint64_t)pending->id * enc->frame_duration_ns) + delay_ns
+            : pending->pts_ns;
+        packet->dts_ns = calculate_packet_dts(enc, pending);
         packet->duration_ns = pending->duration_ns;
         packet->is_keyframe = pending->requested_idr;
-        g_free(pending);
+        pending_frame_free(pending);
     } else {
         packet->pts_ns = 0;
         packet->dts_ns = UINT64_MAX;
@@ -471,6 +561,8 @@ static int submit_common(sbs_direct_venc_t *enc,
     packet->is_keyframe = packet->is_keyframe ||
                            meta.extra.frame_type == FRAME_TYPE_IDR ||
                            meta.extra.frame_type == FRAME_TYPE_I;
+
+    enc->output_counter++;
 
     return SBS_OK;
 }
@@ -493,6 +585,8 @@ sbs_direct_venc_t *sbs_direct_venc_new(const sbs_direct_venc_config_t *config)
     enc->gop_pattern = config->gop_pattern;
     enc->rc_mode = config->rc_mode;
     enc->hdr10 = config->hdr10;
+    enc->bframe_enabled = gop_pattern_has_bframes(enc->gop_pattern);
+    enc->frame_duration_ns = calculate_frame_duration_ns(enc->fps_num, enc->fps_den);
     enc->outbuf_size = choose_outbuf_size(config->width, config->height);
     enc->outbuf = g_malloc0(enc->outbuf_size);
     enc->pending_frames = g_queue_new();
@@ -518,7 +612,7 @@ void sbs_direct_venc_free(sbs_direct_venc_t *enc)
     if (enc->handle != 0 && enc->destroy_fn)
         enc->destroy_fn(enc->handle);
     if (enc->pending_frames)
-        g_queue_free_full(enc->pending_frames, g_free);
+        g_queue_free_full(enc->pending_frames, pending_frame_free);
     g_free(enc->outbuf);
     if (enc->libvpcodec)
         dlclose(enc->libvpcodec);
@@ -563,11 +657,24 @@ int sbs_direct_venc_submit_ptr(sbs_direct_venc_t *enc,
         }
     }
 
+    uint8_t *owned_input = NULL;
+    size_t owned_input_size = 0;
+    const void *submit_data = data;
+
+    if (enc->bframe_enabled) {
+        owned_input = g_malloc(size);
+        if (!owned_input)
+            return SBS_ERR_NOMEM;
+        memcpy(owned_input, data, size);
+        owned_input_size = size;
+        submit_data = owned_input;
+    }
+
     memset(&inbuf, 0, sizeof(inbuf));
     inbuf.buf_type = VMALLOC_TYPE;
     inbuf.buf_fmt = enc->hdr10 ? IMG_FMT_P010 : IMG_FMT_NV21;
     inbuf.buf_stride = (int)(msg->plane_stride[0] > 0 ? msg->plane_stride[0] : (enc->hdr10 ? msg->width * 2 : msg->width));
-    inbuf.buf_info.in_ptr[0] = (unsigned long)data;
+    inbuf.buf_info.in_ptr[0] = (unsigned long)submit_data;
     if (enc->hdr10) {
         /* The Wave521 P010 VMALLOC path only handles one contiguous Y+UV
          * buffer. Supplying a separate UV pointer selects the broken
@@ -578,7 +685,8 @@ int sbs_direct_venc_submit_ptr(sbs_direct_venc_t *enc,
     }
     inbuf.buf_info.in_ptr[2] = 0;
 
-    return submit_common(enc, msg, &inbuf, -1, force_idr, packet);
+    return submit_common(enc, msg, &inbuf, -1, owned_input, owned_input_size,
+                         force_idr, packet);
 }
 
 int sbs_direct_venc_submit_dmabuf(sbs_direct_venc_t *enc,
@@ -616,5 +724,6 @@ int sbs_direct_venc_submit_dmabuf(sbs_direct_venc_t *enc,
     inbuf.buf_info.dma_info.shared_fd[2] = -1;
     inbuf.buf_info.dma_info.num_planes = 1u;
 
-    return submit_common(enc, msg, &inbuf, dmabuf_fd, force_idr, packet);
+    return submit_common(enc, msg, &inbuf, dmabuf_fd, NULL, 0,
+                         force_idr, packet);
 }

@@ -432,10 +432,10 @@ static void push_encoded_packet(sbs_encoder_manager_t *mgr,
     }
 
     gst_buffer_fill(buffer, 0, packet->data, packet->size);
-    GST_BUFFER_PTS(buffer) = normalize_video_time(mgr, packet->pts_ns);
     GST_BUFFER_DTS(buffer) = (packet->dts_ns == UINT64_MAX)
         ? GST_CLOCK_TIME_NONE
         : normalize_video_time(mgr, packet->dts_ns);
+    GST_BUFFER_PTS(buffer) = normalize_video_time(mgr, packet->pts_ns);
     GST_BUFFER_DURATION(buffer) = packet->duration_ns;
 
     /* Mark keyframes so downstream parser/muxer knows. */
@@ -1322,15 +1322,20 @@ int sbs_encoder_manager_update_config(sbs_encoder_manager_t *mgr,
     }
     g_hash_table_remove_all(mgr->branches);
 
+    /* enc_config may contain pointers returned by get_config(), so duplicate
+     * strings before freeing the manager-owned copies below. */
+    char *new_codec_owned = g_strdup(new_codec);
+    char *new_encoder_owned = g_strdup(enc_config->encoder);
+
     /* Update config */
     g_free(mgr->codec);
-    mgr->codec = g_strdup(new_codec);
+    mgr->codec = new_codec_owned;
     mgr->bitrate_kbps = new_bitrate;
     mgr->gop_size = enc_config->gop_size;
     mgr->gop_pattern = enc_config->gop_pattern;
     mgr->rc_mode = enc_config->rc_mode;
     g_free(mgr->encoder_override);
-    mgr->encoder_override = g_strdup(enc_config->encoder);
+    mgr->encoder_override = new_encoder_owned;
     mgr->hdr10 = enc_config->hdr10;
 
     /* Teardown and rebuild */

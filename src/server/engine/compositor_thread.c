@@ -119,6 +119,23 @@ static void close_ge2d_source_fds(sbs_compositor_thread_t *ct)
     }
 }
 
+static bool pending_source_import_still_active(sbs_compositor_thread_t *ct,
+                                               uint32_t slot,
+                                               int import_idx,
+                                               ino_t import_inode)
+{
+    if (!ct || slot >= SBS_COMP_SCENE_MAX_ITEMS || import_idx < 0 ||
+        import_idx >= SBS_DMABUF_BUF_CACHE_SIZE)
+        return false;
+
+    sbs_source_texture_t *tex = &ct->compositor.sources[slot];
+    if (tex->dmabuf_buf_active_idx != import_idx)
+        return false;
+
+    struct sbs_dmabuf_buf_cache_entry *entry = &tex->dmabuf_buf_cache[import_idx];
+    return entry->valid && entry->inode == import_inode;
+}
+
 static void init_ge2d_source_fds(sbs_compositor_thread_t *ct)
 {
     uint32_t i;
@@ -127,23 +144,47 @@ static void init_ge2d_source_fds(sbs_compositor_thread_t *ct)
 }
 
 static void release_pending_source_frames_for_entry(sbs_compositor_thread_t *ct,
-                                                    uint32_t entry_idx)
+                                                    uint32_t entry_idx,
+                                                    bool force)
 {
     if (!ct || entry_idx >= SBS_NATIVE_CANVAS_RING_SIZE)
         return;
     uint32_t count = ct->source_release_pending_count[entry_idx];
+    uint32_t kept = 0;
     for (uint32_t i = 0; i < count; i++) {
+        if (!force && pending_source_import_still_active(
+                ct,
+                ct->source_release_pending_slot[entry_idx][i],
+                ct->source_release_pending_import_idx[entry_idx][i],
+                ct->source_release_pending_import_inode[entry_idx][i])) {
+            if (kept != i) {
+                ct->source_release_pending[entry_idx][kept] =
+                    ct->source_release_pending[entry_idx][i];
+                ct->source_release_pending_slot[entry_idx][kept] =
+                    ct->source_release_pending_slot[entry_idx][i];
+                ct->source_release_pending_import_idx[entry_idx][kept] =
+                    ct->source_release_pending_import_idx[entry_idx][i];
+                ct->source_release_pending_import_inode[entry_idx][kept] =
+                    ct->source_release_pending_import_inode[entry_idx][i];
+            }
+            kept++;
+            continue;
+        }
         sbs_compositor_release_source_dmabuf_import(&ct->compositor,
                                                     ct->source_release_pending_slot[entry_idx][i],
                                                     ct->source_release_pending_import_idx[entry_idx][i],
                                                     ct->source_release_pending_import_inode[entry_idx][i]);
         sbs_frame_fds_release(ct->source_release_pending[entry_idx][i], NULL);
         ct->source_release_pending[entry_idx][i] = NULL;
+    }
+
+    for (uint32_t i = kept; i < count; i++) {
+        ct->source_release_pending[entry_idx][i] = NULL;
         ct->source_release_pending_slot[entry_idx][i] = 0;
         ct->source_release_pending_import_idx[entry_idx][i] = -1;
         ct->source_release_pending_import_inode[entry_idx][i] = 0;
     }
-    ct->source_release_pending_count[entry_idx] = 0;
+    ct->source_release_pending_count[entry_idx] = kept;
 }
 
 static void release_ready_source_frames(sbs_compositor_thread_t *ct)
@@ -157,7 +198,7 @@ static void release_ready_source_frames(sbs_compositor_thread_t *ct)
         int state = atomic_load_explicit(&entry->state, memory_order_acquire);
         if (state != SBS_NATIVE_CANVAS_ENTRY_RENDERING ||
             vkGetFenceStatus(ct->compositor.device, entry->fence) == VK_SUCCESS)
-            release_pending_source_frames_for_entry(ct, i);
+            release_pending_source_frames_for_entry(ct, i, false);
     }
 }
 
@@ -175,16 +216,22 @@ static void attach_source_releases_to_entry(sbs_compositor_thread_t *ct,
         return;
     }
 
-    release_pending_source_frames_for_entry(ct, entry_idx);
-    if (count > SBS_COMP_SCENE_MAX_ITEMS)
-        count = SBS_COMP_SCENE_MAX_ITEMS;
+    release_pending_source_frames_for_entry(ct, entry_idx, false);
+    uint32_t start = ct->source_release_pending_count[entry_idx];
     for (uint32_t i = 0; i < count; i++) {
-        ct->source_release_pending[entry_idx][i] = frames[i];
-        ct->source_release_pending_slot[entry_idx][i] = slots ? slots[i] : 0;
-        ct->source_release_pending_import_idx[entry_idx][i] = import_idxs ? import_idxs[i] : -1;
-        ct->source_release_pending_import_inode[entry_idx][i] = import_inodes ? import_inodes[i] : 0;
+        if (start + i >= SBS_COMP_SCENE_MAX_ITEMS) {
+            sbs_frame_fds_release(frames[i], NULL);
+            continue;
+        }
+        uint32_t dst = start + i;
+        ct->source_release_pending[entry_idx][dst] = frames[i];
+        ct->source_release_pending_slot[entry_idx][dst] = slots ? slots[i] : 0;
+        ct->source_release_pending_import_idx[entry_idx][dst] = import_idxs ? import_idxs[i] : -1;
+        ct->source_release_pending_import_inode[entry_idx][dst] = import_inodes ? import_inodes[i] : 0;
     }
-    ct->source_release_pending_count[entry_idx] = count;
+    uint32_t total = start + count;
+    ct->source_release_pending_count[entry_idx] = total > SBS_COMP_SCENE_MAX_ITEMS
+        ? SBS_COMP_SCENE_MAX_ITEMS : total;
 }
 
 static void release_all_pending_source_frames(sbs_compositor_thread_t *ct)
@@ -192,7 +239,7 @@ static void release_all_pending_source_frames(sbs_compositor_thread_t *ct)
     if (!ct)
         return;
     for (uint32_t i = 0; i < SBS_NATIVE_CANVAS_RING_SIZE; i++)
-        release_pending_source_frames_for_entry(ct, i);
+        release_pending_source_frames_for_entry(ct, i, true);
 }
 
 static void release_transition_cached_entry(sbs_compositor_thread_t *ct)

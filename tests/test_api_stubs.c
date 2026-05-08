@@ -121,6 +121,12 @@ uint64_t sbs_output_router_frames_distributed(const sbs_output_router_t *router)
     return 120;
 }
 
+double sbs_output_router_last_encoder_time_ms(const sbs_output_router_t *router)
+{
+    (void)router;
+    return 0.0;
+}
+
 void sbs_output_router_set_preview_engine(sbs_output_router_t *router,
                                           sbs_preview_engine_t *preview)
 {

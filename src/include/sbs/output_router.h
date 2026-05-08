@@ -92,6 +92,7 @@ gboolean sbs_output_router_on_frame_ready_fd(gint fd,
  * Get total frames distributed.
  */
 uint64_t sbs_output_router_frames_distributed(const sbs_output_router_t *router);
+double sbs_output_router_last_encoder_time_ms(const sbs_output_router_t *router);
 
 void sbs_output_router_set_preview_engine(sbs_output_router_t *router,
                                           sbs_preview_engine_t *preview);

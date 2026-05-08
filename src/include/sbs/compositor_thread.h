@@ -71,6 +71,8 @@ typedef struct {
     uint64_t repeated_frame_count;
     uint32_t frames_dropped;
     double   last_frame_time_ms;
+    double   last_frame_latency_ms;
+    double   last_frame_interval_ms;
     double   avg_frame_time_ms;
     double   min_frame_time_ms;
     double   max_frame_time_ms;

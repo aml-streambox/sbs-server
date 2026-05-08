@@ -97,6 +97,7 @@ struct sbs_output_router {
     uint64_t        encoder_frames_dropped;
     uint64_t        encoder_last_content_frame;
     uint64_t        encoder_duplicate_frames_skipped;
+    double          encoder_last_frame_time_ms;
 
     /* Native preview handoff. Preview's direct H.264 encode can also block, so
      * the router only publishes the latest profile-sized preview lease here. */
@@ -229,6 +230,17 @@ static void native_encoder_reset_content_gate(sbs_output_router_t *router)
     pthread_mutex_unlock(&router->encoder_lock);
 }
 
+static void native_encoder_note_frame_time(sbs_output_router_t *router,
+                                           gint64 elapsed_usec)
+{
+    if (!router)
+        return;
+
+    pthread_mutex_lock(&router->encoder_lock);
+    router->encoder_last_frame_time_ms = (double)elapsed_usec / 1000.0;
+    pthread_mutex_unlock(&router->encoder_lock);
+}
+
 static bool native_encoder_enqueue_lease(sbs_output_router_t *router,
                                          const sbs_native_canvas_lease_t *lease,
                                          const sbs_video_frame_msg_t *msg)
@@ -323,9 +335,12 @@ static void *native_encoder_thread_func(void *arg)
         gint64 elapsed = g_get_monotonic_time() - t0;
         uint64_t submitted_total;
         uint64_t dropped_total;
+        double elapsed_ms = (double)elapsed / 1000.0;
         pthread_mutex_lock(&router->encoder_lock);
-        if (submitted)
+        if (submitted) {
             router->encoder_frames_submitted++;
+            router->encoder_last_frame_time_ms = elapsed_ms;
+        }
         submitted_total = router->encoder_frames_submitted;
         dropped_total = router->encoder_frames_dropped;
         pthread_mutex_unlock(&router->encoder_lock);
@@ -335,7 +350,7 @@ static void *native_encoder_thread_func(void *arg)
                   (unsigned long)lease.frame_number,
                   elapsed / 1000.0,
                   (unsigned long)submitted_total,
-                  (unsigned long)dropped_total);
+                   (unsigned long)dropped_total);
         }
 
         native_encoder_release_lease(router, &lease);
@@ -813,6 +828,8 @@ static void export_thread_process_frame(sbs_output_router_t *router,
                     }
                 }
                 t_encoder_consume = g_get_monotonic_time() - t0;
+                if (t_encoder_consume > 0)
+                    native_encoder_note_frame_time(router, t_encoder_consume);
             }
 
             /* Feed to legacy output supervisor */
@@ -1257,6 +1274,21 @@ gboolean sbs_output_router_on_frame_ready_fd(gint fd,
 uint64_t sbs_output_router_frames_distributed(const sbs_output_router_t *router)
 {
     return router ? router->frames_distributed : 0;
+}
+
+double sbs_output_router_last_encoder_time_ms(const sbs_output_router_t *router)
+{
+    sbs_output_router_t *mutable_router;
+    double value;
+
+    if (!router)
+        return 0.0;
+
+    mutable_router = (sbs_output_router_t *)router;
+    pthread_mutex_lock(&mutable_router->encoder_lock);
+    value = mutable_router->encoder_last_frame_time_ms;
+    pthread_mutex_unlock(&mutable_router->encoder_lock);
+    return value;
 }
 
 void sbs_output_router_set_preview_engine(sbs_output_router_t *router,

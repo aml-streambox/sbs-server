@@ -1,4 +1,5 @@
 api_sources = files(
+    'telemetry_utils.c',
     'ws_server.c',
     'jsonrpc.c',
     'pubsub.c',

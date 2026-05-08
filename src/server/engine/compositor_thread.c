@@ -93,6 +93,8 @@ typedef struct sbs_compositor_thread {
     uint32_t            source_release_pending_count[SBS_NATIVE_CANVAS_RING_SIZE];
 
     double              last_frame_time_ms;
+    double              last_frame_latency_ms;
+    double              last_frame_interval_ms;
     double              total_frame_time_ms;
     double              min_frame_time_ms;
     double              max_frame_time_ms;
@@ -577,6 +579,7 @@ static void *compositor_thread_func(void *arg)
 retire_done:
 
         struct timespec ts_start, ts_end;
+        uint64_t oldest_source_timestamp_us = 0;
         clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
         if (ct->pipeline_mode == SBS_COMP_PIPELINE_GE2D_ONLY) {
@@ -593,6 +596,8 @@ retire_done:
                 fds = (sbs_frame_fds_t *)sbs_frame_slot_take_oldest(item->frame_slot, &ts);
                 if (!fds)
                     continue;
+                if (ts > 0 && (oldest_source_timestamp_us == 0 || ts < oldest_source_timestamp_us))
+                    oldest_source_timestamp_us = ts;
                 fd = fds->dmabuf_fd;
                 if (fd > 0) {
                     if (ct->ge2d_source_fds[i] >= 0)
@@ -670,6 +675,8 @@ retire_done:
                 sbs_frame_fds_t *fds = (sbs_frame_fds_t *)sbs_frame_slot_take_oldest(item->frame_slot, &ts);
                 if (!fds)
                     continue;
+                if (ts > 0 && (oldest_source_timestamp_us == 0 || ts < oldest_source_timestamp_us))
+                    oldest_source_timestamp_us = ts;
 
                 int fd = fds->dmabuf_fd;
                 int fd2 = fds->dmabuf_fd2;
@@ -786,6 +793,14 @@ retire_done:
             double frame_ms = (double)(ts_end.tv_sec - ts_start.tv_sec) * 1000.0
                             + (double)(ts_end.tv_nsec - ts_start.tv_nsec) / 1000000.0;
             ct->last_frame_time_ms = frame_ms;
+            if (oldest_source_timestamp_us > 0) {
+                uint64_t end_us = (uint64_t)ts_end.tv_sec * 1000000ull +
+                                  (uint64_t)ts_end.tv_nsec / 1000ull;
+                if (end_us >= oldest_source_timestamp_us) {
+                    ct->last_frame_latency_ms =
+                        (double)(end_us - oldest_source_timestamp_us) / 1000.0;
+                }
+            }
             ct->total_frame_time_ms += frame_ms;
             ct->timed_frame_count++;
             if (frame_ms < ct->min_frame_time_ms) ct->min_frame_time_ms = frame_ms;
@@ -831,11 +846,14 @@ retire_done:
         struct timespec loop_now;
         clock_gettime(CLOCK_MONOTONIC, &loop_now);
         int64_t loop_start_ns = loop_now.tv_sec * 1000000000LL + loop_now.tv_nsec;
-        if (ct->last_loop_start_ns > 0 && ct->frame_count % 60 == 0) {
+        if (ct->last_loop_start_ns > 0) {
             double loop_ms = (double)(loop_start_ns - ct->last_loop_start_ns) / 1000000.0;
-            LOG_I("loop timing: frame=%lu render=%.2fms remain_ns=%ld loop_ms=%.2f",
-                  (unsigned long)ct->frame_count, ct->last_frame_time_ms,
-                  (long)remain_ns, loop_ms);
+            ct->last_frame_interval_ms = loop_ms;
+            if (ct->frame_count % 60 == 0) {
+                LOG_I("loop timing: frame=%lu render=%.2fms remain_ns=%ld loop_ms=%.2f",
+                      (unsigned long)ct->frame_count, ct->last_frame_time_ms,
+                      (long)remain_ns, loop_ms);
+            }
         }
         ct->last_loop_start_ns = loop_start_ns;
     }
@@ -1015,6 +1033,8 @@ void sbs_compositor_thread_get_timing(sbs_compositor_thread_t *ct,
         : 0;
     out->frames_dropped = ct->frames_dropped;
     out->last_frame_time_ms = ct->last_frame_time_ms;
+    out->last_frame_latency_ms = ct->last_frame_latency_ms;
+    out->last_frame_interval_ms = ct->last_frame_interval_ms;
     out->min_frame_time_ms = ct->min_frame_time_ms;
     out->max_frame_time_ms = ct->max_frame_time_ms;
     if (ct->timed_frame_count > 0) {

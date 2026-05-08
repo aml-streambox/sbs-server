@@ -953,7 +953,7 @@ static gboolean on_frame_available(gint fd, GIOCondition cond, gpointer user_dat
             }
 
             sbs_frame_slot_publish(entry->frame_slot, fds,
-                                   (uint64_t)(entry->last_frame_time / 1000));
+                                   (uint64_t)entry->last_frame_time);
 
             LOG_T("source '%s' frame %lu (fd=%d fd2=%d)",
                   entry->source_id, (unsigned long)msg_buf.frame.sequence,

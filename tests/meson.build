@@ -73,6 +73,7 @@ if get_option('tests')
         '../src/server/config/config_manager.c',
         '../src/server/config/source_start_config.c',
         '../src/server/api/ws_server.c',
+        '../src/server/api/telemetry_utils.c',
         '../src/server/api/jsonrpc.c',
         '../src/server/api/pubsub.c',
         '../src/server/api/handlers/command.c',

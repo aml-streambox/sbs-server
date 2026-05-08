@@ -59,6 +59,7 @@ typedef struct sbs_sink_branch_config {
 typedef struct sbs_encoder_manager_metrics {
     uint64_t frames_pushed;
     uint64_t frames_dropped;
+    uint64_t encoded_bytes;
     uint32_t active_branches;
     bool     pipeline_active;
 } sbs_encoder_manager_metrics_t;

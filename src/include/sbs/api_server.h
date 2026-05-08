@@ -58,9 +58,12 @@ struct sbs_api_server {
     int64_t started_monotonic_usec;
     uint64_t last_telemetry_frame_count;
     uint64_t last_telemetry_content_frame_count;
+    uint64_t last_telemetry_encoded_bytes;
     int64_t last_telemetry_monotonic_usec;
     double last_telemetry_compositor_fps;
     double last_telemetry_content_fps;
+    double last_telemetry_bitrate_kbps;
+    double last_telemetry_latency_ms;
     bool last_telemetry_pipeline_slow;
     uint32_t telemetry_slow_streak;
     bool pending_canvas_valid;

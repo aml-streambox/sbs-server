@@ -98,6 +98,7 @@ struct sbs_encoder_manager {
     /* Frame counters */
     uint64_t frames_pushed;
     uint64_t frames_dropped;
+    uint64_t encoded_bytes;
     uint64_t audio_buffers_pushed;
 
     /* Parser name cache */
@@ -1409,6 +1410,7 @@ void sbs_encoder_manager_consume_frame_ptr(sbs_encoder_manager_t *mgr,
     }
 
     push_encoded_packet(mgr, &packet);
+    mgr->encoded_bytes += packet.size;
 
     mgr->frames_pushed++;
     if (mgr->frames_pushed <= 3 || mgr->frames_pushed % 600 == 0) {
@@ -1448,6 +1450,7 @@ void sbs_encoder_manager_consume_frame_dmabuf(sbs_encoder_manager_t *mgr,
     }
 
     push_encoded_packet(mgr, &packet);
+    mgr->encoded_bytes += packet.size;
 
     mgr->frames_pushed++;
     pthread_mutex_unlock(&mgr->pipeline_mutex);
@@ -1586,14 +1589,20 @@ uint32_t sbs_encoder_manager_sink_count(const sbs_encoder_manager_t *mgr)
 void sbs_encoder_manager_get_metrics(const sbs_encoder_manager_t *mgr,
                                       sbs_encoder_manager_metrics_t *metrics)
 {
+    sbs_encoder_manager_t *mutable_mgr;
+
     if (!metrics) return;
     memset(metrics, 0, sizeof(*metrics));
     if (!mgr) return;
 
-    metrics->frames_pushed   = mgr->frames_pushed;
-    metrics->frames_dropped  = mgr->frames_dropped;
-    metrics->active_branches = (uint32_t)g_hash_table_size(mgr->branches);
-    metrics->pipeline_active = mgr->pipeline_active;
+    mutable_mgr = (sbs_encoder_manager_t *)mgr;
+    pthread_mutex_lock(&mutable_mgr->pipeline_mutex);
+    metrics->frames_pushed   = mutable_mgr->frames_pushed;
+    metrics->frames_dropped  = mutable_mgr->frames_dropped;
+    metrics->encoded_bytes   = mutable_mgr->encoded_bytes;
+    metrics->active_branches = (uint32_t)g_hash_table_size(mutable_mgr->branches);
+    metrics->pipeline_active = mutable_mgr->pipeline_active;
+    pthread_mutex_unlock(&mutable_mgr->pipeline_mutex);
 }
 
 bool sbs_encoder_manager_is_active(const sbs_encoder_manager_t *mgr)

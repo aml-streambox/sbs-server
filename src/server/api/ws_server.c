@@ -2,6 +2,7 @@
 
 #include "sbs/api_server.h"
 #include "sbs/log.h"
+#include "sbs/telemetry_utils.h"
 
 #include <stdio.h>
 
@@ -742,14 +743,15 @@ void sbs_api_server_publish_telemetry(sbs_api_server_t *server)
     cJSON *system = cJSON_CreateObject();
     cJSON *preview = sbs_preview_serialize_telemetry(server ? server->preview : NULL);
     cJSON *audio = sbs_audio_mixer_serialize_levels(server ? server->audio : NULL);
-    uint64_t distributed = 0;
     uint32_t frames_dropped = 0;
     uint64_t frame_count = 0;
     uint64_t content_frame_count = 0;
+    uint64_t encoded_bytes = 0;
     double compositor_fps = 0.0;
     double content_fps = 0.0;
     double target_fps = 0.0;
     double bitrate_kbps = 0.0;
+    double latency_ms = 0.0;
     int64_t now_usec = g_get_monotonic_time();
 
     if (!server) {
@@ -758,15 +760,25 @@ void sbs_api_server_publish_telemetry(sbs_api_server_t *server)
         return;
     }
 
-    if (server->output_router) {
-        distributed = sbs_output_router_frames_distributed(server->output_router);
-    }
     if (server->comp_thread) {
         sbs_comp_timing_stats_t timing;
         sbs_compositor_thread_get_timing(server->comp_thread, &timing);
         frame_count = timing.frame_count;
         content_frame_count = timing.content_frame_count;
         frames_dropped = timing.frames_dropped;
+        latency_ms = timing.last_frame_latency_ms > 0.0
+            ? timing.last_frame_latency_ms
+            : timing.last_frame_time_ms;
+    }
+    if (server->encoder_mgr) {
+        sbs_encoder_manager_metrics_t enc_metrics;
+        sbs_encoder_manager_get_metrics(server->encoder_mgr, &enc_metrics);
+        encoded_bytes = enc_metrics.encoded_bytes;
+    }
+    if (server->output_router) {
+        double encoder_time_ms = sbs_output_router_last_encoder_time_ms(server->output_router);
+        if (encoder_time_ms > 0.0)
+            latency_ms = encoder_time_ms;
     }
     if (server->scene_graph && server->scene_graph->canvas.fps_den > 0) {
         target_fps = (double)server->scene_graph->canvas.fps_num /
@@ -785,23 +797,27 @@ void sbs_api_server_publish_telemetry(sbs_api_server_t *server)
                 : content_frame_count;
             compositor_fps = (double)frame_delta / dt;
             content_fps = (double)content_delta / dt;
+            if (encoded_bytes >= server->last_telemetry_encoded_bytes) {
+                uint64_t byte_delta = encoded_bytes - server->last_telemetry_encoded_bytes;
+                bitrate_kbps = ((double)byte_delta * 8.0) / 1000.0 / dt;
+            }
         }
     } else if (server->started_monotonic_usec > 0 && now_usec > server->started_monotonic_usec) {
         double uptime_sec = (double)(now_usec - server->started_monotonic_usec) / 1000000.0;
         if (uptime_sec > 0.0) {
             compositor_fps = (double)frame_count / uptime_sec;
             content_fps = (double)content_frame_count / uptime_sec;
+            bitrate_kbps = ((double)encoded_bytes * 8.0) / 1000.0 / uptime_sec;
         }
     }
     server->last_telemetry_monotonic_usec = now_usec;
     server->last_telemetry_frame_count = frame_count;
     server->last_telemetry_content_frame_count = content_frame_count;
+    server->last_telemetry_encoded_bytes = encoded_bytes;
     server->last_telemetry_compositor_fps = compositor_fps;
     server->last_telemetry_content_fps = content_fps;
-
-    if (frame_count > 0) {
-        bitrate_kbps = (double)(distributed * 1920ULL * 1080ULL * 12ULL) / 1000.0 / (double)frame_count;
-    }
+    server->last_telemetry_bitrate_kbps = bitrate_kbps;
+    server->last_telemetry_latency_ms = latency_ms;
 
     bool dropped_slow = frames_dropped > 10;
     bool fps_slow =
@@ -820,7 +836,7 @@ void sbs_api_server_publish_telemetry(sbs_api_server_t *server)
     sbs_preview_engine_update_metrics(server->preview,
                                        frame_count,
                                        frames_dropped,
-                                       frames_dropped > 0 ? 100.0 : 33.0,
+                                       latency_ms,
                                        pipeline_slow);
 
     cJSON_AddNumberToObject(system, "compositor_fps", compositor_fps);
@@ -829,9 +845,9 @@ void sbs_api_server_publish_telemetry(sbs_api_server_t *server)
     cJSON_AddNumberToObject(system, "content_frames", (double)content_frame_count);
     cJSON_AddNumberToObject(system, "frames_dropped", frames_dropped);
     cJSON_AddNumberToObject(system, "bitrate_kbps", bitrate_kbps);
-    cJSON_AddNumberToObject(system, "latency_ms", frames_dropped > 0 ? 90.0 : 40.0);
+    cJSON_AddNumberToObject(system, "latency_ms", latency_ms);
     cJSON_AddNumberToObject(system, "cpu_usage", read_cpu_usage_pubsub());
-    cJSON_AddNumberToObject(system, "gpu_usage", 0.0);
+    cJSON_AddNumberToObject(system, "gpu_usage", sbs_telemetry_read_gpu_usage());
     cJSON_AddBoolToObject(system, "pipeline_slow", pipeline_slow);
     cJSON_AddItemToObject(system, "preview", preview);
     cJSON_AddItemToObject(system, "audio", audio);

@@ -98,16 +98,24 @@ void sbs_snapshot_engine_consume_frame(sbs_snapshot_engine_t *engine,
     g_mutex_unlock(&engine->lock);
 }
 
-static void nv21_to_rgb(const uint8_t *src, uint32_t width, uint32_t height, uint8_t *rgb)
+static void nv21_to_rgb(const uint8_t *src, const sbs_video_frame_msg_t *msg, uint8_t *rgb)
 {
-    const uint8_t *y_plane = src;
-    const uint8_t *vu_plane = src + width * height;
+    const uint32_t width = msg->width;
+    const uint32_t height = msg->height;
+    const uint32_t y_stride = msg->plane_stride[0] ? msg->plane_stride[0] : width;
+    const uint32_t uv_stride = msg->plane_stride[1] ? msg->plane_stride[1] : width;
+    const uint32_t uv_offset = msg->plane_offset[1] ? msg->plane_offset[1] : y_stride * height;
+    const uint8_t *y_plane = src + msg->plane_offset[0];
+    const uint8_t *vu_plane = src + uv_offset;
+
     for (uint32_t y = 0; y < height; y++) {
+        const uint8_t *y_row = y_plane + y * y_stride;
+        const uint8_t *vu_row = vu_plane + (y / 2u) * uv_stride;
         for (uint32_t x = 0; x < width; x++) {
-            int Y = y_plane[y * width + x];
-            int vu_index = (y / 2) * width + (x & ~1u);
-            int V = vu_plane[vu_index] - 128;
-            int U = vu_plane[vu_index + 1] - 128;
+            int Y = y_row[x];
+            int vu_index = x & ~1u;
+            int V = vu_row[vu_index] - 128;
+            int U = vu_row[vu_index + 1] - 128;
             int C = Y;
             int R = C + (359 * V >> 8);
             int G = C - ((88 * U + 183 * V) >> 8);
@@ -210,7 +218,17 @@ int sbs_snapshot_engine_capture(sbs_snapshot_engine_t *engine,
     g_mutex_unlock(&engine->lock);
     if (local.memfd < 0) return SBS_ERR_IO;
 
-    total_size = (gsize)local.msg.plane_offset[1] + (gsize)local.msg.plane_stride[1] * (local.msg.height / 2);
+    if (local.msg.drm_format == DRM_FORMAT_P010) {
+        uint32_t y_stride = local.msg.plane_stride[0] ? local.msg.plane_stride[0] : local.msg.width * 2u;
+        uint32_t uv_stride = local.msg.plane_stride[1] ? local.msg.plane_stride[1] : local.msg.width * 2u;
+        uint32_t uv_offset = local.msg.plane_offset[1] ? local.msg.plane_offset[1] : y_stride * local.msg.height;
+        total_size = (gsize)uv_offset + (gsize)uv_stride * (local.msg.height / 2u);
+    } else {
+        uint32_t y_stride = local.msg.plane_stride[0] ? local.msg.plane_stride[0] : local.msg.width;
+        uint32_t uv_stride = local.msg.plane_stride[1] ? local.msg.plane_stride[1] : local.msg.width;
+        uint32_t uv_offset = local.msg.plane_offset[1] ? local.msg.plane_offset[1] : y_stride * local.msg.height;
+        total_size = (gsize)uv_offset + (gsize)uv_stride * (local.msg.height / 2u);
+    }
     mapped = mmap(NULL, total_size, PROT_READ, MAP_SHARED, local.memfd, 0);
     if (mapped == MAP_FAILED) {
         close(local.memfd);
@@ -221,7 +239,7 @@ int sbs_snapshot_engine_capture(sbs_snapshot_engine_t *engine,
     if (local.msg.drm_format == DRM_FORMAT_P010) {
         p010_to_rgb(mapped, &local.msg, rgb);
     } else {
-        nv21_to_rgb(mapped, local.msg.width, local.msg.height, rgb);
+        nv21_to_rgb(mapped, &local.msg, rgb);
     }
     munmap(mapped, total_size);
     close(local.memfd);

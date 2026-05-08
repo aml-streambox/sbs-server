@@ -518,6 +518,12 @@ static int check_native_yuv_plane_format(sbs_compositor_t *comp,
     return 0;
 }
 
+static VkDeviceSize native_canvas_align_stride(VkDeviceSize stride)
+{
+    const VkDeviceSize alignment = 64u;
+    return (stride + alignment - 1u) & ~(alignment - 1u);
+}
+
 static int check_native_yuv_capabilities(sbs_compositor_t *comp)
 {
     if ((comp->width & 1u) || (comp->height & 1u)) {
@@ -563,14 +569,14 @@ static int check_native_yuv_capabilities(sbs_compositor_t *comp)
     comp->native_yuv.hdr_y_format = VK_FORMAT_R16_UNORM;
     comp->native_yuv.hdr_uv_format = VK_FORMAT_R16G16_UNORM;
 
-    comp->native_yuv.sdr_y_stride = comp->width;
-    comp->native_yuv.sdr_uv_stride = comp->width;
+    comp->native_yuv.sdr_y_stride = native_canvas_align_stride(comp->width);
+    comp->native_yuv.sdr_uv_stride = comp->native_yuv.sdr_y_stride;
     comp->native_yuv.sdr_uv_offset = comp->native_yuv.sdr_y_stride * comp->height;
     comp->native_yuv.sdr_total_size = comp->native_yuv.sdr_uv_offset +
         comp->native_yuv.sdr_uv_stride * (comp->height / 2u);
 
-    comp->native_yuv.hdr_y_stride = (VkDeviceSize)comp->width * 2u;
-    comp->native_yuv.hdr_uv_stride = (VkDeviceSize)comp->width * 2u;
+    comp->native_yuv.hdr_y_stride = native_canvas_align_stride((VkDeviceSize)comp->width * 2u);
+    comp->native_yuv.hdr_uv_stride = comp->native_yuv.hdr_y_stride;
     comp->native_yuv.hdr_uv_offset = comp->native_yuv.hdr_y_stride * comp->height;
     comp->native_yuv.hdr_total_size = comp->native_yuv.hdr_uv_offset +
         comp->native_yuv.hdr_uv_stride * comp->height;
@@ -1145,15 +1151,15 @@ static int native_canvas_compute_layout(const sbs_compositor_t *comp,
                               : comp->native_yuv.sdr_uv_format;
 
     if (hdr10) {
-        layout->y_stride = (VkDeviceSize)width * 2u;
-        layout->uv_stride = (VkDeviceSize)width * 2u;
+        layout->y_stride = native_canvas_align_stride((VkDeviceSize)width * 2u);
+        layout->uv_stride = layout->y_stride;
         layout->uv_offset = layout->y_stride * height;
         /* Preserve the existing contiguous P010 allocation contract used by
          * the Wave521 path: Y plus a full-height interleaved UV allocation. */
         layout->total_size = layout->uv_offset + layout->uv_stride * height;
     } else {
-        layout->y_stride = width;
-        layout->uv_stride = width;
+        layout->y_stride = native_canvas_align_stride(width);
+        layout->uv_stride = layout->y_stride;
         layout->uv_offset = layout->y_stride * height;
         layout->total_size = layout->uv_offset +
             layout->uv_stride * (height / 2u);

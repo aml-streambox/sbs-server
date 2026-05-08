@@ -11,6 +11,10 @@
 #include <unistd.h>
 #include <sys/mman.h>
 
+#ifndef DRM_FORMAT_NV21
+#define DRM_FORMAT_NV21 0x3132564e
+#endif
+
 #ifdef SBS_HAVE_GSTREAMER_PREVIEW
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
@@ -209,6 +213,42 @@ static const char *kind_name(sbs_preview_profile_kind_t kind)
     return kind == SBS_PREVIEW_PROFILE_KIND_FALLBACK ? "fallback" : "reuse";
 }
 
+static void compute_default_preview_size(uint32_t src_width,
+                                         uint32_t src_height,
+                                         uint32_t *out_width,
+                                         uint32_t *out_height)
+{
+    uint32_t width = 1280;
+    uint32_t height = 720;
+
+    if (src_width > 0 && src_height > 0) {
+        uint32_t long_edge = src_width > src_height ? src_width : src_height;
+        if (long_edge > 1280) {
+            width = (uint32_t)(((uint64_t)src_width * 1280u + long_edge / 2u) / long_edge);
+            height = (uint32_t)(((uint64_t)src_height * 1280u + long_edge / 2u) / long_edge);
+        } else {
+            width = src_width;
+            height = src_height;
+        }
+        width &= ~1u;
+        height &= ~1u;
+        if (width == 0) width = 2;
+        if (height == 0) height = 2;
+
+        if ((width & 63u) != 0 && width >= 64u) {
+            uint32_t aligned_width = width & ~63u;
+            uint32_t aligned_height = (uint32_t)(((uint64_t)aligned_width * src_height + src_width / 2u) / src_width);
+            aligned_height &= ~1u;
+            if (aligned_height == 0) aligned_height = 2;
+            width = aligned_width;
+            height = aligned_height;
+        }
+    }
+
+    if (out_width) *out_width = width;
+    if (out_height) *out_height = height;
+}
+
 static sbs_preview_profile_t *profile_new(const char *id,
                                           sbs_preview_profile_kind_t kind,
                                           const char *transport,
@@ -319,20 +359,62 @@ void sbs_preview_engine_set_source_format(sbs_preview_engine_t *engine,
                                             uint32_t fps,
                                             sbs_preview_color_mode_t color_mode)
 {
+    uint32_t old_default_w = 0;
+    uint32_t old_default_h = 0;
+    uint32_t new_default_w = 0;
+    uint32_t new_default_h = 0;
+    uint32_t old_default_fps;
+    uint32_t new_default_fps;
+
     if (!engine)
         return;
     g_mutex_lock(&engine->lock);
+    compute_default_preview_size(engine->src_width, engine->src_height,
+                                 &old_default_w, &old_default_h);
+    compute_default_preview_size(width, height, &new_default_w, &new_default_h);
+    old_default_fps = engine->src_fps && engine->src_fps < 30 ? engine->src_fps : 30;
+    new_default_fps = fps && fps < 30 ? fps : 30;
+
     engine->src_width = width;
     engine->src_height = height;
     engine->src_fps = fps;
     engine->src_color_mode = color_mode;
     {
         sbs_preview_profile_t *profile = preview_engine_get_profile_unlocked(
+            engine, "program-hevc-srt");
+        if (profile) {
+            if (width > 0) profile->width = width;
+            if (height > 0) profile->height = height;
+            if (fps > 0) profile->framerate = fps;
+        }
+    }
+    {
+        sbs_preview_profile_t *profile = preview_engine_get_profile_unlocked(
             engine, "preview-h264-webrtc");
         if (profile) {
+            bool default_size = profile->width == 0 || profile->height == 0 ||
+                (profile->width == old_default_w && profile->height == old_default_h);
+            bool default_fps = profile->framerate == 0 || profile->framerate == old_default_fps;
+            bool changed = false;
+
             profile->requestable = engine->webrtc_requestable;
             g_free(profile->codec);
             profile->codec = g_strdup("h264");
+            if (default_size) {
+                changed = changed || profile->width != new_default_w || profile->height != new_default_h;
+                profile->width = new_default_w;
+                profile->height = new_default_h;
+            }
+            if (default_fps) {
+                changed = changed || profile->framerate != new_default_fps;
+                profile->framerate = new_default_fps;
+            }
+            if (changed && profile->active && profile->requires_additional_encode) {
+                g_hash_table_remove(engine->runtimes, profile->id);
+                profile->active = false;
+                profile->available = false;
+                profile->viewer_count = 0;
+            }
         }
     }
     g_mutex_unlock(&engine->lock);
@@ -1102,6 +1184,66 @@ void sbs_preview_engine_update_metrics(sbs_preview_engine_t *engine,
     engine->degraded = degraded;
 }
 
+#ifdef SBS_HAVE_GSTREAMER_PREVIEW
+static uint8_t *preview_copy_nv21_tight(const sbs_video_frame_msg_t *msg,
+                                        const uint8_t *data,
+                                        size_t size,
+                                        sbs_video_frame_msg_t *tight_msg,
+                                        size_t *tight_size)
+{
+    uint32_t width, height, y_stride, uv_stride, uv_offset;
+    size_t required_size, out_size;
+    uint8_t *out;
+
+    if (!msg || !data || !tight_msg || !tight_size || msg->n_planes < 2)
+        return NULL;
+    if (msg->drm_format != 0 && msg->drm_format != DRM_FORMAT_NV21)
+        return NULL;
+
+    width = msg->width;
+    height = msg->height;
+    if (width == 0 || height == 0 || (width & 1u) || (height & 1u))
+        return NULL;
+
+    y_stride = msg->plane_stride[0] ? msg->plane_stride[0] : width;
+    uv_stride = msg->plane_stride[1] ? msg->plane_stride[1] : width;
+    uv_offset = msg->plane_offset[1] ? msg->plane_offset[1] : y_stride * height;
+
+    if (msg->plane_offset[0] == 0 && y_stride == width &&
+        uv_offset == width * height && uv_stride == width) {
+        return NULL;
+    }
+
+    required_size = (size_t)uv_offset + (size_t)uv_stride * (height / 2u);
+    if (size < required_size) {
+        LOG_W("preview NV21 tight copy skipped: buffer too small size=%zu required=%zu stride=%u/%u offset=%u %ux%u",
+              size, required_size, y_stride, uv_stride, uv_offset, width, height);
+        return NULL;
+    }
+
+    out_size = (size_t)width * height * 3u / 2u;
+    out = g_malloc(out_size);
+    for (uint32_t y = 0; y < height; y++) {
+        memcpy(out + (size_t)y * width,
+               data + msg->plane_offset[0] + (size_t)y * y_stride,
+               width);
+    }
+    for (uint32_t y = 0; y < height / 2u; y++) {
+        memcpy(out + (size_t)width * height + (size_t)y * width,
+               data + uv_offset + (size_t)y * uv_stride,
+               width);
+    }
+
+    *tight_msg = *msg;
+    tight_msg->plane_offset[0] = 0;
+    tight_msg->plane_offset[1] = width * height;
+    tight_msg->plane_stride[0] = width;
+    tight_msg->plane_stride[1] = width;
+    *tight_size = out_size;
+    return out;
+}
+#endif
+
 /* sbs_preview_engine_consume_frame — REMOVED (was fd-based memfd path) */
 
 void sbs_preview_engine_consume_frame_ptr(sbs_preview_engine_t *engine,
@@ -1129,9 +1271,23 @@ void sbs_preview_engine_consume_frame_ptr(sbs_preview_engine_t *engine,
 
     if (runtime->direct_enc) {
         sbs_direct_venc_packet_t packet;
+        sbs_video_frame_msg_t tight_msg;
+        const sbs_video_frame_msg_t *submit_msg = msg;
+        const void *submit_data = data;
+        size_t submit_size = size;
+        uint8_t *tight_data = preview_copy_nv21_tight(
+            msg, data, size, &tight_msg, &submit_size);
         bool force_idr = runtime->frames_pushed == 0;
-        int rc = sbs_direct_venc_submit_ptr(runtime->direct_enc, msg,
-                                            data, size, force_idr, &packet);
+
+        if (tight_data) {
+            submit_msg = &tight_msg;
+            submit_data = tight_data;
+        }
+
+        int rc = sbs_direct_venc_submit_ptr(runtime->direct_enc, submit_msg,
+                                            submit_data, submit_size,
+                                            force_idr, &packet);
+        g_free(tight_data);
         if (rc != SBS_OK) {
             engine->total_frames_dropped++;
             goto done;

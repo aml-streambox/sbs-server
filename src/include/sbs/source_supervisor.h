@@ -42,6 +42,9 @@ typedef struct sbs_source_start_config {
     const char *capture_mode;    /* streamboxsrc capture mode */
     const char *output_format;   /* streamboxsrc output format */
     const char *device_path;     /* v4l2src device path */
+    const char *format;          /* v4l2src selected fourcc */
+    const char *framerate;       /* v4l2src selected rate, e.g. "30/1" */
+    const char *decode_mode;     /* v4l2src compressed decode request */
     const char *uri;             /* image/media URI or path */
     bool        loop;            /* loop media on EOS */
     const char *text;            /* text source content */

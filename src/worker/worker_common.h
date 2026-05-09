@@ -27,6 +27,9 @@ typedef struct sbs_source_config {
     char     *output_format;    /* "nv12", "p010" (streamboxsrc only) */
     char     *pattern;          /* "smpte", "snow", etc. (videotestsrc only) */
     char     *device_path;      /* "/dev/videoN" (v4l2src only) */
+    char     *format;           /* V4L2 fourcc, e.g. "NV12", "MJPG" */
+    char     *framerate;        /* V4L2 rate, e.g. "30/1" */
+    char     *decode_mode;      /* "auto", "hardware", "software" */
     char     *uri;              /* file/network URI (uridecodebin only) */
     bool      loop;             /* Loop media file on EOS */
     char     *text;             /* Text source content */

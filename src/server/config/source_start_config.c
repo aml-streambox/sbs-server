@@ -1,6 +1,7 @@
 #include "sbs/source_start_config.h"
 
 #include <glib.h>
+#include <stdio.h>
 #include <string.h>
 
 static const char *source_config_string(sbs_source_state_t *source, const char *key)
@@ -31,12 +32,55 @@ static uint32_t source_config_u32(sbs_source_state_t *source, const char *key,
     return (uint32_t)parsed;
 }
 
+static void source_config_rate(sbs_source_state_t *source, const char *key,
+                               uint32_t fallback_num, uint32_t fallback_den,
+                               uint32_t *out_num, uint32_t *out_den)
+{
+    const char *value = source_config_string(source, key);
+    uint32_t num = fallback_num;
+    uint32_t den = fallback_den > 0 ? fallback_den : 1;
+
+    if (value && value[0]) {
+        unsigned int parsed_num = 0;
+        unsigned int parsed_den = 1;
+        if (sscanf(value, "%u/%u", &parsed_num, &parsed_den) >= 1 && parsed_num > 0) {
+            num = parsed_num;
+            den = parsed_den > 0 ? parsed_den : 1;
+        }
+    }
+
+    *out_num = num;
+    *out_den = den;
+}
+
 static const char *canvas_vfmcap_output_format(const sbs_canvas_state_t *canvas)
 {
     return canvas && canvas->color_mode == SBS_SCENE_COLOR_MODE_HDR10 ? "p010" : "raw";
 }
 
-void sbs_source_start_config_fill(const sbs_canvas_state_t *canvas,
+static bool graph_has_enabled_vfmcap(const sbs_scene_graph_t *graph,
+                                     const sbs_source_state_t *source)
+{
+    GHashTableIter iter;
+    gpointer key, value;
+
+    if (!graph || !graph->sources)
+        return false;
+
+    g_hash_table_iter_init(&iter, graph->sources);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        sbs_source_state_t *other = value;
+        (void)key;
+        if (!other || other == source)
+            continue;
+        if (other->kind == SBS_SOURCE_KIND_VFMCAP && other->enabled)
+            return true;
+    }
+    return false;
+}
+
+void sbs_source_start_config_fill(const sbs_scene_graph_t *graph,
+                                  const sbs_canvas_state_t *canvas,
                                   sbs_source_state_t *source,
                                   sbs_source_start_config_t *cfg)
 {
@@ -88,6 +132,22 @@ void sbs_source_start_config_fill(const sbs_canvas_state_t *canvas,
         cfg->height = source_config_u32(source, "height", default_h, 16, canvas_height);
         cfg->framerate_num = source_config_u32(source, "fps", 1u, 1, 30);
         cfg->framerate_den = 1;
+    } else if (source->kind == SBS_SOURCE_KIND_V4L2SRC) {
+        cfg->width = source_config_u32(source, "width", cfg->width, 16, 8192);
+        cfg->height = source_config_u32(source, "height", cfg->height, 16, 8192);
+        source_config_rate(source, "framerate", cfg->framerate_num, cfg->framerate_den,
+                           &cfg->framerate_num, &cfg->framerate_den);
+        cfg->format = source_config_string(source, "format");
+        if (!cfg->format) cfg->format = source_config_string(source, "fourcc");
+        cfg->framerate = source_config_string(source, "framerate");
+        cfg->decode_mode = source_config_string(source, "decode_mode");
+        if (!cfg->decode_mode) cfg->decode_mode = "auto";
+        if (strcmp(cfg->decode_mode, "auto") == 0 &&
+            graph_has_enabled_vfmcap(graph, source)) {
+            cfg->decode_mode = "software";
+        }
+        g_free(source->v4l2_effective_decode_mode);
+        source->v4l2_effective_decode_mode = g_strdup(cfg->decode_mode);
     } else if (source->kind == SBS_SOURCE_KIND_TEXT) {
         uint32_t default_w = MIN(cfg->width, 1280u);
         cfg->width = source_config_u32(source, "width", default_w, 16, canvas_width);

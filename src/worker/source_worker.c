@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <limits.h>
 #include <sys/mman.h>  /* memfd_create */
 #include <linux/videodev2.h>
 
@@ -51,7 +52,7 @@
 #define SBS_VFMCAP_RECOVER_INTERVAL_MS 2000
 #define SBS_VFMCAP_STABILITY_CHECK_COUNT 3
 #define SBS_VFMCAP_LOW_FPS_RECOVER_WINDOWS 4
-#define SBS_VFMCAP_SIGNAL_INFO_SYSFS "/sys/class/video4linux/video0/signal_info"
+#define SBS_VFMCAP_DEFAULT_DEVICE "/dev/video_cap"
 
 typedef struct source_vfmcap_lease {
     bool active;
@@ -691,22 +692,167 @@ static GstElement *build_streamboxsrc_pipeline(sbs_worker_config_t *config)
  * Build v4l2src pipeline:
  *   v4l2src device=PATH io-mode=dmabuf ! capsfilter ! appsink
  */
+static const char *v4l2_raw_gst_format(const char *fourcc)
+{
+    if (!fourcc || !fourcc[0]) return NULL;
+    if (g_strcmp0(fourcc, "NV12") == 0) return "NV12";
+    if (g_strcmp0(fourcc, "NV21") == 0) return "NV21";
+    if (g_strcmp0(fourcc, "P010") == 0) return "P010_10LE";
+    if (g_strcmp0(fourcc, "RGBA") == 0) return "RGBA";
+    if (g_strcmp0(fourcc, "YUYV") == 0) return "YUY2";
+    if (g_strcmp0(fourcc, "UYVY") == 0) return "UYVY";
+    return NULL;
+}
+
+static bool v4l2_raw_format_direct_importable(const char *fourcc)
+{
+    return g_strcmp0(fourcc, "NV12") == 0 ||
+           g_strcmp0(fourcc, "NV21") == 0 ||
+           g_strcmp0(fourcc, "P010") == 0 ||
+           g_strcmp0(fourcc, "RGBA") == 0;
+}
+
+static bool v4l2_format_is_mjpeg(const char *fourcc)
+{
+    return g_strcmp0(fourcc, "MJPG") == 0 || g_strcmp0(fourcc, "JPEG") == 0;
+}
+
+static bool v4l2_format_is_h264(const char *fourcc)
+{
+    return g_strcmp0(fourcc, "H264") == 0 || g_strcmp0(fourcc, "AVC1") == 0;
+}
+
+static bool parse_framerate_string(const char *value, gint fallback_num,
+                                   gint fallback_den, gint *out_num, gint *out_den)
+{
+    unsigned int num = 0;
+    unsigned int den = 1;
+
+    if (value && value[0] && sscanf(value, "%u/%u", &num, &den) >= 1 && num > 0) {
+        *out_num = (gint)num;
+        *out_den = den > 0 ? (gint)den : 1;
+        return true;
+    }
+
+    *out_num = fallback_num > 0 ? fallback_num : 30;
+    *out_den = fallback_den > 0 ? fallback_den : 1;
+    return false;
+}
+
+static GstCaps *v4l2_raw_caps(const char *format, uint32_t width, uint32_t height,
+                              gint fps_num, gint fps_den)
+{
+    GstCaps *caps = gst_caps_new_empty_simple("video/x-raw");
+    const char *gst_format = v4l2_raw_gst_format(format);
+
+    if (gst_format)
+        gst_caps_set_simple(caps, "format", G_TYPE_STRING, gst_format, NULL);
+    if (width > 0)
+        gst_caps_set_simple(caps, "width", G_TYPE_INT, (gint)width, NULL);
+    if (height > 0)
+        gst_caps_set_simple(caps, "height", G_TYPE_INT, (gint)height, NULL);
+    if (fps_num > 0 && fps_den > 0)
+        gst_caps_set_simple(caps, "framerate", GST_TYPE_FRACTION, fps_num, fps_den, NULL);
+    return caps;
+}
+
+static GstCaps *v4l2_compressed_caps(const char *format, uint32_t width, uint32_t height,
+                                     gint fps_num, gint fps_den)
+{
+    GstCaps *caps;
+    if (v4l2_format_is_h264(format)) {
+        caps = gst_caps_new_empty_simple("video/x-h264");
+        gst_caps_set_simple(caps,
+            "stream-format", G_TYPE_STRING, "byte-stream",
+            "alignment", G_TYPE_STRING, "au",
+            NULL);
+    } else {
+        caps = gst_caps_new_empty_simple("image/jpeg");
+    }
+    if (width > 0)
+        gst_caps_set_simple(caps, "width", G_TYPE_INT, (gint)width, NULL);
+    if (height > 0)
+        gst_caps_set_simple(caps, "height", G_TYPE_INT, (gint)height, NULL);
+    if (fps_num > 0 && fps_den > 0)
+        gst_caps_set_simple(caps, "framerate", GST_TYPE_FRACTION, fps_num, fps_den, NULL);
+    return caps;
+}
+
+static const char *v4l2_decoder_factory_name(const char *format, const char *decode_mode,
+                                             bool *out_hardware)
+{
+    const char *hw = v4l2_format_is_h264(format) ? "amlv4l2h264dec" : "amlv4l2jpegdec";
+    const char *sw = v4l2_format_is_h264(format) ? "avdec_h264" : "jpegdec";
+    bool request_hardware = g_strcmp0(decode_mode, "hardware") == 0;
+    bool request_software = g_strcmp0(decode_mode, "software") == 0;
+
+    if (out_hardware)
+        *out_hardware = false;
+
+    if (!request_software) {
+        GstElementFactory *factory = gst_element_factory_find(hw);
+        if (factory) {
+            gst_object_unref(factory);
+            if (out_hardware)
+                *out_hardware = true;
+            return hw;
+        }
+        if (request_hardware)
+            return NULL;
+    }
+
+    return sw;
+}
+
 static GstElement *build_v4l2src_pipeline(sbs_worker_config_t *config)
 {
     GstElement *pipeline = gst_pipeline_new("source-pipeline");
     GstElement *src      = gst_element_factory_make("v4l2src", "src");
-    GstElement *conv     = gst_element_factory_make("videoconvert", "convert");
-    GstElement *scale    = gst_element_factory_make("videoscale", "scale");
-    GstElement *capsf    = gst_element_factory_make("capsfilter", "caps");
+    GstElement *src_capsf = gst_element_factory_make("capsfilter", "source-caps");
+    GstElement *parser   = NULL;
+    GstElement *decoder  = NULL;
+    GstElement *conv     = NULL;
+    GstElement *scale    = NULL;
+    GstElement *out_capsf = NULL;
     GstElement *sink     = gst_element_factory_make("appsink", "sink");
+    const char *format = config->source.format;
+    bool compressed = v4l2_format_is_mjpeg(format) || v4l2_format_is_h264(format);
+    bool direct_import = !compressed && v4l2_raw_format_direct_importable(format);
+    bool hardware_decode = false;
+    gint fps_num = 30;
+    gint fps_den = 1;
 
-    if (!pipeline || !src || !conv || !scale || !capsf || !sink) {
+    if (compressed) {
+        const char *decoder_name = v4l2_decoder_factory_name(format, config->source.decode_mode,
+                                                             &hardware_decode);
+        if (!decoder_name) {
+            LOG_E("hardware decode requested for %s but no compatible decoder is available",
+                  format ? format : "compressed V4L2");
+        }
+        if (v4l2_format_is_h264(format))
+            parser = gst_element_factory_make("h264parse", "h264parse");
+        decoder = decoder_name ? gst_element_factory_make(decoder_name, "decoder") : NULL;
+        conv = gst_element_factory_make("videoconvert", "convert");
+        scale = gst_element_factory_make("videoscale", "scale");
+        out_capsf = gst_element_factory_make("capsfilter", "output-caps");
+    } else if (!direct_import) {
+        conv = gst_element_factory_make("videoconvert", "convert");
+        scale = gst_element_factory_make("videoscale", "scale");
+        out_capsf = gst_element_factory_make("capsfilter", "output-caps");
+    }
+
+    if (!pipeline || !src || !src_capsf || !sink ||
+        (compressed && (!decoder || !conv || !scale || !out_capsf || (v4l2_format_is_h264(format) && !parser))) ||
+        (!compressed && !direct_import && (!conv || !scale || !out_capsf))) {
         LOG_E("failed to create v4l2src pipeline elements");
         if (pipeline) gst_object_unref(pipeline);
         if (src) gst_object_unref(src);
+        if (src_capsf) gst_object_unref(src_capsf);
+        if (parser) gst_object_unref(parser);
+        if (decoder) gst_object_unref(decoder);
         if (conv) gst_object_unref(conv);
         if (scale) gst_object_unref(scale);
-        if (capsf) gst_object_unref(capsf);
+        if (out_capsf) gst_object_unref(out_capsf);
         if (sink) gst_object_unref(sink);
         return NULL;
     }
@@ -714,15 +860,30 @@ static GstElement *build_v4l2src_pipeline(sbs_worker_config_t *config)
     if (config->source.device_path) {
         g_object_set(src, "device", config->source.device_path, NULL);
     }
-    g_object_set(src, "io-mode", 4 /* dmabuf */, "do-timestamp", TRUE, NULL);
+    g_object_set(src, "io-mode", direct_import ? 4 /* dmabuf */ : 2 /* mmap */,
+                 "do-timestamp", TRUE, NULL);
 
-    GstCaps *caps = gst_caps_new_simple("video/x-raw",
-        "format", G_TYPE_STRING, "NV21",
-        "width",  G_TYPE_INT, (gint)config->width,
-        "height", G_TYPE_INT, (gint)config->height,
-        NULL);
-    g_object_set(capsf, "caps", caps, NULL);
-    gst_caps_unref(caps);
+    parse_framerate_string(config->source.framerate,
+                           (gint)config->framerate_num,
+                           (gint)config->framerate_den,
+                           &fps_num, &fps_den);
+
+    GstCaps *source_caps = compressed
+        ? v4l2_compressed_caps(format, config->width, config->height, fps_num, fps_den)
+        : v4l2_raw_caps(format, config->width, config->height, fps_num, fps_den);
+    g_object_set(src_capsf, "caps", source_caps, NULL);
+    gst_caps_unref(source_caps);
+
+    if (!direct_import || compressed) {
+        GstCaps *out_caps = gst_caps_new_simple("video/x-raw",
+            "format", G_TYPE_STRING, "NV21",
+            "width", G_TYPE_INT, (gint)config->width,
+            "height", G_TYPE_INT, (gint)config->height,
+            "framerate", GST_TYPE_FRACTION, fps_num, fps_den,
+            NULL);
+        g_object_set(out_capsf, "caps", out_caps, NULL);
+        gst_caps_unref(out_caps);
+    }
 
     g_object_set(sink,
         "emit-signals", TRUE,
@@ -731,11 +892,51 @@ static GstElement *build_v4l2src_pipeline(sbs_worker_config_t *config)
         "sync",         FALSE,
         NULL);
 
-    gst_bin_add_many(GST_BIN(pipeline), src, conv, scale, capsf, sink, NULL);
-    if (!gst_element_link_many(src, conv, scale, capsf, sink, NULL)) {
-        LOG_E("failed to link v4l2src pipeline");
-        gst_object_unref(pipeline);
-        return NULL;
+    if (compressed) {
+        LOG_I("v4l2src %s decode path: device=%s format=%s -> NV21 %ux%u@%d/%d",
+              hardware_decode ? "hardware" : "software",
+              config->source.device_path ? config->source.device_path : "default",
+              format ? format : "device-default", config->width, config->height,
+              fps_num, fps_den);
+        if (parser) {
+            gst_bin_add_many(GST_BIN(pipeline), src, src_capsf, parser, decoder, conv, scale, out_capsf, sink, NULL);
+            if (!gst_element_link_many(src, src_capsf, parser, decoder, conv, scale, out_capsf, sink, NULL)) {
+                LOG_E("failed to link h264 %s decode v4l2src pipeline",
+                      hardware_decode ? "hardware" : "software");
+                gst_object_unref(pipeline);
+                return NULL;
+            }
+        } else {
+            gst_bin_add_many(GST_BIN(pipeline), src, src_capsf, decoder, conv, scale, out_capsf, sink, NULL);
+            if (!gst_element_link_many(src, src_capsf, decoder, conv, scale, out_capsf, sink, NULL)) {
+                LOG_E("failed to link mjpeg %s decode v4l2src pipeline",
+                      hardware_decode ? "hardware" : "software");
+                gst_object_unref(pipeline);
+                return NULL;
+            }
+        }
+    } else if (direct_import) {
+        LOG_I("v4l2src direct raw DMA-BUF path: device=%s format=%s %ux%u@%d/%d",
+              config->source.device_path ? config->source.device_path : "default",
+              format ? format : "device-default", config->width, config->height,
+              fps_num, fps_den);
+        gst_bin_add_many(GST_BIN(pipeline), src, src_capsf, sink, NULL);
+        if (!gst_element_link_many(src, src_capsf, sink, NULL)) {
+            LOG_E("failed to link direct v4l2src pipeline");
+            gst_object_unref(pipeline);
+            return NULL;
+        }
+    } else {
+        LOG_I("v4l2src raw fallback path: device=%s format=%s -> NV21 %ux%u@%d/%d",
+              config->source.device_path ? config->source.device_path : "default",
+              format ? format : "device-default", config->width, config->height,
+              fps_num, fps_den);
+        gst_bin_add_many(GST_BIN(pipeline), src, src_capsf, conv, scale, out_capsf, sink, NULL);
+        if (!gst_element_link_many(src, src_capsf, conv, scale, out_capsf, sink, NULL)) {
+            LOG_E("failed to link fallback v4l2src pipeline");
+            gst_object_unref(pipeline);
+            return NULL;
+        }
     }
 
     return pipeline;
@@ -984,14 +1185,11 @@ static GstFlowReturn on_new_sample(GstAppSink *appsink, gpointer user_data)
     bool is_dmabuf = false;
     GstMemory *mem = gst_buffer_peek_memory(buffer, 0);
     const char *source_type = state->ctx->config.source.source_type;
-    bool static_image = source_type && strcmp(source_type, "image") == 0;
+    bool compressed_v4l2 = source_type && strcmp(source_type, "v4l2src") == 0 &&
+        (v4l2_format_is_mjpeg(state->ctx->config.source.format) ||
+         v4l2_format_is_h264(state->ctx->config.source.format));
     bool force_cpu_export = source_type &&
         (strcmp(source_type, "streamboxsrc") == 0 || strcmp(source_type, "v4l2src") == 0);
-
-    if (static_image && state->frame_counter > 0) {
-        gst_sample_unref(sample);
-        return GST_FLOW_OK;
-    }
 
     sbs_video_frame_msg_t msg;
     sbs_video_frame_msg_init(&msg, SBS_IPC_MSG_VIDEO_FRAME);
@@ -1002,7 +1200,14 @@ static GstFlowReturn on_new_sample(GstAppSink *appsink, gpointer user_data)
     msg.width       = state->ctx->config.width;
     msg.height      = state->ctx->config.height;
 
-    if (gst_is_dmabuf_memory(mem)) {
+    if (compressed_v4l2) {
+        /* Hardware decoders may output cropped or tiled DMA-BUFs that are not
+         * directly importable as tight NV21; normalize decoded frames first. */
+        dmabuf_fd = export_linear_nv21(buffer, caps, &msg, state, &is_dmabuf);
+        if (dmabuf_fd < 0) {
+            dmabuf_fd = export_cpu_buffer(buffer, state, &is_dmabuf);
+        }
+    } else if (gst_is_dmabuf_memory(mem)) {
         /* Native DMA-BUF — use directly regardless of source type */
         int orig_fd = gst_dmabuf_memory_get_fd(mem);
         dmabuf_fd = dup(orig_fd);
@@ -1587,16 +1792,48 @@ static void source_worker_vfmcap_release_all(source_state_t *state)
         source_worker_vfmcap_release_lease_index(state, i);
 }
 
-static bool source_worker_read_signal_resolution(uint32_t *width, uint32_t *height)
+static bool source_worker_vfmcap_signal_info_path(const source_state_t *state,
+                                                  char *path,
+                                                  size_t path_size)
+{
+    const char *device;
+    char resolved[PATH_MAX];
+    const char *node;
+
+    if (!path || path_size == 0)
+        return false;
+
+    device = state && state->ctx && state->ctx->config.source.device_path &&
+        state->ctx->config.source.device_path[0]
+        ? state->ctx->config.source.device_path
+        : SBS_VFMCAP_DEFAULT_DEVICE;
+
+    if (!realpath(device, resolved))
+        g_strlcpy(resolved, device, sizeof(resolved));
+
+    node = strrchr(resolved, '/');
+    node = node ? node + 1 : resolved;
+    if (strncmp(node, "video", 5) != 0 || node[5] == '\0')
+        return false;
+
+    g_snprintf(path, path_size, "/sys/class/video4linux/%s/signal_info", node);
+    return true;
+}
+
+static bool source_worker_read_signal_resolution(source_state_t *state,
+                                                 uint32_t *width,
+                                                 uint32_t *height)
 {
     gchar *contents = NULL;
+    char signal_path[PATH_MAX];
     uint32_t w = 0;
     uint32_t h = 0;
 
     if (!width || !height)
         return false;
 
-    if (!g_file_get_contents(SBS_VFMCAP_SIGNAL_INFO_SYSFS, &contents, NULL, NULL))
+    if (!source_worker_vfmcap_signal_info_path(state, signal_path, sizeof(signal_path)) ||
+        !g_file_get_contents(signal_path, &contents, NULL, NULL))
         return false;
 
     char *p = strstr(contents, "width:");
@@ -1625,7 +1862,7 @@ static int source_worker_vfmcap_open_start(source_state_t *state)
 
     device = state->ctx->config.source.device_path;
     if (!device || device[0] == '\0')
-        device = "/dev/video_cap";
+        device = SBS_VFMCAP_DEFAULT_DEVICE;
 
     state->vfmcap_ctx = vfmcap_open(device, &state->vfmcap_config);
     if (!state->vfmcap_ctx) {
@@ -1748,7 +1985,7 @@ static gboolean source_worker_vfmcap_recover_timeout(gpointer user_data)
         return G_SOURCE_REMOVE;
     }
 
-    if (source_worker_read_signal_resolution(&width, &height)) {
+    if (source_worker_read_signal_resolution(state, &width, &height)) {
         if (width == state->vfmcap_stable_width && height == state->vfmcap_stable_height) {
             state->vfmcap_stable_count++;
         } else {

@@ -101,6 +101,9 @@ static int parse_source_config(const cJSON *root, sbs_worker_config_t *config)
     src->output_format = json_get_string(root, "output_format");
     src->pattern       = json_get_string(root, "pattern");
     src->device_path   = json_get_string(root, "device_path");
+    src->format        = json_get_string(root, "format");
+    src->framerate     = json_get_string(root, "framerate");
+    src->decode_mode   = json_get_string(root, "decode_mode");
     src->uri           = json_get_string(root, "uri");
     src->loop          = json_get_bool(root, "loop", false);
     src->text          = json_get_string(root, "text");
@@ -201,6 +204,9 @@ void sbs_worker_config_free(sbs_worker_config_t *config)
     free(config->source.output_format);
     free(config->source.pattern);
     free(config->source.device_path);
+    free(config->source.format);
+    free(config->source.framerate);
+    free(config->source.decode_mode);
     free(config->source.uri);
     free(config->source.text);
     free(config->source.font_family);

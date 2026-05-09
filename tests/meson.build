@@ -1,5 +1,8 @@
 if get_option('tests')
     test_deps = [sbs_common_dep, glib_dep, gio_dep, jpeg_dep]
+    if m_dep.found()
+        test_deps += [m_dep]
+    endif
 
     test_uuid = executable('test-uuid',
         'test_uuid.c',
@@ -74,6 +77,7 @@ if get_option('tests')
         '../src/server/config/source_start_config.c',
         '../src/server/api/ws_server.c',
         '../src/server/api/telemetry_utils.c',
+        '../src/server/api/v4l2_discovery.c',
         '../src/server/api/jsonrpc.c',
         '../src/server/api/pubsub.c',
         '../src/server/api/handlers/command.c',

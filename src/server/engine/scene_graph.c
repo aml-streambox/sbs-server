@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <math.h>
 #include <drm/drm_fourcc.h>
 
 static char *dup_or_null(const char *s)
@@ -213,6 +214,7 @@ void source_state_free(gpointer data)
     }
     audio_binding_clear(&source->audio);
     g_free(source->runtime_state);
+    g_free(source->v4l2_effective_decode_mode);
     g_free(source->error_message);
     g_free(source);
 }
@@ -352,25 +354,43 @@ static void build_item_transform_matrix(const sbs_canvas_state_t *canvas,
      * Map scene rect [pos_x, pos_x+w] x [pos_y, pos_y+h] to NDC. */
     float sx = 2.0f * (float)transform->width / (float)canvas->width;
     float sy = 2.0f * (float)transform->height / (float)canvas->height;
-    float tx = -1.0f + 2.0f * (float)transform->position_x / (float)canvas->width;
-    float ty = -1.0f + 2.0f * (float)transform->position_y / (float)canvas->height;
-
-    if (transform->flip_horizontal) {
-        tx += sx;
-        sx = -sx;
-    }
-    if (transform->flip_vertical) {
-        ty += sy;
-        sy = -sy;
-    }
+    float cx = -1.0f + 2.0f * ((float)transform->position_x + (float)transform->width * 0.5f) / (float)canvas->width;
+    float cy = -1.0f + 2.0f * ((float)transform->position_y + (float)transform->height * 0.5f) / (float)canvas->height;
+    float angle = (float)(transform->rotation_deg * M_PI / 180.0);
+    float c = cosf(angle);
+    float s = sinf(angle);
+    float flip_x = transform->flip_horizontal ? -1.0f : 1.0f;
+    float flip_y = transform->flip_vertical ? -1.0f : 1.0f;
+    float ax = sx * flip_x * c;
+    float ay = sx * flip_x * s;
+    float bx = -sy * flip_y * s;
+    float by = sy * flip_y * c;
 
     memset(out, 0, sizeof(float) * 16);
-    out[0] = sx;
-    out[5] = sy;
+    out[0] = ax;
+    out[1] = ay;
+    out[4] = bx;
+    out[5] = by;
     out[10] = 1.0f;
-    out[12] = tx;
-    out[13] = ty;
+    out[12] = cx - 0.5f * ax - 0.5f * bx;
+    out[13] = cy - 0.5f * ay - 0.5f * by;
     out[15] = 1.0f;
+}
+
+static void normalize_crop_pair(float *a, float *b)
+{
+    float sum;
+
+    if (!a || !b)
+        return;
+    *a = CLAMP(*a, 0.0f, 0.98f);
+    *b = CLAMP(*b, 0.0f, 0.98f);
+    sum = *a + *b;
+    if (sum > 0.98f) {
+        float scale = 0.98f / sum;
+        *a *= scale;
+        *b *= scale;
+    }
 }
 
 static float filter_float_param(const sbs_filter_state_t *filter,
@@ -479,6 +499,20 @@ static void apply_filter_to_comp_item(const sbs_filter_state_t *filter,
             out->filter_flags |= SBS_COMP_FILTER_LUT;
             g_strlcpy(out->lut_path, path, sizeof(out->lut_path));
         }
+    } else if (g_strcmp0(filter->type, "crop") == 0) {
+        out->crop[0] += CLAMP(filter_float_param(filter, "left", 0.0f), 0.0f, 0.98f);
+        out->crop[1] += CLAMP(filter_float_param(filter, "top", 0.0f), 0.0f, 0.98f);
+        out->crop[2] += CLAMP(filter_float_param(filter, "right", 0.0f), 0.0f, 0.98f);
+        out->crop[3] += CLAMP(filter_float_param(filter, "bottom", 0.0f), 0.0f, 0.98f);
+        normalize_crop_pair(&out->crop[0], &out->crop[2]);
+        normalize_crop_pair(&out->crop[1], &out->crop[3]);
+    } else if (g_strcmp0(filter->type, "mirror") == 0) {
+        out->flip_horizontal = !out->flip_horizontal;
+    } else if (g_strcmp0(filter->type, "flip") == 0) {
+        out->flip_vertical = !out->flip_vertical;
+    } else if (g_strcmp0(filter->type, "rotation") == 0) {
+        float deg = filter_float_param(filter, "degrees", 90.0f);
+        out->rotation_deg += CLAMP(deg, -360.0f, 360.0f);
     }
 }
 
@@ -580,8 +614,6 @@ static void fill_comp_item(const sbs_canvas_state_t *canvas,
         }
     }
     out->z_order = item->z_order;
-    render_transform = item->transform;
-    build_item_transform_matrix(canvas, &render_transform, out->transform);
     out->crop[0] = item->transform.width > 0 ? (float)item->transform.crop_left / (float)item->transform.width : 0.0f;
     out->crop[1] = item->transform.height > 0 ? (float)item->transform.crop_top / (float)item->transform.height : 0.0f;
     out->crop[2] = item->transform.width > 0 ? (float)item->transform.crop_right / (float)item->transform.width : 0.0f;
@@ -598,6 +630,11 @@ static void fill_comp_item(const sbs_canvas_state_t *canvas,
     apply_filters_to_comp_item(filters, out);
     apply_filters_to_comp_item(item->filters, out);
     apply_filters_to_comp_item(scene_filters, out);
+    render_transform = item->transform;
+    render_transform.flip_horizontal = out->flip_horizontal;
+    render_transform.flip_vertical = out->flip_vertical;
+    render_transform.rotation_deg = out->rotation_deg;
+    build_item_transform_matrix(canvas, &render_transform, out->transform);
 }
 
 const char *sbs_scene_graph_source_kind_name(sbs_source_kind_t kind)
@@ -650,6 +687,159 @@ static cJSON *str_map_to_json(GHashTable *map)
     g_hash_table_iter_init(&iter, map);
     while (g_hash_table_iter_next(&iter, &key, &value)) {
         cJSON_AddStringToObject(obj, (const char *)key, (const char *)value);
+    }
+
+    return obj;
+}
+
+static const char *str_map_get(GHashTable *map, const char *key)
+{
+    if (!map || !key)
+        return NULL;
+    return g_hash_table_lookup(map, key);
+}
+
+static uint32_t str_map_get_u32(GHashTable *map, const char *key, uint32_t fallback)
+{
+    const char *value = str_map_get(map, key);
+    char *end = NULL;
+    guint64 parsed;
+
+    if (!value || !value[0])
+        return fallback;
+    parsed = g_ascii_strtoull(value, &end, 10);
+    if (end == value || parsed > G_MAXUINT32)
+        return fallback;
+    return (uint32_t)parsed;
+}
+
+static bool v4l2_fourcc_is_compressed(const char *fourcc)
+{
+    return g_strcmp0(fourcc, "MJPG") == 0 ||
+           g_strcmp0(fourcc, "JPEG") == 0 ||
+           g_strcmp0(fourcc, "H264") == 0 ||
+           g_strcmp0(fourcc, "AVC1") == 0 ||
+           g_strcmp0(fourcc, "H265") == 0 ||
+           g_strcmp0(fourcc, "HEVC") == 0;
+}
+
+static bool v4l2_fourcc_is_direct_importable(const char *fourcc)
+{
+    return g_strcmp0(fourcc, "NV12") == 0 ||
+           g_strcmp0(fourcc, "NV21") == 0 ||
+           g_strcmp0(fourcc, "P010") == 0 ||
+           g_strcmp0(fourcc, "RGBA") == 0;
+}
+
+static bool gst_element_available(const char *name)
+{
+    gchar *inspect_path = NULL;
+    gint status = 0;
+    gboolean ok;
+
+    if (!name || !name[0])
+        return false;
+
+    inspect_path = g_find_program_in_path("gst-inspect-1.0");
+    if (!inspect_path && g_file_test("/usr/bin/gst-inspect-1.0", G_FILE_TEST_IS_EXECUTABLE))
+        inspect_path = g_strdup("/usr/bin/gst-inspect-1.0");
+    if (!inspect_path)
+        return false;
+
+    gchar *argv[] = { inspect_path, (gchar *)name, NULL };
+    ok = g_spawn_sync(NULL, argv, NULL,
+                      G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
+                      NULL, NULL, NULL, NULL, &status, NULL);
+    g_free(inspect_path);
+    return ok && status == 0;
+}
+
+static bool v4l2_hardware_decode_available(const char *fourcc)
+{
+    static int have_aml_jpeg = -1;
+    static int have_aml_h264 = -1;
+
+    if (g_strcmp0(fourcc, "MJPG") == 0 || g_strcmp0(fourcc, "JPEG") == 0) {
+        if (have_aml_jpeg < 0)
+            have_aml_jpeg = gst_element_available("amlv4l2jpegdec") ? 1 : 0;
+        return have_aml_jpeg == 1;
+    }
+    if (g_strcmp0(fourcc, "H264") == 0 || g_strcmp0(fourcc, "AVC1") == 0) {
+        if (have_aml_h264 < 0)
+            have_aml_h264 = gst_element_available("amlv4l2h264dec") ? 1 : 0;
+        return have_aml_h264 == 1;
+    }
+    return false;
+}
+
+static cJSON *serialize_v4l2_status(const sbs_source_state_t *source)
+{
+    GHashTable *config = source ? source->config : NULL;
+    const char *device_id = str_map_get(config, "device_id");
+    const char *device_path = str_map_get(config, "device");
+    const char *fourcc = str_map_get(config, "format");
+    const char *framerate = str_map_get(config, "framerate");
+    const char *decode_mode = str_map_get(config, "decode_mode");
+    const char *effective_decode_mode = source ? source->v4l2_effective_decode_mode : NULL;
+    bool compressed;
+    bool direct_importable;
+    cJSON *obj = cJSON_CreateObject();
+
+    if (!device_path)
+        device_path = str_map_get(config, "device_path");
+    if (!fourcc)
+        fourcc = str_map_get(config, "fourcc");
+    if (!framerate)
+        framerate = str_map_get(config, "fps");
+    if (!decode_mode)
+        decode_mode = "auto";
+    if (!effective_decode_mode)
+        effective_decode_mode = decode_mode;
+
+    compressed = v4l2_fourcc_is_compressed(fourcc);
+    direct_importable = !compressed && v4l2_fourcc_is_direct_importable(fourcc);
+
+    if (device_id)
+        cJSON_AddStringToObject(obj, "device_id", device_id);
+    else
+        cJSON_AddNullToObject(obj, "device_id");
+    cJSON_AddStringToObject(obj, "device_path", device_path ? device_path : "/dev/video0");
+    if (fourcc)
+        cJSON_AddStringToObject(obj, "fourcc", fourcc);
+    else
+        cJSON_AddNullToObject(obj, "fourcc");
+    cJSON_AddNumberToObject(obj, "width",
+                            str_map_get_u32(config, "width", source ? source->frame_width : 0));
+    cJSON_AddNumberToObject(obj, "height",
+                            str_map_get_u32(config, "height", source ? source->frame_height : 0));
+    if (framerate)
+        cJSON_AddStringToObject(obj, "framerate", framerate);
+    else
+        cJSON_AddNullToObject(obj, "framerate");
+    cJSON_AddStringToObject(obj, "requested_decode_mode", decode_mode);
+    cJSON_AddStringToObject(obj, "effective_decode_mode", effective_decode_mode);
+
+    if (!source || !source->running) {
+        cJSON_AddStringToObject(obj, "active_decode_path", "inactive");
+        cJSON_AddNullToObject(obj, "zero_copy_active");
+        cJSON_AddStringToObject(obj, "zero_copy_state", "inactive");
+    } else if (compressed) {
+        const char *active_decode = "software";
+        if (g_strcmp0(effective_decode_mode, "hardware") == 0 ||
+            (g_strcmp0(effective_decode_mode, "auto") == 0 && v4l2_hardware_decode_available(fourcc))) {
+            active_decode = "hardware";
+        }
+        cJSON_AddStringToObject(obj, "active_decode_path", active_decode);
+        cJSON_AddBoolToObject(obj, "zero_copy_active", false);
+        cJSON_AddStringToObject(obj, "zero_copy_state", "decode");
+    } else if (direct_importable) {
+        cJSON_AddStringToObject(obj, "active_decode_path", "none");
+        cJSON_AddNullToObject(obj, "zero_copy_active");
+        cJSON_AddStringToObject(obj, "zero_copy_state", "expected");
+    } else {
+        cJSON_AddStringToObject(obj, "active_decode_path", "none");
+        cJSON_AddBoolToObject(obj, "zero_copy_active", false);
+        cJSON_AddStringToObject(obj, "zero_copy_state", "fallback");
     }
 
     return obj;
@@ -762,6 +952,8 @@ cJSON *sbs_scene_graph_serialize_source(const sbs_source_state_t *source)
     cJSON_AddStringToObject(obj, "state", source->runtime_state ? source->runtime_state : (source->running ? "running" : "created"));
     cJSON_AddBoolToObject(obj, "muted", source->muted);
     cJSON_AddItemToObject(obj, "config", str_map_to_json(source->config));
+    if (source->kind == SBS_SOURCE_KIND_V4L2SRC)
+        cJSON_AddItemToObject(obj, "v4l2_status", serialize_v4l2_status(source));
     cJSON_AddItemToObject(obj, "filters", serialize_filters(source->filters));
     sbs_frame_slot_get_stats((sbs_frame_slot_t *)&source->frame_slot, &frame_stats);
     cJSON *frame_queue = cJSON_CreateObject();

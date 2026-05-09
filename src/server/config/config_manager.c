@@ -279,7 +279,7 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
         if (source->enabled && server->source_sup) {
             sbs_source_start_config_t cfg = {0};
             int rc;
-            sbs_source_start_config_fill(&server->scene_graph->canvas, source, &cfg);
+            sbs_source_start_config_fill(server->scene_graph, &server->scene_graph->canvas, source, &cfg);
             rc = sbs_source_supervisor_start_source(server->source_sup, &cfg, &source->frame_slot);
             if (rc != SBS_OK) {
                 LOG_E("failed to restore source '%s': %d", source->id, rc);

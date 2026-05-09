@@ -3,6 +3,7 @@
 #include "sbs/api_server.h"
 #include "sbs/log.h"
 #include "sbs/source_start_config.h"
+#include "sbs/v4l2_discovery.h"
 
 #include <glib/gstdio.h>
 #include <unistd.h>
@@ -264,6 +265,19 @@ int sbs_api_handle_source_describe_kind(sbs_api_server_t *server, sbs_api_client
     return SBS_OK;
 }
 
+int sbs_api_handle_source_discover_v4l2(sbs_api_server_t *server, sbs_api_client_t *client,
+                                        cJSON *params, cJSON **result, cJSON **error)
+{
+    (void)server;
+    (void)client;
+    (void)params;
+    (void)error;
+
+    *result = cJSON_CreateObject();
+    cJSON_AddItemToObject(*result, "devices", sbs_v4l2_discovery_list_devices());
+    return SBS_OK;
+}
+
 int sbs_api_handle_source_upload_asset(sbs_api_server_t *server, sbs_api_client_t *client,
                                        cJSON *params, cJSON **result, cJSON **error)
 {
@@ -489,7 +503,7 @@ int sbs_api_handle_source_update(sbs_api_server_t *server, sbs_api_client_t *cli
         source->running = false;
 
         sbs_source_start_config_t cfg;
-        sbs_source_start_config_fill(&server->scene_graph->canvas, source, &cfg);
+        sbs_source_start_config_fill(server->scene_graph, &server->scene_graph->canvas, source, &cfg);
 
         rc = sbs_source_supervisor_start_source(server->source_sup, &cfg, &source->frame_slot);
         if (rc != SBS_OK) {
@@ -562,7 +576,7 @@ int sbs_api_handle_source_start(sbs_api_server_t *server, sbs_api_client_t *clie
         return SBS_ERR_NOT_FOUND;
     }
 
-    sbs_source_start_config_fill(&server->scene_graph->canvas, source, &cfg);
+    sbs_source_start_config_fill(server->scene_graph, &server->scene_graph->canvas, source, &cfg);
 
     rc = sbs_source_supervisor_start_source(server->source_sup, &cfg, &source->frame_slot);
     if (rc != SBS_OK) {

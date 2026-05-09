@@ -276,6 +276,9 @@ int sbs_source_supervisor_start_source(sbs_source_supervisor_t *sup,
     entry->config_copy.capture_mode = config->capture_mode ? strdup(config->capture_mode) : NULL;
     entry->config_copy.output_format = config->output_format ? strdup(config->output_format) : NULL;
     entry->config_copy.device_path  = config->device_path ? strdup(config->device_path) : NULL;
+    entry->config_copy.format       = config->format ? strdup(config->format) : NULL;
+    entry->config_copy.framerate    = config->framerate ? strdup(config->framerate) : NULL;
+    entry->config_copy.decode_mode  = config->decode_mode ? strdup(config->decode_mode) : NULL;
     entry->config_copy.uri          = config->uri ? strdup(config->uri) : NULL;
     entry->config_copy.text         = config->text ? strdup(config->text) : NULL;
     entry->config_copy.font_family  = config->font_family ? strdup(config->font_family) : NULL;
@@ -493,6 +496,9 @@ static void source_entry_free(sbs_source_entry_t *entry)
     free((char *)entry->config_copy.capture_mode);
     free((char *)entry->config_copy.output_format);
     free((char *)entry->config_copy.device_path);
+    free((char *)entry->config_copy.format);
+    free((char *)entry->config_copy.framerate);
+    free((char *)entry->config_copy.decode_mode);
     free((char *)entry->config_copy.uri);
     free((char *)entry->config_copy.text);
     free((char *)entry->config_copy.font_family);
@@ -540,6 +546,9 @@ static char *build_config_json(const sbs_source_entry_t *entry)
     ADD_JSON_STRING("capture_mode", entry->config_copy.capture_mode);
     ADD_JSON_STRING("output_format", entry->config_copy.output_format);
     ADD_JSON_STRING("device_path", entry->config_copy.device_path);
+    ADD_JSON_STRING("format", entry->config_copy.format);
+    ADD_JSON_STRING("framerate", entry->config_copy.framerate);
+    ADD_JSON_STRING("decode_mode", entry->config_copy.decode_mode);
     ADD_JSON_STRING("uri", entry->config_copy.uri);
     ADD_JSON_STRING("text", entry->config_copy.text);
     ADD_JSON_STRING("font_family", entry->config_copy.font_family);

@@ -76,6 +76,7 @@ typedef struct sbs_source_state {
     bool running;
     bool muted;
     char *runtime_state;
+    char *v4l2_effective_decode_mode;
     char *error_message;
 } sbs_source_state_t;
 

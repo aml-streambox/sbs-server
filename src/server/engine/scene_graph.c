@@ -67,7 +67,11 @@ static void audio_binding_copy(sbs_audio_binding_t *dst,
     }
     dst->enabled = src->enabled;
     dst->device = dup_or_null(src->device);
-    dst->volume = src->volume > 0.0 ? src->volume : 1.0;
+    dst->volume = src->volume >= 0.0 ? src->volume : 1.0;
+    dst->left_gain = src->left_gain >= 0.0 ? src->left_gain : 1.0;
+    dst->right_gain = src->right_gain >= 0.0 ? src->right_gain : 1.0;
+    dst->delay_ms = src->delay_ms;
+    memcpy(dst->eq_bands, src->eq_bands, sizeof(dst->eq_bands));
     dst->mute = src->mute;
     dst->monitor = src->monitor;
 }
@@ -647,6 +651,7 @@ const char *sbs_scene_graph_source_kind_name(sbs_source_kind_t kind)
     case SBS_SOURCE_KIND_IMAGE: return "image";
     case SBS_SOURCE_KIND_TEXT: return "text";
     case SBS_SOURCE_KIND_VFMCAP: return "vfmcap";
+    case SBS_SOURCE_KIND_ALSA_AUDIO: return "alsa_audio";
     default: return "videotestsrc";
     }
 }
@@ -661,8 +666,33 @@ bool sbs_scene_graph_parse_source_kind(const char *type, sbs_source_kind_t *out_
     else if (strcmp(type, "image") == 0) *out_kind = SBS_SOURCE_KIND_IMAGE;
     else if (strcmp(type, "text") == 0) *out_kind = SBS_SOURCE_KIND_TEXT;
     else if (strcmp(type, "vfmcap") == 0) *out_kind = SBS_SOURCE_KIND_VFMCAP;
+    else if (strcmp(type, "alsa_audio") == 0 || strcmp(type, "audio") == 0) *out_kind = SBS_SOURCE_KIND_ALSA_AUDIO;
     else return false;
     return true;
+}
+
+static cJSON *serialize_audio_binding(const sbs_audio_binding_t *binding)
+{
+    cJSON *audio = cJSON_CreateObject();
+    cJSON *eq = cJSON_CreateArray();
+
+    cJSON_AddBoolToObject(audio, "enabled", binding->enabled);
+    if (binding->device) {
+        cJSON_AddStringToObject(audio, "device", binding->device);
+    } else {
+        cJSON_AddNullToObject(audio, "device");
+    }
+    cJSON_AddNumberToObject(audio, "volume", binding->volume >= 0.0 ? binding->volume : 1.0);
+    cJSON_AddNumberToObject(audio, "left_gain", binding->left_gain >= 0.0 ? binding->left_gain : 1.0);
+    cJSON_AddNumberToObject(audio, "right_gain", binding->right_gain >= 0.0 ? binding->right_gain : 1.0);
+    cJSON_AddNumberToObject(audio, "delay_ms", binding->delay_ms);
+    for (uint32_t i = 0; i < G_N_ELEMENTS(binding->eq_bands); i++) {
+        cJSON_AddItemToArray(eq, cJSON_CreateNumber(binding->eq_bands[i]));
+    }
+    cJSON_AddItemToObject(audio, "eq_bands", eq);
+    cJSON_AddBoolToObject(audio, "mute", binding->mute);
+    cJSON_AddBoolToObject(audio, "monitor", binding->monitor);
+    return audio;
 }
 
 const char *sbs_scene_graph_transition_kind_name(sbs_transition_kind_t kind)
@@ -913,23 +943,13 @@ static cJSON *serialize_transform(const sbs_scene_item_transform_t *transform)
 static cJSON *serialize_item(const sbs_scene_item_state_t *item)
 {
     cJSON *obj = cJSON_CreateObject();
-    cJSON *audio = cJSON_CreateObject();
     cJSON_AddStringToObject(obj, "id", item->id);
     cJSON_AddStringToObject(obj, "source_id", item->source_id);
     cJSON_AddBoolToObject(obj, "visible", item->visible);
     cJSON_AddBoolToObject(obj, "locked", item->locked);
     cJSON_AddNumberToObject(obj, "z_order", item->z_order);
     cJSON_AddItemToObject(obj, "transform", serialize_transform(&item->transform));
-    cJSON_AddBoolToObject(audio, "enabled", item->audio.enabled);
-    if (item->audio.device) {
-        cJSON_AddStringToObject(audio, "device", item->audio.device);
-    } else {
-        cJSON_AddNullToObject(audio, "device");
-    }
-    cJSON_AddNumberToObject(audio, "volume", item->audio.volume > 0.0 ? item->audio.volume : 1.0);
-    cJSON_AddBoolToObject(audio, "mute", item->audio.mute);
-    cJSON_AddBoolToObject(audio, "monitor", item->audio.monitor);
-    cJSON_AddItemToObject(obj, "audio", audio);
+    cJSON_AddItemToObject(obj, "audio", serialize_audio_binding(&item->audio));
     cJSON_AddItemToObject(obj, "filters", serialize_filters(item->filters));
     return obj;
 }
@@ -937,7 +957,6 @@ static cJSON *serialize_item(const sbs_scene_item_state_t *item)
 cJSON *sbs_scene_graph_serialize_source(const sbs_source_state_t *source)
 {
     cJSON *obj = cJSON_CreateObject();
-    cJSON *audio;
     sbs_frame_slot_stats_t frame_stats;
 
     if (!source) {
@@ -963,17 +982,7 @@ cJSON *sbs_scene_graph_serialize_source(const sbs_source_state_t *source)
     cJSON_AddNumberToObject(frame_queue, "held", frame_stats.held);
     cJSON_AddItemToObject(obj, "frame_queue", frame_queue);
 
-    audio = cJSON_CreateObject();
-    cJSON_AddBoolToObject(audio, "enabled", source->audio.enabled);
-    if (source->audio.device) {
-        cJSON_AddStringToObject(audio, "device", source->audio.device);
-    } else {
-        cJSON_AddNullToObject(audio, "device");
-    }
-    cJSON_AddNumberToObject(audio, "volume", source->audio.volume);
-    cJSON_AddBoolToObject(audio, "mute", source->audio.mute);
-    cJSON_AddBoolToObject(audio, "monitor", source->audio.monitor);
-    cJSON_AddItemToObject(obj, "audio", audio);
+    cJSON_AddItemToObject(obj, "audio", serialize_audio_binding(&source->audio));
 
     if (source->error_message) {
         cJSON_AddStringToObject(obj, "error_message", source->error_message);
@@ -1294,6 +1303,8 @@ int sbs_scene_graph_create_source(sbs_scene_graph_t *graph,
     }
     source->filters = g_ptr_array_new_with_free_func(filter_state_free);
     source->audio.volume = 1.0;
+    source->audio.left_gain = 1.0;
+    source->audio.right_gain = 1.0;
     source->runtime_state = g_strdup("created");
     sbs_frame_slot_init(&source->frame_slot);
     sbs_frame_slot_set_release_func(&source->frame_slot, sbs_frame_fds_release, NULL);

@@ -24,6 +24,28 @@ static const char *json_str(cJSON *obj, const char *key);
 static bool json_bool(cJSON *obj, const char *key, bool fallback);
 static double json_num(cJSON *obj, const char *key, double fallback);
 
+static void load_audio_binding(cJSON *audio_obj, sbs_audio_binding_t *audio, bool default_enabled)
+{
+    cJSON *eq;
+
+    if (!audio) return;
+    audio->enabled = json_bool(audio_obj, "enabled", default_enabled);
+    g_free(audio->device);
+    audio->device = g_strdup(json_str(audio_obj, "device"));
+    audio->volume = json_num(audio_obj, "volume", 1.0);
+    audio->left_gain = json_num(audio_obj, "left_gain", 1.0);
+    audio->right_gain = json_num(audio_obj, "right_gain", 1.0);
+    audio->delay_ms = (int32_t)json_num(audio_obj, "delay_ms", 0.0);
+    audio->mute = json_bool(audio_obj, "mute", false);
+    audio->monitor = json_bool(audio_obj, "monitor", false);
+
+    eq = cJSON_GetObjectItemCaseSensitive(audio_obj, "eq_bands");
+    for (uint32_t i = 0; i < G_N_ELEMENTS(audio->eq_bands); i++) {
+        cJSON *band = cJSON_IsArray(eq) ? cJSON_GetArrayItem(eq, (int)i) : NULL;
+        audio->eq_bands[i] = cJSON_IsNumber(band) ? band->valuedouble : 0.0;
+    }
+}
+
 static void seed_default_graph(sbs_scene_graph_t *graph)
 {
     sbs_source_create_params_t src_params = {
@@ -61,6 +83,8 @@ static void seed_default_graph(sbs_scene_graph_t *graph)
         default_source->audio.enabled = true;
         default_source->audio.device = g_strdup("hw:0,2");
         default_source->audio.volume = 1.0;
+        default_source->audio.left_gain = 1.0;
+        default_source->audio.right_gain = 1.0;
         default_source->audio.monitor = false;
         default_source->audio.mute = false;
     }
@@ -279,6 +303,12 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
         if (source->enabled && server->source_sup) {
             sbs_source_start_config_t cfg = {0};
             int rc;
+            if (source->kind == SBS_SOURCE_KIND_ALSA_AUDIO) {
+                source->running = true;
+                g_free(source->runtime_state);
+                source->runtime_state = g_strdup("running");
+                continue;
+            }
             sbs_source_start_config_fill(server->scene_graph, &server->scene_graph->canvas, source, &cfg);
             rc = sbs_source_supervisor_start_source(server->source_sup, &cfg, &source->frame_slot);
             if (rc != SBS_OK) {
@@ -429,11 +459,11 @@ static int apply_scene_graph_bundle(sbs_api_server_t *server, cJSON *bundle)
             g_hash_table_destroy(source->config);
             source->config = json_object_to_map(cfg);
             load_filter_array_for_source(graph, source->id, filters, false);
-            source->audio.enabled = json_bool(audio_obj, "enabled", false);
-            source->audio.device = g_strdup(json_str(audio_obj, "device"));
-            source->audio.volume = json_num(audio_obj, "volume", 1.0);
-            source->audio.mute = json_bool(audio_obj, "mute", false);
-            source->audio.monitor = json_bool(audio_obj, "monitor", false);
+            load_audio_binding(audio_obj, &source->audio, create.kind == SBS_SOURCE_KIND_ALSA_AUDIO);
+            if (create.kind == SBS_SOURCE_KIND_ALSA_AUDIO && !source->audio.device) {
+                const char *device = source->config ? g_hash_table_lookup(source->config, "device") : NULL;
+                source->audio.device = g_strdup(device && device[0] ? device : "hw:0,2");
+            }
         }
     }
 
@@ -474,11 +504,7 @@ static int apply_scene_graph_bundle(sbs_api_server_t *server, cJSON *bundle)
                 ip.transform.alignment = (char *)(json_str(transform, "alignment") ? json_str(transform, "alignment") : "center");
                 ip.transform.opacity = json_num(transform, "opacity", 1.0);
                 if (cJSON_IsObject(audio_obj)) {
-                    item_audio.enabled = json_bool(audio_obj, "enabled", false);
-                    item_audio.device = g_strdup(json_str(audio_obj, "device"));
-                    item_audio.volume = json_num(audio_obj, "volume", 1.0);
-                    item_audio.mute = json_bool(audio_obj, "mute", false);
-                    item_audio.monitor = json_bool(audio_obj, "monitor", false);
+                    load_audio_binding(audio_obj, &item_audio, false);
                     ip.audio = &item_audio;
                 }
                 sbs_scene_item_state_t *created_item = NULL;
@@ -527,7 +553,23 @@ static int apply_scene_graph_bundle(sbs_api_server_t *server, cJSON *bundle)
     }
 
     if (audio && server->audio) {
-        sbs_audio_mixer_set_master(server->audio, json_num(audio, "master_volume", 1.0), json_bool(audio, "master_mute", false));
+        double master_eq[10] = {0};
+        cJSON *eq = cJSON_GetObjectItemCaseSensitive(audio, "master_eq_bands");
+        if (cJSON_IsArray(eq)) {
+            for (uint32_t i = 0; i < G_N_ELEMENTS(master_eq); i++) {
+                cJSON *band = cJSON_GetArrayItem(eq, (int)i);
+                if (cJSON_IsNumber(band)) {
+                    master_eq[i] = band->valuedouble;
+                }
+            }
+        }
+        sbs_audio_mixer_set_master(server->audio,
+                                   json_num(audio, "master_volume", 1.0),
+                                   json_bool(audio, "master_mute", false),
+                                   json_num(audio, "master_left_gain", 1.0),
+                                   json_num(audio, "master_right_gain", 1.0),
+                                   cJSON_IsArray(eq) ? master_eq : NULL,
+                                   G_N_ELEMENTS(master_eq));
     }
 
     return SBS_OK;

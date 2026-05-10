@@ -152,6 +152,13 @@ static cJSON *create_source_kind_json(sbs_source_kind_t kind, bool include_field
         cJSON_AddItemToArray(fields, source_field_string("device", "Device Path", "/dev/video_cap"));
         cJSON_AddItemToArray(fields, source_field_select("output_format", "Output Format", "raw", vfmcap_formats));
         break;
+    case SBS_SOURCE_KIND_ALSA_AUDIO:
+        cJSON_AddStringToObject(obj, "id", "alsa_audio");
+        cJSON_AddStringToObject(obj, "name", "ALSA Audio Input");
+        cJSON_AddStringToObject(obj, "summary", "Audio-only input from an ALSA PCM device");
+        cJSON_AddBoolToObject(obj, "pausable", false);
+        cJSON_AddItemToArray(fields, source_field_string("device", "ALSA Device", "hw:0,2"));
+        break;
     default:
         cJSON_Delete(fields);
         cJSON_Delete(obj);
@@ -183,6 +190,38 @@ static GHashTable *json_object_to_str_map(cJSON *obj)
         }
     }
     return map;
+}
+
+static const char *str_map_get(GHashTable *map, const char *key)
+{
+    return map && key ? g_hash_table_lookup(map, key) : NULL;
+}
+
+static void sync_alsa_audio_source_config(sbs_source_state_t *source)
+{
+    const char *device;
+
+    if (!source || source->kind != SBS_SOURCE_KIND_ALSA_AUDIO) {
+        return;
+    }
+
+    device = str_map_get(source->config, "device");
+    source->audio.enabled = source->enabled;
+    if (device && device[0]) {
+        g_free(source->audio.device);
+        source->audio.device = g_strdup(device);
+    } else if (!source->audio.device) {
+        source->audio.device = g_strdup("hw:0,2");
+    }
+    if (source->audio.volume < 0.0) {
+        source->audio.volume = 1.0;
+    }
+    if (source->audio.left_gain < 0.0) {
+        source->audio.left_gain = 1.0;
+    }
+    if (source->audio.right_gain < 0.0) {
+        source->audio.right_gain = 1.0;
+    }
 }
 
 static void publish_source_event(sbs_api_server_t *server, const char *topic, sbs_source_state_t *source)
@@ -236,6 +275,7 @@ int sbs_api_handle_source_list_kinds(sbs_api_server_t *server, sbs_api_client_t 
         SBS_SOURCE_KIND_IMAGE,
         SBS_SOURCE_KIND_TEXT,
         SBS_SOURCE_KIND_VFMCAP,
+        SBS_SOURCE_KIND_ALSA_AUDIO,
     };
     cJSON *kinds = cJSON_CreateArray();
 
@@ -429,6 +469,7 @@ int sbs_api_handle_source_create(sbs_api_server_t *server, sbs_api_client_t *cli
         *error = api_error(-32005, "Unable to create source");
         return rc;
     }
+    sync_alsa_audio_source_config(source);
     publish_source_event(server, "source.created", source);
 
     if (create.keep_alive) {
@@ -490,10 +531,14 @@ int sbs_api_handle_source_update(sbs_api_server_t *server, sbs_api_client_t *cli
         *error = api_error(-32001, "Source not found");
         return rc;
     }
+    sync_alsa_audio_source_config(source);
+    if (source->kind == SBS_SOURCE_KIND_ALSA_AUDIO && server->audio) {
+        sbs_audio_mixer_set_source_state(server->audio, source);
+    }
     publish_source_event(server, "source.updated", source);
 
     /* If config changed and source is running, restart the worker with new config */
-    if (update.set_config && source->running) {
+    if (update.set_config && source->running && source->kind != SBS_SOURCE_KIND_ALSA_AUDIO) {
         LOG_I("source '%s' config updated while running, restarting worker", id);
 
         sbs_source_supervisor_stop_source(server->source_sup, id);
@@ -539,7 +584,7 @@ int sbs_api_handle_source_remove(sbs_api_server_t *server, sbs_api_client_t *cli
         return SBS_ERR_NOT_FOUND;
     }
 
-    if (source->running) {
+    if (source->running && source->kind != SBS_SOURCE_KIND_ALSA_AUDIO) {
         sbs_source_supervisor_stop_source(server->source_sup, id);
         source->running = false;
         g_free(source->runtime_state);
@@ -578,6 +623,23 @@ int sbs_api_handle_source_start(sbs_api_server_t *server, sbs_api_client_t *clie
 
     sbs_source_start_config_fill(server->scene_graph, &server->scene_graph->canvas, source, &cfg);
 
+    if (source->kind == SBS_SOURCE_KIND_ALSA_AUDIO) {
+        sync_alsa_audio_source_config(source);
+        if (server->audio) {
+            rc = sbs_audio_mixer_set_source_state(server->audio, source);
+            if (rc != SBS_OK) {
+                *error = api_error(-32006, "Failed to start audio input");
+                return rc;
+            }
+        }
+        source->running = true;
+        g_free(source->runtime_state);
+        source->runtime_state = g_strdup("running");
+        publish_source_event(server, "source.status", source);
+        *result = sbs_scene_graph_serialize_source(source);
+        return SBS_OK;
+    }
+
     rc = sbs_source_supervisor_start_source(server->source_sup, &cfg, &source->frame_slot);
     if (rc != SBS_OK) {
         *error = api_error(-32006, "Failed to start source worker");
@@ -608,10 +670,18 @@ int sbs_api_handle_source_stop(sbs_api_server_t *server, sbs_api_client_t *clien
         *error = api_error(-32001, "Source not found");
         return SBS_ERR_NOT_FOUND;
     }
-    rc = sbs_source_supervisor_stop_source(server->source_sup, id);
-    if (rc != SBS_OK) {
-        *error = api_error(-32003, "Failed to stop source");
-        return rc;
+    if (source->kind == SBS_SOURCE_KIND_ALSA_AUDIO) {
+        source->audio.enabled = false;
+        if (server->audio) {
+            sbs_audio_mixer_set_source_state(server->audio, source);
+        }
+        rc = SBS_OK;
+    } else {
+        rc = sbs_source_supervisor_stop_source(server->source_sup, id);
+        if (rc != SBS_OK) {
+            *error = api_error(-32003, "Failed to stop source");
+            return rc;
+        }
     }
     if (source->slot_initialized) {
         sbs_frame_slot_flush(&source->frame_slot);

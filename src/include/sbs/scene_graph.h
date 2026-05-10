@@ -26,6 +26,7 @@ typedef enum sbs_source_kind {
     SBS_SOURCE_KIND_IMAGE = 4,
     SBS_SOURCE_KIND_TEXT = 5,
     SBS_SOURCE_KIND_VFMCAP = 6,
+    SBS_SOURCE_KIND_ALSA_AUDIO = 7,
 } sbs_source_kind_t;
 
 typedef enum sbs_transition_kind {
@@ -47,6 +48,10 @@ typedef struct sbs_audio_binding {
     bool enabled;
     char *device;
     double volume;
+    double left_gain;
+    double right_gain;
+    int32_t delay_ms;
+    double eq_bands[10];
     bool mute;
     bool monitor;
 } sbs_audio_binding_t;

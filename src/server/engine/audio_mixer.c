@@ -104,6 +104,9 @@ static const char *active_audio_backend_name(void)
 struct sbs_audio_mixer {
     sbs_scene_graph_t *graph;
     double master_volume_value;
+    double master_left_gain;
+    double master_right_gain;
+    double master_eq_bands[10];
     bool master_mute;
 };
 
@@ -112,6 +115,8 @@ sbs_audio_mixer_t *sbs_audio_mixer_new(sbs_scene_graph_t *graph)
     sbs_audio_mixer_t *audio = g_new0(sbs_audio_mixer_t, 1);
     audio->graph = graph;
     audio->master_volume_value = 1.0;
+    audio->master_left_gain = 1.0;
+    audio->master_right_gain = 1.0;
     return audio;
 }
 
@@ -121,9 +126,9 @@ void sbs_audio_mixer_stop(sbs_audio_mixer_t *audio) { (void)audio; }
 void sbs_audio_mixer_on_scene_change(sbs_audio_mixer_t *audio, const char *active_scene_id) { (void)audio; (void)active_scene_id; }
 int sbs_audio_mixer_set_source_state(sbs_audio_mixer_t *audio, sbs_source_state_t *source) { (void)audio; (void)source; return SBS_OK; }
 int sbs_audio_mixer_set_scene_item_state(sbs_audio_mixer_t *audio, sbs_scene_item_state_t *item) { (void)audio; (void)item; return SBS_OK; }
-int sbs_audio_mixer_set_master(sbs_audio_mixer_t *audio, double volume, bool mute) { if (audio) { audio->master_volume_value = volume; audio->master_mute = mute; } return SBS_OK; }
+int sbs_audio_mixer_set_master(sbs_audio_mixer_t *audio, double volume, bool mute, double left_gain, double right_gain, const double *eq_bands, uint32_t eq_band_count) { if (audio) { audio->master_volume_value = volume; audio->master_mute = mute; audio->master_left_gain = left_gain; audio->master_right_gain = right_gain; for (uint32_t i = 0; eq_bands && i < G_N_ELEMENTS(audio->master_eq_bands) && i < eq_band_count; i++) audio->master_eq_bands[i] = eq_bands[i]; } return SBS_OK; }
 cJSON *sbs_audio_mixer_serialize_levels(sbs_audio_mixer_t *audio) { (void)audio; cJSON *obj=cJSON_CreateObject(); cJSON_AddItemToObject(obj,"sources",cJSON_CreateObject()); cJSON_AddItemToObject(obj,"master",cJSON_CreateObject()); return obj; }
-cJSON *sbs_audio_mixer_serialize_state(sbs_audio_mixer_t *audio) { cJSON *obj=cJSON_CreateObject(); cJSON_AddStringToObject(obj,"device","hw:0,2"); cJSON_AddStringToObject(obj,"backend", active_audio_backend_name()); cJSON_AddStringToObject(obj,"preferred_backend", "hifi"); cJSON_AddNumberToObject(obj,"master_volume", audio ? audio->master_volume_value : 1.0); cJSON_AddBoolToObject(obj,"master_mute", audio ? audio->master_mute : false); cJSON_AddItemToObject(obj,"hifi", serialize_hifi_probe()); cJSON_AddItemToObject(obj,"levels", sbs_audio_mixer_serialize_levels(audio)); return obj; }
+cJSON *sbs_audio_mixer_serialize_state(sbs_audio_mixer_t *audio) { cJSON *obj=cJSON_CreateObject(); cJSON *eq=cJSON_CreateArray(); cJSON_AddStringToObject(obj,"device","hw:0,2"); cJSON_AddStringToObject(obj,"backend", active_audio_backend_name()); cJSON_AddStringToObject(obj,"preferred_backend", "hifi"); cJSON_AddNumberToObject(obj,"master_volume", audio ? audio->master_volume_value : 1.0); cJSON_AddNumberToObject(obj,"master_left_gain", audio ? audio->master_left_gain : 1.0); cJSON_AddNumberToObject(obj,"master_right_gain", audio ? audio->master_right_gain : 1.0); for (uint32_t i = 0; i < 10; i++) cJSON_AddItemToArray(eq, cJSON_CreateNumber(audio ? audio->master_eq_bands[i] : 0.0)); cJSON_AddItemToObject(obj,"master_eq_bands", eq); cJSON_AddBoolToObject(obj,"master_mute", audio ? audio->master_mute : false); cJSON_AddItemToObject(obj,"hifi", serialize_hifi_probe()); cJSON_AddItemToObject(obj,"levels", sbs_audio_mixer_serialize_levels(audio)); return obj; }
 uint32_t sbs_audio_mixer_pending_depth(sbs_audio_mixer_t *audio) { (void)audio; return 0; }
 sbs_audio_buffer_t *sbs_audio_mixer_take_latest_buffer(sbs_audio_mixer_t *audio) { (void)audio; return NULL; }
 
@@ -149,6 +154,10 @@ typedef struct sbs_audio_branch {
     GstElement *queue;
     GstElement *convert;
     GstElement *resample;
+    GstElement *capsfilter;
+    GstElement *delay;
+    GstElement *panorama;
+    GstElement *equalizer;
     GstElement *volume;
     GstElement *level;
     GstPad *mixer_pad;
@@ -156,10 +165,63 @@ typedef struct sbs_audio_branch {
     bool muted;
 } sbs_audio_branch_t;
 
+static double clamp_double(double value, double min_value, double max_value)
+{
+    if (value < min_value) return min_value;
+    if (value > max_value) return max_value;
+    return value;
+}
+
+static double audio_binding_volume(const sbs_audio_binding_t *binding)
+{
+    return binding && binding->volume >= 0.0 ? binding->volume : 1.0;
+}
+
+static void configure_branch_audio_controls(sbs_audio_branch_t *branch,
+                                            const sbs_audio_binding_t *binding)
+{
+    double left = binding ? binding->left_gain : 1.0;
+    double right = binding ? binding->right_gain : 1.0;
+    int32_t delay_ms = binding ? binding->delay_ms : 0;
+    double pan = 0.0;
+
+    left = clamp_double(left >= 0.0 ? left : 1.0, 0.0, 2.0);
+    right = clamp_double(right >= 0.0 ? right : 1.0, 0.0, 2.0);
+    delay_ms = CLAMP(delay_ms, 0, 5000);
+    if (left + right > 0.0) {
+        pan = clamp_double((right - left) / (left + right), -1.0, 1.0);
+    }
+
+    if (branch->delay) {
+        g_object_set(branch->delay, "ts-offset", (gint64)delay_ms * GST_MSECOND, NULL);
+    }
+    if (branch->panorama) {
+        g_object_set(branch->panorama, "panorama", pan, NULL);
+    }
+    if (branch->equalizer && binding) {
+        for (uint32_t i = 0; i < G_N_ELEMENTS(binding->eq_bands); i++) {
+            char prop[16];
+            g_snprintf(prop, sizeof(prop), "band%u", i);
+            g_object_set(branch->equalizer, prop,
+                         clamp_double(binding->eq_bands[i], -24.0, 12.0), NULL);
+        }
+    }
+}
+
+static bool link_branch_element(GstElement **prev, GstElement *next)
+{
+    if (!next) return true;
+    if (!gst_element_link(*prev, next)) return false;
+    *prev = next;
+    return true;
+}
+
 struct sbs_audio_mixer {
     sbs_scene_graph_t *graph;
     GstElement *pipeline;
     GstElement *mixer;
+    GstElement *master_panorama;
+    GstElement *master_equalizer;
     GstElement *master_volume;
     GstElement *master_level;
     GstElement *appsink;
@@ -175,8 +237,37 @@ struct sbs_audio_mixer {
     uint64_t dropped_samples;
     gint64 last_queue_log_us;
     double master_volume_value;
+    double master_left_gain;
+    double master_right_gain;
+    double master_eq_bands[10];
     bool master_mute;
 };
+
+static void configure_master_audio_controls(sbs_audio_mixer_t *audio)
+{
+    double left = audio ? audio->master_left_gain : 1.0;
+    double right = audio ? audio->master_right_gain : 1.0;
+    double pan = 0.0;
+
+    if (!audio) return;
+    left = clamp_double(left >= 0.0 ? left : 1.0, 0.0, 2.0);
+    right = clamp_double(right >= 0.0 ? right : 1.0, 0.0, 2.0);
+    if (left + right > 0.0) {
+        pan = clamp_double((right - left) / (left + right), -1.0, 1.0);
+    }
+
+    if (audio->master_panorama) {
+        g_object_set(audio->master_panorama, "panorama", pan, NULL);
+    }
+    if (audio->master_equalizer) {
+        for (uint32_t i = 0; i < G_N_ELEMENTS(audio->master_eq_bands); i++) {
+            char prop[16];
+            g_snprintf(prop, sizeof(prop), "band%u", i);
+            g_object_set(audio->master_equalizer, prop,
+                         clamp_double(audio->master_eq_bands[i], -24.0, 12.0), NULL);
+        }
+    }
+}
 
 static void branch_free(gpointer data)
 {
@@ -366,6 +457,7 @@ static sbs_audio_branch_t *add_branch_for_binding(sbs_audio_mixer_t *audio,
     GstPad *src_pad;
     GstCaps *caps;
     char *level_name;
+    GstElement *last;
 
     branch = g_new0(sbs_audio_branch_t, 1);
     branch->source_id = g_strdup(source->id);
@@ -379,9 +471,14 @@ static sbs_audio_branch_t *add_branch_for_binding(sbs_audio_mixer_t *audio,
     branch->queue = gst_element_factory_make("queue", NULL);
     branch->convert = gst_element_factory_make("audioconvert", NULL);
     branch->resample = gst_element_factory_make("audioresample", NULL);
+    branch->capsfilter = gst_element_factory_make("capsfilter", NULL);
+    branch->delay = gst_element_factory_make("identity", NULL);
+    branch->panorama = gst_element_factory_make("audiopanorama", NULL);
+    branch->equalizer = gst_element_factory_make("equalizer-10bands", NULL);
     branch->volume = gst_element_factory_make("volume", NULL);
     branch->level = gst_element_factory_make("level", NULL);
-    if (!branch->source || !branch->queue || !branch->convert || !branch->resample || !branch->volume || !branch->level) {
+    if (!branch->source || !branch->queue || !branch->convert || !branch->resample ||
+        !branch->capsfilter || !branch->delay || !branch->volume || !branch->level) {
         LOG_W("failed to create audio branch elements for source %s", source->id);
         branch_free(branch);
         return NULL;
@@ -402,7 +499,7 @@ static sbs_audio_branch_t *add_branch_for_binding(sbs_audio_mixer_t *audio,
         "leaky", 2,
         NULL);
     g_object_set(branch->volume,
-        "volume", (gdouble)(binding && binding->volume > 0.0 ? binding->volume : 1.0),
+        "volume", (gdouble)audio_binding_volume(binding),
         "mute", branch->effective_mute,
         NULL);
     g_object_set(branch->level,
@@ -410,29 +507,47 @@ static sbs_audio_branch_t *add_branch_for_binding(sbs_audio_mixer_t *audio,
         "peak-ttl", (guint64)(1000 * GST_MSECOND),
         "post-messages", TRUE,
         NULL);
+    configure_branch_audio_controls(branch, binding);
     level_name = g_strdup_printf("level_%s", source->id);
     gst_object_set_name(GST_OBJECT(branch->level), level_name);
     g_free(level_name);
-
-    gst_bin_add_many(GST_BIN(audio->pipeline), branch->source, branch->queue, branch->convert,
-                     branch->resample, branch->volume, branch->level, NULL);
 
     caps = gst_caps_new_simple("audio/x-raw",
         "rate", G_TYPE_INT, 48000,
         "channels", G_TYPE_INT, 2,
         "format", G_TYPE_STRING, "S16LE",
         NULL);
-    if (!gst_element_link(branch->source, branch->queue) ||
-        !gst_element_link(branch->queue, branch->convert) ||
-        !gst_element_link(branch->convert, branch->resample) ||
-        !gst_element_link_filtered(branch->resample, branch->volume, caps) ||
-        !gst_element_link(branch->volume, branch->level)) {
+    g_object_set(branch->capsfilter, "caps", caps, NULL);
+    gst_caps_unref(caps);
+
+    gst_bin_add_many(GST_BIN(audio->pipeline), branch->source, branch->queue, branch->convert,
+                     branch->resample, branch->capsfilter, branch->delay, branch->volume,
+                     branch->level, NULL);
+    if (branch->panorama) {
+        gst_bin_add(GST_BIN(audio->pipeline), branch->panorama);
+    } else {
+        LOG_W("audiopanorama unavailable; left/right gain control disabled for source %s", source->id);
+    }
+    if (branch->equalizer) {
+        gst_bin_add(GST_BIN(audio->pipeline), branch->equalizer);
+    } else {
+        LOG_W("equalizer-10bands unavailable; EQ control disabled for source %s", source->id);
+    }
+
+    last = branch->source;
+    if (!link_branch_element(&last, branch->queue) ||
+        !link_branch_element(&last, branch->convert) ||
+        !link_branch_element(&last, branch->resample) ||
+        !link_branch_element(&last, branch->capsfilter) ||
+        !link_branch_element(&last, branch->delay) ||
+        !link_branch_element(&last, branch->panorama) ||
+        !link_branch_element(&last, branch->equalizer) ||
+        !link_branch_element(&last, branch->volume) ||
+        !link_branch_element(&last, branch->level)) {
         LOG_W("failed to link audio branch for source %s", source->id);
-        gst_caps_unref(caps);
         branch_free(branch);
         return NULL;
     }
-    gst_caps_unref(caps);
 
     branch->mixer_pad = gst_element_request_pad_simple(audio->mixer, "sink_%u");
     src_pad = gst_element_get_static_pad(branch->level, "src");
@@ -448,6 +563,10 @@ static sbs_audio_branch_t *add_branch_for_binding(sbs_audio_mixer_t *audio,
     gst_element_sync_state_with_parent(branch->queue);
     gst_element_sync_state_with_parent(branch->convert);
     gst_element_sync_state_with_parent(branch->resample);
+    gst_element_sync_state_with_parent(branch->capsfilter);
+    gst_element_sync_state_with_parent(branch->delay);
+    if (branch->panorama) gst_element_sync_state_with_parent(branch->panorama);
+    if (branch->equalizer) gst_element_sync_state_with_parent(branch->equalizer);
     gst_element_sync_state_with_parent(branch->volume);
     gst_element_sync_state_with_parent(branch->level);
 
@@ -470,6 +589,8 @@ sbs_audio_mixer_t *sbs_audio_mixer_new(sbs_scene_graph_t *graph)
     audio->pending_buffers = g_queue_new();
     g_mutex_init(&audio->lock);
     audio->master_volume_value = 1.0;
+    audio->master_left_gain = 1.0;
+    audio->master_right_gain = 1.0;
     audio->master_meter.level_db = -120.0;
     audio->master_meter.peak_db = -120.0;
     return audio;
@@ -513,6 +634,8 @@ int sbs_audio_mixer_start(sbs_audio_mixer_t *audio)
     audio->pipeline = gst_pipeline_new("audio_pipeline");
     audio->mixer = gst_element_factory_make("audiomixer", "audio_mixer");
     GstElement *post_queue = gst_element_factory_make("queue", "audio_post_queue");
+    audio->master_panorama = gst_element_factory_make("audiopanorama", "master_panorama");
+    audio->master_equalizer = gst_element_factory_make("equalizer-10bands", "master_equalizer");
     audio->master_volume = gst_element_factory_make("volume", "master_volume");
     audio->master_level = gst_element_factory_make("level", "master_level");
     audio->appsink = gst_element_factory_make("appsink", "audio_out_tap");
@@ -532,6 +655,7 @@ int sbs_audio_mixer_start(sbs_audio_mixer_t *audio)
         NULL);
 
     g_object_set(audio->master_volume, "volume", audio->master_volume_value, "mute", audio->master_mute, NULL);
+    configure_master_audio_controls(audio);
     g_object_set(audio->master_level,
         "interval", (guint64)(100 * GST_MSECOND),
         "peak-ttl", (guint64)(1000 * GST_MSECOND),
@@ -546,7 +670,23 @@ int sbs_audio_mixer_start(sbs_audio_mixer_t *audio)
     g_signal_connect(audio->appsink, "new-sample", G_CALLBACK(on_audio_sample), audio);
 
     gst_bin_add_many(GST_BIN(audio->pipeline), audio->mixer, post_queue, audio->master_volume, audio->master_level, audio->appsink, NULL);
-    if (!gst_element_link_many(audio->mixer, post_queue, audio->master_volume, audio->master_level, audio->appsink, NULL)) {
+    if (audio->master_panorama) {
+        gst_bin_add(GST_BIN(audio->pipeline), audio->master_panorama);
+    } else {
+        LOG_W("audiopanorama unavailable; master left/right gain disabled");
+    }
+    if (audio->master_equalizer) {
+        gst_bin_add(GST_BIN(audio->pipeline), audio->master_equalizer);
+    } else {
+        LOG_W("equalizer-10bands unavailable; master EQ disabled");
+    }
+    GstElement *last = audio->mixer;
+    if (!link_branch_element(&last, post_queue) ||
+        !link_branch_element(&last, audio->master_panorama) ||
+        !link_branch_element(&last, audio->master_equalizer) ||
+        !link_branch_element(&last, audio->master_volume) ||
+        !link_branch_element(&last, audio->master_level) ||
+        !link_branch_element(&last, audio->appsink)) {
         LOG_E("failed to link audio mixer core path");
         return SBS_ERR_IO;
     }
@@ -578,7 +718,7 @@ void sbs_audio_mixer_stop(sbs_audio_mixer_t *audio)
     gst_element_set_state(audio->pipeline, GST_STATE_NULL);
     gst_object_unref(audio->pipeline);
     audio->pipeline = NULL;
-    audio->mixer = audio->master_volume = audio->master_level = audio->appsink = NULL;
+    audio->mixer = audio->master_panorama = audio->master_equalizer = audio->master_volume = audio->master_level = audio->appsink = NULL;
     g_mutex_lock(&audio->lock);
     while (audio->pending_buffers && (buf = g_queue_pop_head(audio->pending_buffers)) != NULL) {
         g_free(buf);
@@ -624,9 +764,10 @@ void sbs_audio_mixer_on_scene_change(sbs_audio_mixer_t *audio,
             branch->active_in_scene = binding->enabled;
             branch->effective_mute = !binding->enabled || binding->mute;
             g_object_set(branch->volume,
-                         "volume", binding->volume > 0.0 ? binding->volume : 1.0,
+                         "volume", audio_binding_volume(binding),
                          "mute", branch->effective_mute,
                          NULL);
+            configure_branch_audio_controls(branch, binding);
         } else {
             sbs_source_state_t *source = sbs_scene_graph_get_source(audio->graph, branch->source_id);
             branch->monitor = source ? source->audio.monitor : false;
@@ -634,9 +775,12 @@ void sbs_audio_mixer_on_scene_change(sbs_audio_mixer_t *audio,
             branch->active_in_scene = false;
             branch->effective_mute = true;
             g_object_set(branch->volume,
-                         "volume", source && source->audio.volume > 0.0 ? source->audio.volume : 1.0,
+                         "volume", source ? audio_binding_volume(&source->audio) : 1.0,
                          "mute", branch->effective_mute,
                          NULL);
+            if (source) {
+                configure_branch_audio_controls(branch, &source->audio);
+            }
         }
     }
     g_hash_table_destroy(needed);
@@ -670,7 +814,8 @@ int sbs_audio_mixer_set_source_state(sbs_audio_mixer_t *audio,
     branch->monitor = source->audio.monitor;
     branch->muted = source->audio.mute;
     branch->effective_mute = branch->muted || !branch->active_in_scene;
-    g_object_set(branch->volume, "volume", source->audio.volume, "mute", branch->effective_mute, NULL);
+    configure_branch_audio_controls(branch, &source->audio);
+    g_object_set(branch->volume, "volume", audio_binding_volume(&source->audio), "mute", branch->effective_mute, NULL);
     return SBS_OK;
 }
 
@@ -701,20 +846,31 @@ int sbs_audio_mixer_set_scene_item_state(sbs_audio_mixer_t *audio,
         branch->active_in_scene = item->audio.enabled;
         branch->effective_mute = !item->audio.enabled || item->audio.mute;
         g_object_set(branch->volume,
-                     "volume", item->audio.volume > 0.0 ? item->audio.volume : 1.0,
+                     "volume", audio_binding_volume(&item->audio),
                      "mute", branch->effective_mute,
                      NULL);
+        configure_branch_audio_controls(branch, &item->audio);
     }
     return SBS_OK;
 }
 
 int sbs_audio_mixer_set_master(sbs_audio_mixer_t *audio,
                                double volume,
-                               bool mute)
+                               bool mute,
+                               double left_gain,
+                               double right_gain,
+                               const double *eq_bands,
+                               uint32_t eq_band_count)
 {
     if (!audio || !audio->master_volume) return SBS_ERR_INVAL;
     audio->master_volume_value = volume;
     audio->master_mute = mute;
+    audio->master_left_gain = left_gain >= 0.0 ? left_gain : 1.0;
+    audio->master_right_gain = right_gain >= 0.0 ? right_gain : 1.0;
+    for (uint32_t i = 0; eq_bands && i < G_N_ELEMENTS(audio->master_eq_bands) && i < eq_band_count; i++) {
+        audio->master_eq_bands[i] = eq_bands[i];
+    }
+    configure_master_audio_controls(audio);
     g_object_set(audio->master_volume, "volume", volume, "mute", mute, NULL);
     return SBS_OK;
 }
@@ -754,10 +910,17 @@ cJSON *sbs_audio_mixer_serialize_levels(sbs_audio_mixer_t *audio)
 cJSON *sbs_audio_mixer_serialize_state(sbs_audio_mixer_t *audio)
 {
     cJSON *obj = cJSON_CreateObject();
+    cJSON *eq = cJSON_CreateArray();
     cJSON_AddStringToObject(obj, "device", "hw:0,2");
     cJSON_AddStringToObject(obj, "backend", active_audio_backend_name());
     cJSON_AddStringToObject(obj, "preferred_backend", "hifi");
     cJSON_AddNumberToObject(obj, "master_volume", audio ? audio->master_volume_value : 1.0);
+    cJSON_AddNumberToObject(obj, "master_left_gain", audio ? audio->master_left_gain : 1.0);
+    cJSON_AddNumberToObject(obj, "master_right_gain", audio ? audio->master_right_gain : 1.0);
+    for (uint32_t i = 0; i < 10; i++) {
+        cJSON_AddItemToArray(eq, cJSON_CreateNumber(audio ? audio->master_eq_bands[i] : 0.0));
+    }
+    cJSON_AddItemToObject(obj, "master_eq_bands", eq);
     cJSON_AddBoolToObject(obj, "master_mute", audio ? audio->master_mute : false);
     cJSON_AddItemToObject(obj, "hifi", serialize_hifi_probe());
     cJSON_AddItemToObject(obj, "levels", sbs_audio_mixer_serialize_levels(audio));

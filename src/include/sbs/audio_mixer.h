@@ -32,7 +32,11 @@ int sbs_audio_mixer_set_scene_item_state(sbs_audio_mixer_t *audio,
                                          sbs_scene_item_state_t *item);
 int sbs_audio_mixer_set_master(sbs_audio_mixer_t *audio,
                                double volume,
-                               bool mute);
+                               bool mute,
+                               double left_gain,
+                               double right_gain,
+                               const double *eq_bands,
+                               uint32_t eq_band_count);
 
 cJSON *sbs_audio_mixer_serialize_levels(sbs_audio_mixer_t *audio);
 cJSON *sbs_audio_mixer_serialize_state(sbs_audio_mixer_t *audio);

@@ -32,6 +32,41 @@ static bool json_bool(cJSON *obj, const char *key, bool fallback)
     return fallback;
 }
 
+static int32_t json_i32(cJSON *obj, const char *key, int32_t fallback)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    return cJSON_IsNumber(item) ? (int32_t)item->valuedouble : fallback;
+}
+
+static void apply_audio_params(sbs_audio_binding_t *audio,
+                               cJSON *params,
+                               bool default_enabled)
+{
+    cJSON *eq;
+
+    if (!audio) return;
+    audio->enabled = json_bool(params, "enabled", default_enabled);
+    audio->volume = json_num(params, "volume", audio->volume >= 0.0 ? audio->volume : 1.0);
+    audio->left_gain = json_num(params, "left_gain", audio->left_gain >= 0.0 ? audio->left_gain : 1.0);
+    audio->right_gain = json_num(params, "right_gain", audio->right_gain >= 0.0 ? audio->right_gain : 1.0);
+    audio->delay_ms = json_i32(params, "delay_ms", audio->delay_ms);
+    audio->mute = json_bool(params, "mute", audio->mute);
+    audio->monitor = json_bool(params, "monitor", audio->monitor);
+    if (json_str(params, "device")) {
+        g_free(audio->device);
+        audio->device = g_strdup(json_str(params, "device"));
+    }
+    eq = cJSON_GetObjectItemCaseSensitive(params, "eq_bands");
+    if (cJSON_IsArray(eq)) {
+        for (uint32_t i = 0; i < G_N_ELEMENTS(audio->eq_bands); i++) {
+            cJSON *band = cJSON_GetArrayItem(eq, (int)i);
+            if (cJSON_IsNumber(band)) {
+                audio->eq_bands[i] = band->valuedouble;
+            }
+        }
+    }
+}
+
 static cJSON *json_clone(cJSON *item)
 {
     char *payload = cJSON_PrintUnformatted(item);
@@ -59,14 +94,7 @@ int sbs_api_handle_audio_set_source(sbs_api_server_t *server, sbs_api_client_t *
         *error = api_error(-32001, "Source not found");
         return SBS_ERR_NOT_FOUND;
     }
-    source->audio.enabled = json_bool(params, "enabled", true);
-    source->audio.volume = json_num(params, "volume", source->audio.volume > 0 ? source->audio.volume : 1.0);
-    source->audio.mute = json_bool(params, "mute", source->audio.mute);
-    source->audio.monitor = json_bool(params, "monitor", source->audio.monitor);
-    if (json_str(params, "device")) {
-        g_free(source->audio.device);
-        source->audio.device = g_strdup(json_str(params, "device"));
-    }
+    apply_audio_params(&source->audio, params, true);
     if (source->audio.enabled && !source->audio.device) {
         source->audio.device = g_strdup("hw:0,2");
     }
@@ -96,12 +124,12 @@ int sbs_api_handle_audio_set_scene_item(sbs_api_server_t *server, sbs_api_client
         return SBS_ERR_NOT_FOUND;
     }
 
-    audio.enabled = json_bool(params, "enabled", item->audio.enabled);
-    audio.volume = json_num(params, "volume", item->audio.volume > 0 ? item->audio.volume : 1.0);
-    audio.mute = json_bool(params, "mute", item->audio.mute);
-    audio.monitor = json_bool(params, "monitor", item->audio.monitor);
-    audio.device = g_strdup(json_str(params, "device") ? json_str(params, "device") :
-                            (item->audio.device ? item->audio.device : "hw:0,2"));
+    audio = item->audio;
+    audio.device = NULL;
+    apply_audio_params(&audio, params, item->audio.enabled);
+    if (!audio.device) {
+        audio.device = g_strdup(item->audio.device ? item->audio.device : "hw:0,2");
+    }
     if (audio.enabled && !audio.device) {
         audio.device = g_strdup("hw:0,2");
     }
@@ -133,10 +161,25 @@ int sbs_api_handle_audio_set_master(sbs_api_server_t *server, sbs_api_client_t *
                                     cJSON *params, cJSON **result, cJSON **error)
 {
     int rc;
+    double eq_bands[10] = {0};
+    cJSON *eq = cJSON_GetObjectItemCaseSensitive(params, "eq_bands");
     (void)client;
+
+    if (cJSON_IsArray(eq)) {
+        for (uint32_t i = 0; i < G_N_ELEMENTS(eq_bands); i++) {
+            cJSON *band = cJSON_GetArrayItem(eq, (int)i);
+            if (cJSON_IsNumber(band)) {
+                eq_bands[i] = band->valuedouble;
+            }
+        }
+    }
     rc = sbs_audio_mixer_set_master(server->audio,
                                     json_num(params, "volume", 1.0),
-                                    json_bool(params, "mute", false));
+                                    json_bool(params, "mute", false),
+                                    json_num(params, "left_gain", 1.0),
+                                    json_num(params, "right_gain", 1.0),
+                                    cJSON_IsArray(eq) ? eq_bands : NULL,
+                                    G_N_ELEMENTS(eq_bands));
     if (rc != SBS_OK) {
         *error = api_error(-32005, "Unable to update master audio state");
         return rc;

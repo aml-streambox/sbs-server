@@ -423,6 +423,73 @@ static void drain_eventfd(int fd)
         ;
 }
 
+static bool native_canvas_repeat_late_frames_enabled(void)
+{
+    const char *env = getenv("SBS_NATIVE_CANVAS_REPEAT_LATE_FRAMES");
+    return !env || env[0] != '0';
+}
+
+static uint32_t native_canvas_repeat_late_frames_max(void)
+{
+    const char *env = getenv("SBS_NATIVE_CANVAS_REPEAT_LATE_FRAMES_MAX");
+    unsigned long value;
+
+    if (!env || !*env)
+        return 4u;
+
+    value = strtoul(env, NULL, 10);
+    if (value == 0)
+        return 0u;
+    if (value > 16)
+        return 16u;
+    return (uint32_t)value;
+}
+
+static bool publish_compositor_event(sbs_compositor_thread_t *ct)
+{
+    sbs_comp_event_t *ev;
+
+    if (!ct)
+        return false;
+
+    ev = malloc(sizeof(*ev));
+    if (!ev)
+        return false;
+
+    ev->frame_number = ct->frame_count;
+    ev->frames_dropped = ct->frames_dropped;
+    if (sbs_spsc_queue_push(ct->event_queue, ev)) {
+        write_eventfd(ct->eventfd_fd);
+        return true;
+    }
+
+    free(ev);
+    return false;
+}
+
+static uint32_t publish_late_native_repeats(sbs_compositor_thread_t *ct,
+                                            uint32_t repeat_count)
+{
+    uint32_t published = 0;
+
+    if (!ct || !ct->compositor.native_canvas.initialized)
+        return 0;
+
+    for (uint32_t i = 0; i < repeat_count; i++) {
+        uint64_t frame_number = ct->frame_count + 1u;
+        if (!sbs_compositor_native_canvas_republish_last(&ct->compositor,
+                                                         frame_number)) {
+            break;
+        }
+        ct->frame_count++;
+        if (!publish_compositor_event(ct))
+            break;
+        published++;
+    }
+
+    return published;
+}
+
 static void *compositor_thread_func(void *arg)
 {
     sbs_compositor_thread_t *ct = arg;
@@ -856,15 +923,7 @@ retire_done:
 
         ct->frame_count++;
 
-        sbs_comp_event_t *ev = malloc(sizeof(sbs_comp_event_t));
-        if (ev) {
-            ev->frame_number = ct->frame_count;
-            ev->frames_dropped = ct->frames_dropped;
-            if (sbs_spsc_queue_push(ct->event_queue, ev))
-                write_eventfd(ct->eventfd_fd);
-            else
-                free(ev);
-        }
+        publish_compositor_event(ct);
 
         /* Deadline-based sleep: advance next_deadline by one frame interval
          * and sleep only the remaining time. This ensures we maintain the
@@ -883,9 +942,31 @@ retire_done:
             /* Sleep remaining time (min 1ms to avoid busy spin from rounding) */
             usleep((useconds_t)(remain_ns / 1000));
         } else if (remain_ns < -frame_interval_ns) {
-            /* We're more than a full frame behind — reset deadline to now
-             * to avoid a burst of catch-up renders */
-            clock_gettime(CLOCK_MONOTONIC, &next_deadline);
+            uint32_t repeated = 0;
+            if (native_canvas_repeat_late_frames_enabled()) {
+                uint32_t repeat_count = (uint32_t)((-remain_ns) / frame_interval_ns);
+                uint32_t repeat_max = native_canvas_repeat_late_frames_max();
+                if (repeat_count > repeat_max)
+                    repeat_count = repeat_max;
+                repeated = publish_late_native_repeats(ct, repeat_count);
+                if (repeated > 0 && (ct->frame_count % 60 == 0 || repeated > 1)) {
+                    LOG_I("native canvas late repeat: published=%u behind=%.2fms",
+                          repeated, (double)(-remain_ns) / 1000000.0);
+                }
+                for (uint32_t i = 0; i < repeated; i++) {
+                    next_deadline.tv_nsec += frame_interval_ns;
+                    while (next_deadline.tv_nsec >= 1000000000L) {
+                        next_deadline.tv_nsec -= 1000000000L;
+                        next_deadline.tv_sec++;
+                    }
+                }
+            }
+
+            if (repeated == 0) {
+                /* We're more than a full frame behind and cannot publish a
+                 * repeat frame. Reset deadline to avoid a burst of renders. */
+                clock_gettime(CLOCK_MONOTONIC, &next_deadline);
+            }
         }
         /* else: we're late but within one frame — skip sleep, render immediately */
 

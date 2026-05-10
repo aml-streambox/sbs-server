@@ -124,11 +124,12 @@ int sbs_audio_mixer_set_scene_item_state(sbs_audio_mixer_t *audio, sbs_scene_ite
 int sbs_audio_mixer_set_master(sbs_audio_mixer_t *audio, double volume, bool mute) { if (audio) { audio->master_volume_value = volume; audio->master_mute = mute; } return SBS_OK; }
 cJSON *sbs_audio_mixer_serialize_levels(sbs_audio_mixer_t *audio) { (void)audio; cJSON *obj=cJSON_CreateObject(); cJSON_AddItemToObject(obj,"sources",cJSON_CreateObject()); cJSON_AddItemToObject(obj,"master",cJSON_CreateObject()); return obj; }
 cJSON *sbs_audio_mixer_serialize_state(sbs_audio_mixer_t *audio) { cJSON *obj=cJSON_CreateObject(); cJSON_AddStringToObject(obj,"device","hw:0,2"); cJSON_AddStringToObject(obj,"backend", active_audio_backend_name()); cJSON_AddStringToObject(obj,"preferred_backend", "hifi"); cJSON_AddNumberToObject(obj,"master_volume", audio ? audio->master_volume_value : 1.0); cJSON_AddBoolToObject(obj,"master_mute", audio ? audio->master_mute : false); cJSON_AddItemToObject(obj,"hifi", serialize_hifi_probe()); cJSON_AddItemToObject(obj,"levels", sbs_audio_mixer_serialize_levels(audio)); return obj; }
+uint32_t sbs_audio_mixer_pending_depth(sbs_audio_mixer_t *audio) { (void)audio; return 0; }
 sbs_audio_buffer_t *sbs_audio_mixer_take_latest_buffer(sbs_audio_mixer_t *audio) { (void)audio; return NULL; }
 
 #else
 
-#define SBS_AUDIO_PENDING_MAX 256u
+#define SBS_AUDIO_PENDING_MAX 8u
 
 static void ensure_gstreamer_audio_ready(void)
 {
@@ -167,6 +168,12 @@ struct sbs_audio_mixer {
     char *active_scene_id;
     GMutex lock;
     GQueue *pending_buffers;
+    uint64_t pending_samples;
+    uint64_t queued_buffers;
+    uint64_t popped_buffers;
+    uint64_t dropped_buffers;
+    uint64_t dropped_samples;
+    gint64 last_queue_log_us;
     double master_volume_value;
     bool master_mute;
 };
@@ -313,8 +320,33 @@ static GstFlowReturn on_audio_sample(GstAppSink *sink, gpointer user_data)
     if (audio->pending_buffers) {
         if (g_queue_get_length(audio->pending_buffers) >= SBS_AUDIO_PENDING_MAX) {
             dropped = g_queue_pop_head(audio->pending_buffers);
+            if (dropped) {
+                audio->pending_samples -= MIN(audio->pending_samples,
+                                              (uint64_t)dropped->msg.n_samples);
+                audio->dropped_buffers++;
+                audio->dropped_samples += dropped->msg.n_samples;
+            }
         }
         g_queue_push_tail(audio->pending_buffers, abuf);
+        audio->pending_samples += abuf->msg.n_samples;
+        audio->queued_buffers++;
+        if (audio->dropped_buffers > 0) {
+            gint64 now_us = g_get_monotonic_time();
+            if (audio->last_queue_log_us == 0 ||
+                now_us - audio->last_queue_log_us >= 1000000) {
+                uint32_t depth = g_queue_get_length(audio->pending_buffers);
+                uint32_t pending_ms = audio->pending_samples > 0
+                    ? (uint32_t)((audio->pending_samples * 1000u) / 48000u)
+                    : 0;
+                LOG_W("audio FIFO overrun: dropped=%lu queued=%lu popped=%lu depth=%u pending=%ums",
+                      (unsigned long)audio->dropped_buffers,
+                      (unsigned long)audio->queued_buffers,
+                      (unsigned long)audio->popped_buffers,
+                      depth,
+                      pending_ms);
+                audio->last_queue_log_us = now_us;
+            }
+        }
         abuf = NULL;
     }
     g_mutex_unlock(&audio->lock);
@@ -738,8 +770,23 @@ sbs_audio_buffer_t *sbs_audio_mixer_take_latest_buffer(sbs_audio_mixer_t *audio)
     if (!audio) return NULL;
     g_mutex_lock(&audio->lock);
     buf = audio->pending_buffers ? g_queue_pop_head(audio->pending_buffers) : NULL;
+    if (buf) {
+        audio->pending_samples -= MIN(audio->pending_samples,
+                                      (uint64_t)buf->msg.n_samples);
+        audio->popped_buffers++;
+    }
     g_mutex_unlock(&audio->lock);
     return buf;
+}
+
+uint32_t sbs_audio_mixer_pending_depth(sbs_audio_mixer_t *audio)
+{
+    uint32_t depth = 0;
+    if (!audio) return 0;
+    g_mutex_lock(&audio->lock);
+    depth = audio->pending_buffers ? g_queue_get_length(audio->pending_buffers) : 0;
+    g_mutex_unlock(&audio->lock);
+    return depth;
 }
 
 #endif

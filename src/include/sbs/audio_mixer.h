@@ -37,5 +37,6 @@ int sbs_audio_mixer_set_master(sbs_audio_mixer_t *audio,
 cJSON *sbs_audio_mixer_serialize_levels(sbs_audio_mixer_t *audio);
 cJSON *sbs_audio_mixer_serialize_state(sbs_audio_mixer_t *audio);
 sbs_audio_buffer_t *sbs_audio_mixer_take_latest_buffer(sbs_audio_mixer_t *audio);
+uint32_t sbs_audio_mixer_pending_depth(sbs_audio_mixer_t *audio);
 
 #endif

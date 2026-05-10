@@ -139,6 +139,7 @@ void sbs_api_register_core_methods(sbs_api_server_t *server)
     register_method(server, "pubsub.subscribe", sbs_api_handle_pubsub_subscribe);
     register_method(server, "pubsub.unsubscribe", sbs_api_handle_pubsub_unsubscribe);
     register_method(server, "instance.list", sbs_api_handle_instance_list);
+    register_method(server, "instance.restart", sbs_api_handle_instance_restart);
 }
 
 void sbs_api_register_controller_methods(sbs_api_server_t *server)

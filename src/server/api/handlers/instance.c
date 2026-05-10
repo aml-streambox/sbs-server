@@ -2,6 +2,10 @@
 
 #include "sbs/api_server.h"
 
+#include <signal.h>
+#include <string.h>
+#include <unistd.h>
+
 static cJSON *api_error(int code, const char *message)
 {
     cJSON *err = cJSON_CreateObject();
@@ -143,6 +147,36 @@ static int build_instance_info_result(sbs_api_server_t *server, uint32_t instanc
     return SBS_OK;
 }
 
+static int build_local_instance_info_result(sbs_api_server_t *server, cJSON **result)
+{
+    *result = cJSON_CreateObject();
+    if (!*result) return SBS_ERR_NOMEM;
+    cJSON_AddNumberToObject(*result, "instance_id", (double)server->instance_id);
+    cJSON_AddStringToObject(*result, "name", "Local");
+    cJSON_AddBoolToObject(*result, "enabled", true);
+    cJSON_AddBoolToObject(*result, "running", server->running);
+    cJSON_AddNumberToObject(*result, "pid", (double)getpid());
+    cJSON_AddNumberToObject(*result, "api_port", (double)server->port);
+    cJSON_AddNumberToObject(*result, "preview_port", (double)server->preview_port);
+    return SBS_OK;
+}
+
+static gpointer delayed_local_restart_thread(gpointer user_data)
+{
+    (void)user_data;
+    g_usleep(250000);
+    kill(getpid(), SIGTERM);
+    return NULL;
+}
+
+static void schedule_local_instance_restart(void)
+{
+    GThread *thread = g_thread_new("sbs-local-restart", delayed_local_restart_thread, NULL);
+    if (thread) {
+        g_thread_unref(thread);
+    }
+}
+
 int sbs_api_handle_instance_update(sbs_api_server_t *server, sbs_api_client_t *client,
                                    cJSON *params, cJSON **result, cJSON **error)
 {
@@ -281,11 +315,21 @@ int sbs_api_handle_instance_restart(sbs_api_server_t *server, sbs_api_client_t *
     uint32_t instance_id;
     int rc;
     (void)client;
-    if (require_manager(server, error) != SBS_OK) return SBS_ERR_INVAL;
     instance_id = json_instance_id(params, &ok);
     if (!ok) {
         *error = api_error(-32602, "instance_id is required");
         return SBS_ERR_INVAL;
+    }
+    if (!server->instance_mgr) {
+        if (instance_id != server->instance_id) {
+            *error = api_error(-32001, "Instance not found");
+            return SBS_ERR_NOT_FOUND;
+        }
+        rc = build_local_instance_info_result(server, result);
+        if (rc == SBS_OK) {
+            schedule_local_instance_restart();
+        }
+        return rc;
     }
     rc = sbs_instance_manager_stop_instance(server->instance_mgr, instance_id);
     if (rc == SBS_ERR_NOT_FOUND) {

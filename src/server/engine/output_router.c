@@ -45,6 +45,7 @@
 #define SBS_NATIVE_ENCODER_QUEUE_CAPACITY 2u
 #define SBS_NATIVE_ENCODER_RETAIN_CAPACITY 16u
 #define SBS_NATIVE_ENCODER_BFRAME_RETAIN_COUNT 8u
+#define SBS_AUDIO_ROUTER_INTERVAL_US 2000u
 
 struct sbs_output_router {
     sbs_compositor_thread_t  *comp_thread;  /* Borrowed reference */
@@ -70,6 +71,13 @@ struct sbs_output_router {
     int        export_eventfd;       /* Signaled by main thread to wake export thread */
     volatile bool export_running;
     bool       export_started;
+
+    /* Audio routing is independent from compositor/export cadence. */
+    pthread_t       audio_thread;
+    bool            audio_thread_started;
+    volatile bool   audio_thread_running;
+    pthread_mutex_t audio_lock;
+    pthread_mutex_t supervisor_send_lock;
 
     /* Destination-oriented export state */
     bool       dest_preview_inited;
@@ -177,6 +185,65 @@ static void native_encoder_release_lease(sbs_output_router_t *router,
         return;
     sbs_compositor_thread_native_mailbox_release(router->comp_thread, lease);
     native_encoder_clear_lease(lease);
+}
+
+static uint32_t output_router_drain_audio(sbs_output_router_t *router)
+{
+    sbs_audio_mixer_t *audio;
+    uint32_t drained = 0;
+
+    if (!router)
+        return 0;
+
+    pthread_mutex_lock(&router->audio_lock);
+    audio = router->audio;
+    pthread_mutex_unlock(&router->audio_lock);
+    if (!audio)
+        return 0;
+
+    for (;;) {
+        sbs_audio_buffer_t *abuf = sbs_audio_mixer_take_latest_buffer(audio);
+        sbs_encoder_manager_t *encoder_mgr = NULL;
+        sbs_preview_engine_t *preview = NULL;
+        if (!abuf)
+            break;
+
+        pthread_mutex_lock(&router->encoder_lock);
+        encoder_mgr = router->encoder_mgr;
+        pthread_mutex_unlock(&router->encoder_lock);
+        if (encoder_mgr)
+            sbs_encoder_manager_consume_audio(encoder_mgr, &abuf->msg, abuf->data);
+
+        pthread_mutex_lock(&router->supervisor_send_lock);
+        if (sbs_output_supervisor_output_count(router->out_sup) > 0)
+            sbs_output_supervisor_send_audio(router->out_sup, &abuf->msg, abuf->data);
+        pthread_mutex_unlock(&router->supervisor_send_lock);
+
+        pthread_mutex_lock(&router->preview_lock);
+        preview = router->preview;
+        pthread_mutex_unlock(&router->preview_lock);
+        if (preview)
+            sbs_preview_engine_consume_audio(preview, &abuf->msg, abuf->data);
+
+        g_free(abuf);
+        drained++;
+    }
+
+    return drained;
+}
+
+static void *audio_thread_func(void *arg)
+{
+    sbs_output_router_t *router = arg;
+
+    LOG_I("audio routing thread started");
+    while (router->audio_thread_running) {
+        output_router_drain_audio(router);
+        usleep(SBS_AUDIO_ROUTER_INTERVAL_US);
+    }
+    output_router_drain_audio(router);
+    LOG_I("audio routing thread stopped");
+    return NULL;
 }
 
 static bool native_encoder_content_already_queued(sbs_output_router_t *router,
@@ -679,9 +746,11 @@ static void export_thread_process_frame(sbs_output_router_t *router,
 
                 if (lease.color_mode == SBS_EXPORT_COLOR_SDR) {
                     if (output_count > 0) {
+                        pthread_mutex_lock(&router->supervisor_send_lock);
                         int sent = sbs_output_supervisor_send_frame(router->out_sup,
                                                                     &msg,
                                                                     lease.backing_fd);
+                        pthread_mutex_unlock(&router->supervisor_send_lock);
                         if (sent > 0) {
                             router->frames_distributed++;
                             delivered = true;
@@ -924,7 +993,9 @@ static void export_thread_process_frame(sbs_output_router_t *router,
                                 sbs_snapshot_engine_consume_frame(router->snapshot, &msg, snap_fd);
                         }
                         if (output_count > 0) {
+                            pthread_mutex_lock(&router->supervisor_send_lock);
                             int sent = sbs_output_supervisor_send_frame(router->out_sup, &msg, mfd);
+                            pthread_mutex_unlock(&router->supervisor_send_lock);
                             if (sent > 0) router->frames_distributed++;
                         }
                         mfd = -1; /* consumed by send_frame */
@@ -979,23 +1050,7 @@ static void export_thread_process_frame(sbs_output_router_t *router,
     }
 
 audio_only:
-    /* Drain queued PCM so AAC input remains continuous even when the mixer
-     * produces more than one small buffer between compositor ticks. */
-    if (router->audio) {
-        uint32_t drained = 0;
-        sbs_audio_buffer_t *abuf;
-        while ((abuf = sbs_audio_mixer_take_latest_buffer(router->audio)) != NULL) {
-            if (encoder_sink_count > 0 && encoder_mgr)
-                sbs_encoder_manager_consume_audio(encoder_mgr, &abuf->msg, abuf->data);
-            if (output_count > 0)
-                sbs_output_supervisor_send_audio(router->out_sup, &abuf->msg, abuf->data);
-            if (preview && preview_profile)
-                sbs_preview_engine_consume_audio(preview, &abuf->msg, abuf->data);
-            g_free(abuf);
-            if (++drained >= 32)
-                break;
-        }
-    }
+    (void)encoder_sink_count;
 
     if (native_canvas_active) {
         return;
@@ -1145,6 +1200,8 @@ sbs_output_router_t *sbs_output_router_new(sbs_compositor_thread_t *comp_thread,
         native_encoder_clear_lease(&router->encoder_queue_leases[i]);
     for (uint32_t i = 0; i < SBS_NATIVE_ENCODER_RETAIN_CAPACITY; i++)
         native_encoder_clear_lease(&router->encoder_retained_leases[i]);
+    pthread_mutex_init(&router->audio_lock, NULL);
+    pthread_mutex_init(&router->supervisor_send_lock, NULL);
     pthread_mutex_init(&router->encoder_lock, NULL);
     pthread_cond_init(&router->encoder_cond, NULL);
 
@@ -1155,6 +1212,8 @@ sbs_output_router_t *sbs_output_router_new(sbs_compositor_thread_t *comp_thread,
         LOG_E("failed to create native encoder handoff thread: %s", strerror(rc));
         pthread_cond_destroy(&router->encoder_cond);
         pthread_mutex_destroy(&router->encoder_lock);
+        pthread_mutex_destroy(&router->supervisor_send_lock);
+        pthread_mutex_destroy(&router->audio_lock);
         free(router);
         return NULL;
     }
@@ -1178,15 +1237,30 @@ sbs_output_router_t *sbs_output_router_new(sbs_compositor_thread_t *comp_thread,
         pthread_mutex_destroy(&router->preview_lock);
         pthread_cond_destroy(&router->encoder_cond);
         pthread_mutex_destroy(&router->encoder_lock);
+        pthread_mutex_destroy(&router->supervisor_send_lock);
+        pthread_mutex_destroy(&router->audio_lock);
         free(router);
         return NULL;
     }
     router->preview_thread_started = true;
 
+    router->audio_thread_running = true;
+    rc = pthread_create(&router->audio_thread, NULL, audio_thread_func, router);
+    if (rc != 0) {
+        LOG_E("failed to create audio routing thread: %s", strerror(rc));
+        router->audio_thread_running = false;
+    } else {
+        router->audio_thread_started = true;
+    }
+
     /* Create export thread */
     router->export_eventfd = eventfd(0, EFD_CLOEXEC);
     if (router->export_eventfd < 0) {
         LOG_E("failed to create export eventfd: %s", strerror(errno));
+        if (router->audio_thread_started) {
+            router->audio_thread_running = false;
+            pthread_join(router->audio_thread, NULL);
+        }
         pthread_mutex_lock(&router->preview_lock);
         router->preview_thread_running = false;
         pthread_cond_signal(&router->preview_cond);
@@ -1201,6 +1275,8 @@ sbs_output_router_t *sbs_output_router_new(sbs_compositor_thread_t *comp_thread,
         pthread_mutex_destroy(&router->preview_lock);
         pthread_cond_destroy(&router->encoder_cond);
         pthread_mutex_destroy(&router->encoder_lock);
+        pthread_mutex_destroy(&router->supervisor_send_lock);
+        pthread_mutex_destroy(&router->audio_lock);
         free(router);
         return NULL;
     }
@@ -1209,6 +1285,10 @@ sbs_output_router_t *sbs_output_router_new(sbs_compositor_thread_t *comp_thread,
     rc = pthread_create(&router->export_thread, NULL, export_thread_func, router);
     if (rc != 0) {
         LOG_E("failed to create export thread: %s", strerror(rc));
+        if (router->audio_thread_started) {
+            router->audio_thread_running = false;
+            pthread_join(router->audio_thread, NULL);
+        }
         pthread_mutex_lock(&router->preview_lock);
         router->preview_thread_running = false;
         pthread_cond_signal(&router->preview_cond);
@@ -1224,6 +1304,8 @@ sbs_output_router_t *sbs_output_router_new(sbs_compositor_thread_t *comp_thread,
         pthread_mutex_destroy(&router->preview_lock);
         pthread_cond_destroy(&router->encoder_cond);
         pthread_mutex_destroy(&router->encoder_lock);
+        pthread_mutex_destroy(&router->supervisor_send_lock);
+        pthread_mutex_destroy(&router->audio_lock);
         free(router);
         return NULL;
     }
@@ -1250,6 +1332,12 @@ void sbs_output_router_free(sbs_output_router_t *router)
     }
     if (router->export_eventfd >= 0) {
         close(router->export_eventfd);
+    }
+
+    if (router->audio_thread_started) {
+        router->audio_thread_running = false;
+        pthread_join(router->audio_thread, NULL);
+        LOG_I("audio routing thread joined");
     }
 
     if (router->preview_thread_started) {
@@ -1302,6 +1390,8 @@ void sbs_output_router_free(sbs_output_router_t *router)
     }
     pthread_cond_destroy(&router->encoder_cond);
     pthread_mutex_destroy(&router->encoder_lock);
+    pthread_mutex_destroy(&router->supervisor_send_lock);
+    pthread_mutex_destroy(&router->audio_lock);
 
     LOG_I("output router destroyed (distributed: %lu, skipped: %lu, encoded: %lu, enc_dropped: %lu, previews: %lu, preview_dropped: %lu)",
           (unsigned long)router->frames_distributed,
@@ -1395,7 +1485,9 @@ void sbs_output_router_set_audio_mixer(sbs_output_router_t *router,
     if (!router) {
         return;
     }
+    pthread_mutex_lock(&router->audio_lock);
     router->audio = audio;
+    pthread_mutex_unlock(&router->audio_lock);
 }
 
 void sbs_output_router_set_encoder_manager(sbs_output_router_t *router,

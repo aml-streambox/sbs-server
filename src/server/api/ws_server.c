@@ -533,6 +533,7 @@ void sbs_api_server_free(sbs_api_server_t *server)
     sbs_preview_engine_free(server->preview);
     sbs_snapshot_engine_free(server->snapshot);
     sbs_audio_mixer_free(server->audio);
+    sbs_auth_manager_free(server->auth);
     g_hash_table_destroy(server->methods);
     g_hash_table_destroy(server->clients);
     g_free(server->pending_canvas_color_mode);

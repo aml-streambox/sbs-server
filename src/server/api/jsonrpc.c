@@ -1,6 +1,7 @@
 #define SBS_LOG_COMP "api-jsonrpc"
 
 #include "sbs/api_server.h"
+#include "sbs/auth_manager.h"
 
 #include <string.h>
 
@@ -32,8 +33,51 @@ static void register_method(sbs_api_server_t *server,
     g_hash_table_insert(server->methods, (gpointer)name, handler);
 }
 
+static bool is_auth_method(const char *method)
+{
+    return g_strcmp0(method, "auth.status") == 0 ||
+           g_strcmp0(method, "auth.setup") == 0 ||
+           g_strcmp0(method, "auth.login") == 0 ||
+           g_strcmp0(method, "auth.loginApiKey") == 0;
+}
+
+static const char *json_str(cJSON *obj, const char *key)
+{
+    if (!cJSON_IsObject(obj)) return NULL;
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    return cJSON_IsString(item) ? cJSON_GetStringValue(item) : NULL;
+}
+
+static bool request_authenticated(sbs_api_server_t *server,
+                                  sbs_api_client_t *client,
+                                  cJSON *params)
+{
+    if (!server || !server->auth) return true;
+    if (sbs_auth_manager_passwordless(server->auth)) return true;
+    if (!client) return true;
+    if (client->authenticated) return true;
+    if (sbs_auth_manager_validate_session(server->auth, json_str(params, "auth_token"))) {
+        client->authenticated = true;
+        return true;
+    }
+    if (sbs_auth_manager_validate_api_key(server->auth, json_str(params, "api_key"))) {
+        client->authenticated = true;
+        return true;
+    }
+    return false;
+}
+
 void sbs_api_register_core_methods(sbs_api_server_t *server)
 {
+    register_method(server, "auth.status", sbs_api_handle_auth_status);
+    register_method(server, "auth.setup", sbs_api_handle_auth_setup);
+    register_method(server, "auth.login", sbs_api_handle_auth_login);
+    register_method(server, "auth.loginApiKey", sbs_api_handle_auth_login_api_key);
+    register_method(server, "auth.createApiKey", sbs_api_handle_auth_create_api_key);
+    register_method(server, "auth.listApiKeys", sbs_api_handle_auth_list_api_keys);
+    register_method(server, "auth.deleteApiKey", sbs_api_handle_auth_delete_api_key);
+    register_method(server, "auth.updateCredentials", sbs_api_handle_auth_update_credentials);
+    register_method(server, "auth.setPasswordless", sbs_api_handle_auth_set_passwordless);
     register_method(server, "system.getState", sbs_api_handle_system_get_state);
     register_method(server, "system.getInfo", sbs_api_handle_system_get_info);
     register_method(server, "source.list", sbs_api_handle_source_list);
@@ -99,6 +143,15 @@ void sbs_api_register_core_methods(sbs_api_server_t *server)
 
 void sbs_api_register_controller_methods(sbs_api_server_t *server)
 {
+    register_method(server, "auth.status", sbs_api_handle_auth_status);
+    register_method(server, "auth.setup", sbs_api_handle_auth_setup);
+    register_method(server, "auth.login", sbs_api_handle_auth_login);
+    register_method(server, "auth.loginApiKey", sbs_api_handle_auth_login_api_key);
+    register_method(server, "auth.createApiKey", sbs_api_handle_auth_create_api_key);
+    register_method(server, "auth.listApiKeys", sbs_api_handle_auth_list_api_keys);
+    register_method(server, "auth.deleteApiKey", sbs_api_handle_auth_delete_api_key);
+    register_method(server, "auth.updateCredentials", sbs_api_handle_auth_update_credentials);
+    register_method(server, "auth.setPasswordless", sbs_api_handle_auth_set_passwordless);
     register_method(server, "instance.list", sbs_api_handle_instance_list);
     register_method(server, "instance.create", sbs_api_handle_instance_create);
     register_method(server, "instance.update", sbs_api_handle_instance_update);
@@ -181,6 +234,15 @@ int sbs_api_server_dispatch_json(sbs_api_server_t *server,
     handler = g_hash_table_lookup(server->methods, cJSON_GetStringValue(method_item));
     if (!handler) {
         cJSON_AddItemToObject(response, "error", rpc_error(-32601, "Method not found"));
+        *response_json = cJSON_PrintUnformatted(response);
+        cJSON_Delete(response);
+        cJSON_Delete(request);
+        return SBS_OK;
+    }
+
+    if (!is_auth_method(cJSON_GetStringValue(method_item)) &&
+        !request_authenticated(server, client, params)) {
+        cJSON_AddItemToObject(response, "error", rpc_error(-32020, "Authentication required"));
         *response_json = cJSON_PrintUnformatted(response);
         cJSON_Delete(response);
         cJSON_Delete(request);

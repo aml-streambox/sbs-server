@@ -299,6 +299,7 @@ static int run_instance_daemon(const char *argv0, sbs_log_level_t level)
     audio_mixer = NULL;
     api_server->encoder_mgr = encoder_mgr;
     api_server->config = config_mgr;
+    api_server->auth = sbs_auth_manager_new(sbs_config_manager_config_dir(config_mgr));
     config_mgr = NULL;
     sbs_api_server_set_instance_id(api_server, opt_instance_id >= 0 ? (uint32_t)opt_instance_id : 0U);
 

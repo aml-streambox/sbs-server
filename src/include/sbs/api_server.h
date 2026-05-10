@@ -10,6 +10,7 @@
 #include "sbs/snapshot.h"
 #include "sbs/audio_mixer.h"
 #include "sbs/config_manager.h"
+#include "sbs/auth_manager.h"
 #include "sbs/instance_manager.h"
 #include "sbs/encoder_manager.h"
 #include "cjson/cJSON.h"
@@ -35,6 +36,7 @@ struct sbs_api_client {
     gpointer thread;
     char *peer_ip;
     bool connected;
+    bool authenticated;
 };
 
 struct sbs_api_server {
@@ -47,6 +49,7 @@ struct sbs_api_server {
     sbs_snapshot_engine_t *snapshot;
     sbs_audio_mixer_t *audio;
     sbs_config_manager_t *config;
+    sbs_auth_manager_t *auth;
     sbs_instance_manager_t *instance_mgr;
     sbs_encoder_manager_t *encoder_mgr;
     GHashTable *methods;
@@ -118,6 +121,25 @@ void sbs_api_server_configure_controller(sbs_api_server_t *server,
 void sbs_api_server_set_instance_id(sbs_api_server_t *server, uint32_t instance_id);
 void sbs_api_server_refresh_scene(sbs_api_server_t *server);
 void sbs_api_server_publish_telemetry(sbs_api_server_t *server);
+
+int sbs_api_handle_auth_status(sbs_api_server_t *server, sbs_api_client_t *client,
+                               cJSON *params, cJSON **result, cJSON **error);
+int sbs_api_handle_auth_setup(sbs_api_server_t *server, sbs_api_client_t *client,
+                              cJSON *params, cJSON **result, cJSON **error);
+int sbs_api_handle_auth_login(sbs_api_server_t *server, sbs_api_client_t *client,
+                              cJSON *params, cJSON **result, cJSON **error);
+int sbs_api_handle_auth_login_api_key(sbs_api_server_t *server, sbs_api_client_t *client,
+                                      cJSON *params, cJSON **result, cJSON **error);
+int sbs_api_handle_auth_create_api_key(sbs_api_server_t *server, sbs_api_client_t *client,
+                                       cJSON *params, cJSON **result, cJSON **error);
+int sbs_api_handle_auth_list_api_keys(sbs_api_server_t *server, sbs_api_client_t *client,
+                                      cJSON *params, cJSON **result, cJSON **error);
+int sbs_api_handle_auth_delete_api_key(sbs_api_server_t *server, sbs_api_client_t *client,
+                                       cJSON *params, cJSON **result, cJSON **error);
+int sbs_api_handle_auth_update_credentials(sbs_api_server_t *server, sbs_api_client_t *client,
+                                           cJSON *params, cJSON **result, cJSON **error);
+int sbs_api_handle_auth_set_passwordless(sbs_api_server_t *server, sbs_api_client_t *client,
+                                         cJSON *params, cJSON **result, cJSON **error);
 
 int sbs_api_handle_system_get_state(sbs_api_server_t *server, sbs_api_client_t *client,
                                     cJSON *params, cJSON **result, cJSON **error);

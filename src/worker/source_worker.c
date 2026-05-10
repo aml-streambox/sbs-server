@@ -162,8 +162,16 @@ static int source_worker_acquire_cpu_export_slot(source_state_t *state,
             state->cpu_export_ring[idx].backing.fd = -1;
         }
 
-        if (sbs_dmabuf_alloc_buffer(&state->dmabuf_alloc, size, 0, &new_buf) != SBS_OK ||
-            new_buf.fd < 0 || new_buf.heap == SBS_DMABUF_HEAP_MEMFD) {
+        if (sbs_dmabuf_alloc_buffer_from_heap(&state->dmabuf_alloc,
+                                              SBS_DMABUF_HEAP_SYSTEM,
+                                              size, 0, &new_buf) != SBS_OK ||
+            new_buf.fd < 0) {
+            if (new_buf.fd >= 0)
+                close(new_buf.fd);
+            new_buf.fd = -1;
+            (void)sbs_dmabuf_alloc_buffer(&state->dmabuf_alloc, size, 0, &new_buf);
+        }
+        if (new_buf.fd < 0 || new_buf.heap == SBS_DMABUF_HEAP_MEMFD) {
             if (new_buf.fd >= 0)
                 close(new_buf.fd);
             return -1;

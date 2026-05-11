@@ -7708,7 +7708,7 @@ static bool native_scene_can_full_canvas_direct_yuv(sbs_compositor_t *comp,
         int32_t dst_y = item->render_y;
         uint32_t dst_w = (uint32_t)item->render_width;
         uint32_t dst_h = (uint32_t)item->render_height;
-        if (dst_w == 0 || dst_h == 0 || dst_x > 0 || dst_y > 0 ||
+        if (dst_w == 0 || dst_h == 0 || dst_x > 0 ||
             dst_x + (int32_t)dst_w < (int32_t)comp->width)
             return false;
 
@@ -7717,7 +7717,8 @@ static bool native_scene_can_full_canvas_direct_yuv(sbs_compositor_t *comp,
             entry->color_mode == SBS_EXPORT_COLOR_SDR &&
             comp->sources[slot].drm_format == SBS_DRM_FORMAT_AMLY &&
             comp->native_amly_to_nv21_src_pipeline != VK_NULL_HANDLE &&
-            dst_y == 0 && dst_h <= comp->height &&
+            dst_y < (int32_t)comp->height &&
+            dst_y + (int32_t)dst_h > 0 &&
             (item->filter_flags & ~SBS_COMP_FILTER_HDR_TO_SDR_LUT) == 0;
         return covers_canvas_height || source_driven_amly_with_bg_fill;
     }
@@ -8450,9 +8451,10 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                 comp->native_amly_to_nv21_src_pipeline != VK_NULL_HANDLE &&
                 item_base_direct && layer_opacity >= 0.999f &&
                 (item->filter_flags & ~SBS_COMP_FILTER_HDR_TO_SDR_LUT) == 0 &&
-                dst_x <= 0 && dst_y == 0 &&
+                dst_x <= 0 &&
                 dst_x + (int32_t)dst_w >= (int32_t)canvas_width &&
-                dst_h <= canvas_height) {
+                dst_y < (int32_t)canvas_height &&
+                dst_y + (int32_t)dst_h > 0) {
                 direct_pipeline = comp->native_amly_to_nv21_src_pipeline;
                 source_driven_amly = true;
             }
@@ -8599,17 +8601,33 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                 }
                 vkCmdDispatch(cb, (block_w + wg_x - 1u) / wg_x,
                               (block_h + wg_y - 1u) / wg_y, 1);
-                if (source_driven_amly && full_canvas_direct &&
-                    pc.dst_y == 0 && pc.dst_h < canvas_height) {
+                if (source_driven_amly && full_canvas_direct) {
+                    uint32_t bg_pairs = (canvas_width + 1u) >> 1;
                     sbs_native_p010_direct_pc_t bg_pc = pc;
-                    uint32_t bg_rows = canvas_height - pc.dst_h;
                     bg_pc.src_h = 0;
                     bg_pc.uv_stride = 0;
-                    bg_pc.uv_offset = (canvas_width + 1u) >> 1;
-                    vkCmdPushConstants(cb, comp->native_p010_direct_pipeline_layout,
-                                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bg_pc), &bg_pc);
-                    vkCmdDispatch(cb, (bg_pc.uv_offset + 15u) / 16u,
-                                  (((bg_rows + 1u) >> 1) + 7u) / 8u, 1);
+                    bg_pc.uv_offset = bg_pairs;
+                    if (pc.dst_y > 0) {
+                        uint32_t bg_rows = (uint32_t)pc.dst_y < canvas_height
+                            ? (uint32_t)pc.dst_y : canvas_height;
+                        bg_pc.y_stride = 0;
+                        vkCmdPushConstants(cb, comp->native_p010_direct_pipeline_layout,
+                                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bg_pc), &bg_pc);
+                        vkCmdDispatch(cb, (bg_pairs + 15u) / 16u,
+                                      (((bg_rows + 1u) >> 1) + 7u) / 8u, 1);
+                    }
+                    if (pc.dst_y + (int32_t)pc.dst_h < (int32_t)canvas_height) {
+                        int32_t bg_start_i = pc.dst_y + (int32_t)pc.dst_h;
+                        uint32_t bg_start = bg_start_i > 0 ? (uint32_t)bg_start_i : 0u;
+                        uint32_t bg_rows = bg_start < canvas_height ? canvas_height - bg_start : 0u;
+                        if (bg_rows > 0) {
+                            bg_pc.y_stride = bg_start;
+                            vkCmdPushConstants(cb, comp->native_p010_direct_pipeline_layout,
+                                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bg_pc), &bg_pc);
+                            vkCmdDispatch(cb, (bg_pairs + 15u) / 16u,
+                                          (((bg_rows + 1u) >> 1) + 7u) / 8u, 1);
+                        }
+                    }
                 }
             }
             native_timing_record_layer_end(comp, cb, timing, item, tex,

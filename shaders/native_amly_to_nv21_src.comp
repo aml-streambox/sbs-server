@@ -165,11 +165,11 @@ void main() {
     uint local_pair = gl_GlobalInvocationID.x;
     uint src_y = gl_GlobalInvocationID.y;
 
-    if (src_y >= pc.src_h) {
+    if (pc.src_h == 0u) {
         if (local_pair >= pc.src_pair_count)
             return;
 
-        uint y = pc.dst_h + (src_y - pc.src_h) * 2u;
+        uint y = pc.y_stride + src_y * 2u;
         uint x = local_pair * 2u;
         if (x >= pc.canvas_width || y >= pc.canvas_height)
             return;
@@ -183,13 +183,13 @@ void main() {
                 imageStore(y_img, ivec2(x + 1u, y + 1u), vec4(pc.bg_y, 0.0, 0.0, 1.0));
         }
 
-        uint uv_y = ((pc.dst_h + 1u) >> 1) + (src_y - pc.src_h);
+        uint uv_y = (pc.y_stride >> 1) + src_y;
         if (uv_y < (pc.canvas_height >> 1))
             imageStore(uv_img, ivec2(local_pair, uv_y), vec4(pc.bg_v, pc.bg_u, 0.0, 1.0));
         return;
     }
 
-    if (local_pair >= pc.src_pair_count)
+    if (local_pair >= pc.src_pair_count || src_y >= pc.src_h)
         return;
 
     uint pair_x = pc.src_pair_start + local_pair;

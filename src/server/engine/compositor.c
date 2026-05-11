@@ -7699,7 +7699,27 @@ static bool native_scene_can_full_canvas_direct_yuv(sbs_compositor_t *comp,
         if (!source_texture_matches_item(&comp->sources[slot], item))
             return false;
 
-        return native_source_can_direct_yuv(comp, entry, &comp->sources[slot], item);
+        bool direct_yuv = native_source_can_direct_yuv(comp, entry,
+                                                       &comp->sources[slot], item);
+        if (!direct_yuv)
+            return false;
+
+        int32_t dst_x = item->render_x;
+        int32_t dst_y = item->render_y;
+        uint32_t dst_w = (uint32_t)item->render_width;
+        uint32_t dst_h = (uint32_t)item->render_height;
+        if (dst_w == 0 || dst_h == 0 || dst_x > 0 || dst_y > 0 ||
+            dst_x + (int32_t)dst_w < (int32_t)comp->width)
+            return false;
+
+        bool covers_canvas_height = dst_y + (int32_t)dst_h >= (int32_t)comp->height;
+        bool source_driven_amly_with_bg_fill =
+            entry->color_mode == SBS_EXPORT_COLOR_SDR &&
+            comp->sources[slot].drm_format == SBS_DRM_FORMAT_AMLY &&
+            comp->native_amly_to_nv21_src_pipeline != VK_NULL_HANDLE &&
+            dst_y == 0 && dst_h <= comp->height &&
+            (item->filter_flags & ~SBS_COMP_FILTER_HDR_TO_SDR_LUT) == 0;
+        return covers_canvas_height || source_driven_amly_with_bg_fill;
     }
 
     return false;
@@ -8340,7 +8360,7 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
     if (!have_rgba_pipeline && !have_direct_pipeline)
         return;
 
-    bool full_canvas_direct_used = false;
+    bool base_layer_used = false;
     for (uint32_t i = 0; i < count && i < SBS_MAX_SOURCE_TEXTURES; i++) {
         const sbs_comp_scene_item_t *item = &items[i];
         uint32_t slot = native_source_texture_slot_for_item(comp, items, count, i,
@@ -8392,7 +8412,8 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
         };
 
         if (direct_yuv) {
-            bool item_full_canvas_direct = full_canvas_direct && !full_canvas_direct_used;
+            bool item_base_direct = !base_layer_used;
+            bool item_full_canvas_direct = full_canvas_direct && item_base_direct;
             float layer_opacity = native_clampf01(item->opacity * opacity_scale);
             uint32_t source_scale_dst_w = dst_w;
             uint32_t source_scale_dst_h = dst_h;
@@ -8427,7 +8448,7 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                 tex->drm_format == SBS_DRM_FORMAT_AMLY &&
                 direct_pipeline == comp->native_amly_to_nv21_pipeline &&
                 comp->native_amly_to_nv21_src_pipeline != VK_NULL_HANDLE &&
-                item_full_canvas_direct && layer_opacity >= 0.999f &&
+                item_base_direct && layer_opacity >= 0.999f &&
                 (item->filter_flags & ~SBS_COMP_FILTER_HDR_TO_SDR_LUT) == 0 &&
                 dst_x <= 0 && dst_y == 0 &&
                 dst_x + (int32_t)dst_w >= (int32_t)canvas_width &&
@@ -8578,6 +8599,18 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                 }
                 vkCmdDispatch(cb, (block_w + wg_x - 1u) / wg_x,
                               (block_h + wg_y - 1u) / wg_y, 1);
+                if (source_driven_amly && full_canvas_direct &&
+                    pc.dst_y == 0 && pc.dst_h < canvas_height) {
+                    sbs_native_p010_direct_pc_t bg_pc = pc;
+                    uint32_t bg_rows = canvas_height - pc.dst_h;
+                    bg_pc.src_h = 0;
+                    bg_pc.uv_stride = 0;
+                    bg_pc.uv_offset = (canvas_width + 1u) >> 1;
+                    vkCmdPushConstants(cb, comp->native_p010_direct_pipeline_layout,
+                                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bg_pc), &bg_pc);
+                    vkCmdDispatch(cb, (bg_pc.uv_offset + 15u) / 16u,
+                                  (((bg_rows + 1u) >> 1) + 7u) / 8u, 1);
+                }
             }
             native_timing_record_layer_end(comp, cb, timing, item, tex,
                                             split_full_canvas_direct ? canvas_width : pc.dst_w,
@@ -8586,8 +8619,7 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                                             split_full_canvas_direct ? 0 : pc.dst_y,
                                             true);
             native_canvas_layer_barrier(cb, entry);
-            if (item_full_canvas_direct)
-                full_canvas_direct_used = true;
+            base_layer_used = true;
             tex->upload_pending = false;
             {
                 static uint64_t direct_layer_count = 0;
@@ -8698,6 +8730,7 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                                             pc.dst_w, pc.dst_h, pc.dst_x, pc.dst_y,
                                             false);
             native_canvas_layer_barrier(cb, entry);
+            base_layer_used = true;
         }
         {
             static uint64_t native_layer_count = 0;

@@ -164,7 +164,32 @@ void write_chroma_rect(uint src_pair_x, uint src_y, vec2 vu) {
 void main() {
     uint local_pair = gl_GlobalInvocationID.x;
     uint src_y = gl_GlobalInvocationID.y;
-    if (local_pair >= pc.src_pair_count || src_y >= pc.src_h)
+
+    if (src_y >= pc.src_h) {
+        if (local_pair >= pc.src_pair_count)
+            return;
+
+        uint y = pc.dst_h + (src_y - pc.src_h) * 2u;
+        uint x = local_pair * 2u;
+        if (x >= pc.canvas_width || y >= pc.canvas_height)
+            return;
+
+        imageStore(y_img, ivec2(x, y), vec4(pc.bg_y, 0.0, 0.0, 1.0));
+        if (x + 1u < pc.canvas_width)
+            imageStore(y_img, ivec2(x + 1u, y), vec4(pc.bg_y, 0.0, 0.0, 1.0));
+        if (y + 1u < pc.canvas_height) {
+            imageStore(y_img, ivec2(x, y + 1u), vec4(pc.bg_y, 0.0, 0.0, 1.0));
+            if (x + 1u < pc.canvas_width)
+                imageStore(y_img, ivec2(x + 1u, y + 1u), vec4(pc.bg_y, 0.0, 0.0, 1.0));
+        }
+
+        uint uv_y = ((pc.dst_h + 1u) >> 1) + (src_y - pc.src_h);
+        if (uv_y < (pc.canvas_height >> 1))
+            imageStore(uv_img, ivec2(local_pair, uv_y), vec4(pc.bg_v, pc.bg_u, 0.0, 1.0));
+        return;
+    }
+
+    if (local_pair >= pc.src_pair_count)
         return;
 
     uint pair_x = pc.src_pair_start + local_pair;

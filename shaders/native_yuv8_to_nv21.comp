@@ -36,12 +36,15 @@ layout(push_constant) uniform PushConstants {
     float hdr_hue_cos;
     float hdr_hue_sin;
     float filter_params[4];
+    uint src_offset_x;
+    uint src_offset_y;
 } pc;
 
 const uint FLAG_FULL_CANVAS = 1u;
 const uint FLAG_SOURCE_NV21 = 4u;
 const uint FLAG_DST_IN_BOUNDS = 8u;
 const uint FLAG_SRC_OFFSET = 16u;
+const uint FLAG_SRC_RECT_OFFSET = 32u;
 const uint FILTER_GRAYSCALE = 1u;
 const uint FILTER_BRIGHTNESS = 2u;
 const uint FILTER_CONTRAST = 4u;
@@ -53,6 +56,7 @@ bool source_is_nv21() { return (pc.flags & FLAG_SOURCE_NV21) != 0u; }
 bool dst_in_bounds() { return (pc.flags & FLAG_DST_IN_BOUNDS) != 0u; }
 bool filter_hdr_to_sdr() { return (pc.filter_flags & FILTER_HDR_TO_SDR) != 0u; }
 bool src_offset_enabled() { return (pc.flags & FLAG_SRC_OFFSET) != 0u; }
+bool src_rect_offset_enabled() { return (pc.flags & FLAG_SRC_RECT_OFFSET) != 0u; }
 bool luma_key_enabled() { return (pc.filter_flags & FILTER_LUMA_KEY) != 0u; }
 
 float luma_key_alpha(float y) {
@@ -86,18 +90,26 @@ void store_vu_alpha(ivec2 dst, vec2 vu, float alpha) {
 }
 
 uint src_local_x(uint x) {
+    if (src_rect_offset_enabled())
+        return x + pc.src_offset_x;
     return src_offset_enabled() && pc.dst_x > 0 ? x + uint(pc.dst_x) : x;
 }
 
 uint src_local_y(uint y) {
+    if (src_rect_offset_enabled())
+        return y + pc.src_offset_y;
     return src_offset_enabled() && pc.dst_y > 0 ? y + uint(pc.dst_y) : y;
 }
 
 uint src_local_uv_x(uint x) {
+    if (src_rect_offset_enabled())
+        return x + (pc.src_offset_x >> 1);
     return src_offset_enabled() && pc.dst_x > 0 ? x + (uint(pc.dst_x) >> 1) : x;
 }
 
 uint src_local_uv_y(uint y) {
+    if (src_rect_offset_enabled())
+        return y + (pc.src_offset_y >> 1);
     return src_offset_enabled() && pc.dst_y > 0 ? y + (uint(pc.dst_y) >> 1) : y;
 }
 

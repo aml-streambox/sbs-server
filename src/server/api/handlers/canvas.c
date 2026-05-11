@@ -220,6 +220,10 @@ int sbs_api_handle_canvas_update(sbs_api_server_t *server, sbs_api_client_t *cli
     if (!new_fps_den) {
         new_fps_den = 1;
     }
+    if (new_w == 0 || new_h == 0 || (new_w & 63u) != 0 || (new_h & 63u) != 0) {
+        *error = api_error(-32602, "Canvas width and height must be positive multiples of 64");
+        return SBS_ERR_INVAL;
+    }
 
     bundle = sbs_config_manager_build_bundle(server);
     if (!bundle) {

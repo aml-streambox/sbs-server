@@ -15,6 +15,8 @@
 #define DRM_FORMAT_NV21 0x3132564e
 #endif
 
+#define SBS_PREVIEW_DEFAULT_DOWNSCALE_FACTOR 4u
+
 #ifdef SBS_HAVE_GSTREAMER_PREVIEW
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
@@ -213,37 +215,33 @@ static const char *kind_name(sbs_preview_profile_kind_t kind)
     return kind == SBS_PREVIEW_PROFILE_KIND_FALLBACK ? "fallback" : "reuse";
 }
 
-static void compute_default_preview_size(uint32_t src_width,
-                                         uint32_t src_height,
-                                         uint32_t *out_width,
-                                         uint32_t *out_height)
+static bool preview_downscale_factor_allowed(uint32_t factor)
 {
-    uint32_t width = 1280;
-    uint32_t height = 720;
+    return factor == 1u || factor == 2u || factor == 4u || factor == 8u;
+}
 
-    if (src_width > 0 && src_height > 0) {
-        uint32_t long_edge = src_width > src_height ? src_width : src_height;
-        if (long_edge > 1280) {
-            width = (uint32_t)(((uint64_t)src_width * 1280u + long_edge / 2u) / long_edge);
-            height = (uint32_t)(((uint64_t)src_height * 1280u + long_edge / 2u) / long_edge);
-        } else {
-            width = src_width;
-            height = src_height;
-        }
-        width &= ~1u;
-        height &= ~1u;
-        if (width == 0) width = 2;
-        if (height == 0) height = 2;
+static uint32_t preview_downscale_factor_or_default(uint32_t factor)
+{
+    return preview_downscale_factor_allowed(factor)
+        ? factor : SBS_PREVIEW_DEFAULT_DOWNSCALE_FACTOR;
+}
 
-        if ((width & 63u) != 0 && width >= 64u) {
-            uint32_t aligned_width = width & ~63u;
-            uint32_t aligned_height = (uint32_t)(((uint64_t)aligned_width * src_height + src_width / 2u) / src_width);
-            aligned_height &= ~1u;
-            if (aligned_height == 0) aligned_height = 2;
-            width = aligned_width;
-            height = aligned_height;
-        }
-    }
+static void compute_preview_size(uint32_t src_width,
+                                 uint32_t src_height,
+                                 uint32_t downscale_factor,
+                                 uint32_t *out_width,
+                                 uint32_t *out_height)
+{
+    uint32_t factor = preview_downscale_factor_or_default(downscale_factor);
+    uint32_t width = src_width > 0 ? src_width : 1920u;
+    uint32_t height = src_height > 0 ? src_height : 1080u;
+
+    width /= factor;
+    height /= factor;
+    width &= ~1u;
+    height &= ~1u;
+    if (width == 0) width = 2;
+    if (height == 0) height = 2;
 
     if (out_width) *out_width = width;
     if (out_height) *out_height = height;
@@ -273,6 +271,7 @@ static sbs_preview_profile_t *profile_new(const char *id,
     profile->latency_class = g_strdup(latency_class);
     profile->width = width;
     profile->height = height;
+    profile->downscale_factor = 1u;
     profile->framerate = framerate;
     profile->hardware_decode_preferred = hardware_decode_preferred;
     profile->requires_additional_encode = requires_additional_encode;
@@ -330,8 +329,9 @@ sbs_preview_engine_t *sbs_preview_engine_new(void)
         sbs_preview_profile_t *webrtc_profile = profile_new(
             "preview-h264-webrtc", SBS_PREVIEW_PROFILE_KIND_FALLBACK,
             "webrtc", "h264", "rtp", "low",
-            1280, 720, 30, false, true, false, webrtc_requestable,
+            480, 270, 30, false, true, false, webrtc_requestable,
             "webrtc://signaling");
+        webrtc_profile->downscale_factor = SBS_PREVIEW_DEFAULT_DOWNSCALE_FACTOR;
         webrtc_profile->bitrate_kbps = 2500;
         g_hash_table_insert(engine->profiles, "preview-h264-webrtc", webrtc_profile);
     }
@@ -359,8 +359,6 @@ void sbs_preview_engine_set_source_format(sbs_preview_engine_t *engine,
                                             uint32_t fps,
                                             sbs_preview_color_mode_t color_mode)
 {
-    uint32_t old_default_w = 0;
-    uint32_t old_default_h = 0;
     uint32_t new_default_w = 0;
     uint32_t new_default_h = 0;
     uint32_t old_default_fps;
@@ -369,9 +367,6 @@ void sbs_preview_engine_set_source_format(sbs_preview_engine_t *engine,
     if (!engine)
         return;
     g_mutex_lock(&engine->lock);
-    compute_default_preview_size(engine->src_width, engine->src_height,
-                                 &old_default_w, &old_default_h);
-    compute_default_preview_size(width, height, &new_default_w, &new_default_h);
     old_default_fps = engine->src_fps && engine->src_fps < 30 ? engine->src_fps : 30;
     new_default_fps = fps && fps < 30 ? fps : 30;
 
@@ -392,19 +387,18 @@ void sbs_preview_engine_set_source_format(sbs_preview_engine_t *engine,
         sbs_preview_profile_t *profile = preview_engine_get_profile_unlocked(
             engine, "preview-h264-webrtc");
         if (profile) {
-            bool default_size = profile->width == 0 || profile->height == 0 ||
-                (profile->width == old_default_w && profile->height == old_default_h);
             bool default_fps = profile->framerate == 0 || profile->framerate == old_default_fps;
             bool changed = false;
 
+            profile->downscale_factor = preview_downscale_factor_or_default(profile->downscale_factor);
+            compute_preview_size(width, height, profile->downscale_factor,
+                                 &new_default_w, &new_default_h);
             profile->requestable = engine->webrtc_requestable;
             g_free(profile->codec);
             profile->codec = g_strdup("h264");
-            if (default_size) {
-                changed = changed || profile->width != new_default_w || profile->height != new_default_h;
-                profile->width = new_default_w;
-                profile->height = new_default_h;
-            }
+            changed = changed || profile->width != new_default_w || profile->height != new_default_h;
+            profile->width = new_default_w;
+            profile->height = new_default_h;
             if (default_fps) {
                 changed = changed || profile->framerate != new_default_fps;
                 profile->framerate = new_default_fps;
@@ -1819,14 +1813,16 @@ int sbs_preview_engine_add_webrtc_ice(sbs_preview_engine_t *engine,
 
 int sbs_preview_engine_update_profile_config(sbs_preview_engine_t *engine,
                                                const char *profile_id,
-                                               uint32_t width,
-                                               uint32_t height,
-                                              uint32_t framerate,
-                                              uint32_t bitrate_kbps)
+                                               uint32_t downscale_factor,
+                                               uint32_t framerate,
+                                               uint32_t bitrate_kbps)
 {
     sbs_preview_profile_t *profile;
+    bool changed = false;
 
     if (!engine || !profile_id)
+        return SBS_ERR_INVAL;
+    if (downscale_factor > 0 && !preview_downscale_factor_allowed(downscale_factor))
         return SBS_ERR_INVAL;
 
     g_mutex_lock(&engine->lock);
@@ -1836,24 +1832,34 @@ int sbs_preview_engine_update_profile_config(sbs_preview_engine_t *engine,
         return SBS_ERR_NOT_FOUND;
     }
 
-    if (width > 0)
+    if (downscale_factor > 0 && profile->requires_additional_encode) {
+        uint32_t width = 0;
+        uint32_t height = 0;
+        compute_preview_size(engine->src_width, engine->src_height,
+                             downscale_factor, &width, &height);
+        changed = changed || profile->downscale_factor != downscale_factor ||
+            profile->width != width || profile->height != height;
+        profile->downscale_factor = downscale_factor;
         profile->width = width;
-    if (height > 0)
         profile->height = height;
+    }
     if (framerate > 0) {
         if (profile->requires_additional_encode && framerate > 30) {
             LOG_I("preview profile %s capped at 30fps to protect 4K program output",
                   profile_id);
             framerate = 30;
         }
+        changed = changed || profile->framerate != framerate;
         profile->framerate = framerate;
     }
-    if (bitrate_kbps > 0)
+    if (bitrate_kbps > 0) {
+        changed = changed || profile->bitrate_kbps != bitrate_kbps;
         profile->bitrate_kbps = bitrate_kbps;
+    }
 
     /* If the profile is active, tear down and restart the runtime so the
      * new settings take effect on the next WebRTC session start. */
-    if (profile->active && profile->requires_additional_encode) {
+    if (changed && profile->active && profile->requires_additional_encode) {
         LOG_I("preview config updated for %s — tearing down runtime for new settings",
               profile_id);
         g_hash_table_remove(engine->runtimes, profile->id);
@@ -1862,9 +1868,9 @@ int sbs_preview_engine_update_profile_config(sbs_preview_engine_t *engine,
         profile->viewer_count = 0;
     }
 
-    LOG_I("preview profile %s config: %ux%u@%u bitrate=%u kbps",
+    LOG_I("preview profile %s config: %ux%u@%u downscale=%u bitrate=%u kbps",
           profile_id, profile->width, profile->height,
-          profile->framerate, profile->bitrate_kbps);
+          profile->framerate, profile->downscale_factor, profile->bitrate_kbps);
     g_mutex_unlock(&engine->lock);
     return SBS_OK;
 }
@@ -1915,6 +1921,7 @@ cJSON *sbs_preview_serialize_profile(const sbs_preview_profile_t *profile)
     cJSON_AddNumberToObject(resolution, "width", profile->width);
     cJSON_AddNumberToObject(resolution, "height", profile->height);
     cJSON_AddItemToObject(obj, "resolution", resolution);
+    cJSON_AddNumberToObject(obj, "downscale_factor", profile->downscale_factor);
     cJSON_AddNumberToObject(obj, "framerate", profile->framerate);
     cJSON_AddBoolToObject(obj, "hardware_decode_preferred", profile->hardware_decode_preferred);
     cJSON_AddBoolToObject(obj, "requires_additional_encode", profile->requires_additional_encode);

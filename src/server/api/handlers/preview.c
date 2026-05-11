@@ -286,6 +286,7 @@ int sbs_api_handle_preview_get_encoder_config(sbs_api_server_t *server,
     cJSON_AddStringToObject(*result, "profile_id", profile->id);
     cJSON_AddNumberToObject(*result, "width", profile->width);
     cJSON_AddNumberToObject(*result, "height", profile->height);
+    cJSON_AddNumberToObject(*result, "downscale_factor", profile->downscale_factor);
     cJSON_AddNumberToObject(*result, "framerate", profile->framerate);
     cJSON_AddNumberToObject(*result, "bitrate_kbps", profile->bitrate_kbps);
     cJSON_AddStringToObject(*result, "codec", profile->codec ? profile->codec : "h264");
@@ -300,20 +301,23 @@ int sbs_api_handle_preview_update_encoder_config(sbs_api_server_t *server,
                                                   cJSON **error)
 {
     const char *profile_id = json_str(params, "profile_id");
-    cJSON *width_j, *height_j, *fps_j, *bitrate_j;
-    uint32_t width = 0, height = 0, framerate = 0, bitrate_kbps = 0;
+    cJSON *width_j, *height_j, *downscale_j, *fps_j, *bitrate_j;
+    uint32_t downscale_factor = 0, framerate = 0, bitrate_kbps = 0;
     int rc;
     (void)client;
 
     if (!profile_id) profile_id = "preview-h264-webrtc";
 
     width_j = cJSON_GetObjectItemCaseSensitive(params, "width");
-    if (width_j && cJSON_IsNumber(width_j))
-        width = (uint32_t)width_j->valuedouble;
-
     height_j = cJSON_GetObjectItemCaseSensitive(params, "height");
-    if (height_j && cJSON_IsNumber(height_j))
-        height = (uint32_t)height_j->valuedouble;
+    if (width_j || height_j) {
+        *error = api_error(-32602, "Preview resolution is derived from canvas; use downscale_factor 1, 2, 4, or 8");
+        return SBS_ERR_INVAL;
+    }
+
+    downscale_j = cJSON_GetObjectItemCaseSensitive(params, "downscale_factor");
+    if (downscale_j && cJSON_IsNumber(downscale_j))
+        downscale_factor = (uint32_t)downscale_j->valuedouble;
 
     fps_j = cJSON_GetObjectItemCaseSensitive(params, "framerate");
     if (fps_j && cJSON_IsNumber(fps_j))
@@ -324,7 +328,7 @@ int sbs_api_handle_preview_update_encoder_config(sbs_api_server_t *server,
         bitrate_kbps = (uint32_t)bitrate_j->valuedouble;
 
     rc = sbs_preview_engine_update_profile_config(server->preview, profile_id,
-                                                   width, height, framerate, bitrate_kbps);
+                                                    downscale_factor, framerate, bitrate_kbps);
     if (rc != SBS_OK) {
         *error = api_error(-32011, "Failed to update preview encoder config");
         return rc;

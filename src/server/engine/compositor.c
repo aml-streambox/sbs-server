@@ -48,8 +48,8 @@ static const VkApplicationInfo app_info = {
 #define SBS_NATIVE_TOTAL_ENTRY_COUNT (SBS_NATIVE_CANVAS_RING_SIZE * 2u)
 #define SBS_NATIVE_TIMING_QUERY_MARKS (SBS_NATIVE_TIMING_MAX_LAYERS + 4u)
 #define SBS_NATIVE_YUV_PC_SIZE 96u
-#define SBS_NATIVE_P010_DIRECT_PC_SIZE 120u
-#define SBS_NATIVE_DOWNSCALE_PC_SIZE 16u
+#define SBS_NATIVE_P010_DIRECT_PC_SIZE 128u
+#define SBS_NATIVE_DOWNSCALE_PC_SIZE 20u
 #define SBS_NATIVE_OCCLUSION_MAX_RECTS 32u
 #ifndef SBS_DRM_FORMAT_AMLY
 #define SBS_DRM_FORMAT_AMLY 0x594c4d41u
@@ -7605,6 +7605,8 @@ typedef struct sbs_native_p010_direct_pc {
     float    hdr_hue_cos;
     float    hdr_hue_sin;
     float    filter_params[4];
+    uint32_t src_offset_x;
+    uint32_t src_offset_y;
 } sbs_native_p010_direct_pc_t;
 
 typedef struct sbs_native_downscale_pc {
@@ -7612,6 +7614,7 @@ typedef struct sbs_native_downscale_pc {
     uint32_t src_h;
     uint32_t dst_w;
     uint32_t dst_h;
+    uint32_t factor;
 } sbs_native_downscale_pc_t;
 
 _Static_assert(sizeof(sbs_native_yuv_pc_t) == SBS_NATIVE_YUV_PC_SIZE,
@@ -8342,6 +8345,8 @@ static bool native_build_layer_visible_rects(sbs_compositor_t *comp,
                                              sbs_native_rect_t *rects,
                                              uint32_t *rect_count)
 {
+    sbs_native_rect_t original_rect = base_rect;
+
     if (!rects || !rect_count || base_index >= count)
         return false;
     if (!native_rect_clip_canvas(&base_rect, canvas_width, canvas_height))
@@ -8362,7 +8367,9 @@ static bool native_build_layer_visible_rects(sbs_compositor_t *comp,
             return true;
     }
 
-    return *rect_count != 1 || rects[0].x != base_rect.x ||
+    return *rect_count != 1 || rects[0].x != original_rect.x ||
+        rects[0].y != original_rect.y || rects[0].x1 != original_rect.x1 ||
+        rects[0].y1 != original_rect.y1 || rects[0].x != base_rect.x ||
         rects[0].y != base_rect.y || rects[0].x1 != base_rect.x1 ||
         rects[0].y1 != base_rect.y1;
 }
@@ -8517,11 +8524,12 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                     canvas_width, canvas_height, ref_items, ref_count,
                     visible_rects, &visible_rect_count);
             }
-            if (!split_full_canvas_direct && item_base_direct &&
-                entry->color_mode == SBS_EXPORT_COLOR_SDR &&
-                tex->drm_format == SBS_DRM_FORMAT_AMLY &&
-                (direct_pipeline == comp->native_amly_to_nv21_pipeline ||
-                 direct_pipeline == comp->native_amly_to_nv21_src_pipeline) &&
+            if (!split_full_canvas_direct && entry->color_mode == SBS_EXPORT_COLOR_SDR &&
+                ((item_base_direct && tex->drm_format == SBS_DRM_FORMAT_AMLY &&
+                  (direct_pipeline == comp->native_amly_to_nv21_pipeline ||
+                   direct_pipeline == comp->native_amly_to_nv21_src_pipeline)) ||
+                 tex->drm_format == DRM_FORMAT_NV12 ||
+                 tex->drm_format == DRM_FORMAT_NV21) &&
                 layer_opacity >= 0.999f &&
                 dst_x < (int32_t)canvas_width && dst_y < (int32_t)canvas_height &&
                 dst_x + (int32_t)dst_w > 0 && dst_y + (int32_t)dst_h > 0 &&
@@ -8647,7 +8655,8 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                                   (block_h + wg_y - 1u) / wg_y, 1);
                 }
             } else if (split_direct_layer) {
-                bool use_source_split = comp->native_amly_to_nv21_src_pipeline != VK_NULL_HANDLE;
+                bool use_source_split = tex->drm_format == SBS_DRM_FORMAT_AMLY &&
+                    comp->native_amly_to_nv21_src_pipeline != VK_NULL_HANDLE;
                 if (use_source_split)
                     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
                                       comp->native_amly_to_nv21_src_pipeline);
@@ -8703,8 +8712,8 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                     sbs_native_p010_direct_pc_t sub_pc = pc;
                     uint32_t block_w;
                     uint32_t block_h;
-                    uint32_t wg_x = 16u;
-                    uint32_t wg_y = 16u;
+                    uint32_t wg_x = tex->drm_format == SBS_DRM_FORMAT_AMLY ? 16u : 8u;
+                    uint32_t wg_y = tex->drm_format == SBS_DRM_FORMAT_AMLY ? 16u : 8u;
 
                     if (vr.x1 <= vr.x || vr.y1 <= vr.y ||
                         vr.x < dst_x || vr.y < dst_y)
@@ -8737,8 +8746,12 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                         sub_pc.dst_h = (uint32_t)(vr.y1 - vr.y);
                         sub_pc.flags |= SBS_NATIVE_P010_DIRECT_DST_IN_BOUNDS |
                             SBS_NATIVE_P010_DIRECT_SRC_RECT_OFFSET;
-                        sub_pc.y_stride = (uint32_t)(vr.x - dst_x);
-                        sub_pc.uv_stride = (uint32_t)(vr.y - dst_y);
+                        sub_pc.src_offset_x = (uint32_t)(vr.x - dst_x);
+                        sub_pc.src_offset_y = (uint32_t)(vr.y - dst_y);
+                        if (tex->drm_format == SBS_DRM_FORMAT_AMLY) {
+                            sub_pc.y_stride = sub_pc.src_offset_x;
+                            sub_pc.uv_stride = sub_pc.src_offset_y;
+                        }
                         block_w = (sub_pc.dst_w + 1u) / 2u;
                         block_h = (sub_pc.dst_h + 1u) / 2u;
                     }
@@ -8937,9 +8950,12 @@ static void native_record_encoder_copy(VkCommandBuffer cb,
         entry->encoder_size == 0)
         return;
 
+    uint32_t y_bpp = entry->color_mode == SBS_EXPORT_COLOR_HDR10 ? 2u : 1u;
+    uint32_t uv_bpp = entry->color_mode == SBS_EXPORT_COLOR_HDR10 ? 4u : 2u;
+
     VkBufferImageCopy y_copy = {
         .bufferOffset = entry->y.offset,
-        .bufferRowLength = entry->y.width,
+        .bufferRowLength = (uint32_t)(entry->y.stride / y_bpp),
         .bufferImageHeight = entry->y.height,
         .imageSubresource = {
             .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -8951,7 +8967,7 @@ static void native_record_encoder_copy(VkCommandBuffer cb,
     };
     VkBufferImageCopy uv_copy = {
         .bufferOffset = entry->uv.offset,
-        .bufferRowLength = entry->uv.width,
+        .bufferRowLength = (uint32_t)(entry->uv.stride / uv_bpp),
         .bufferImageHeight = entry->uv.height,
         .imageSubresource = {
             .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -9238,7 +9254,17 @@ static int sbs_compositor_submit_native_preview_from_entry(sbs_compositor_t *com
         .src_h = src_entry->y.height,
         .dst_w = dst_entry->y.width,
         .dst_h = dst_entry->y.height,
+        .factor = 1u,
     };
+    if (pc.dst_w > 0 && pc.dst_h > 0 &&
+        pc.src_w % pc.dst_w == 0 && pc.src_h % pc.dst_h == 0) {
+        uint32_t factor_x = pc.src_w / pc.dst_w;
+        uint32_t factor_y = pc.src_h / pc.dst_h;
+        if (factor_x == factor_y &&
+            (factor_x == 1u || factor_x == 2u || factor_x == 4u || factor_x == 8u)) {
+            pc.factor = factor_x;
+        }
+    }
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
                             comp->native_downscale_pipeline_layout, 0, 1,

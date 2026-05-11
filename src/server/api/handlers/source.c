@@ -78,7 +78,7 @@ static cJSON *create_source_kind_json(sbs_source_kind_t kind, bool include_field
     };
     static const char * const streambox_modes[] = { "hdmirx", "vdin0", "vdin1", "test", NULL };
     static const char * const streambox_formats[] = { "nv12", "p010", NULL };
-    static const char * const vfmcap_formats[] = { "raw", "nv12", "p010", NULL };
+    static const char * const vfmcap_formats[] = { "raw", NULL };
     static const char * const text_fonts[] = {
         "Liberation Sans", "Liberation Serif", "Liberation Mono", "Cantarell",
         "DejaVu Sans", "DejaVu Serif", "Noto Sans", "Noto Serif", NULL

@@ -365,14 +365,18 @@ typedef struct sbs_compositor {
     VkShaderModule          native_p010_direct_shader;
     VkShaderModule          native_p010_to_nv21_shader;
     VkShaderModule          native_yuv8_to_p010_shader;
+    VkShaderModule          native_amly_to_p010_shader;
     VkShaderModule          native_yuv8_to_nv21_shader;
     VkShaderModule          native_amly_to_nv21_shader;
+    VkShaderModule          native_amly_to_nv21_src_shader;
     VkPipelineLayout        native_p010_direct_pipeline_layout;
     VkPipeline              native_p010_direct_pipeline;
     VkPipeline              native_p010_to_nv21_pipeline;
     VkPipeline              native_yuv8_to_p010_pipeline;
+    VkPipeline              native_amly_to_p010_pipeline;
     VkPipeline              native_yuv8_to_nv21_pipeline;
     VkPipeline              native_amly_to_nv21_pipeline;
+    VkPipeline              native_amly_to_nv21_src_pipeline;
     VkDescriptorSetLayout   native_p010_direct_ds_layout;
     VkDescriptorPool        native_p010_direct_ds_pool;
     VkDescriptorSet         native_p010_direct_ds[SBS_NATIVE_CANVAS_RING_SIZE][SBS_NATIVE_LAYER_DESCRIPTOR_SETS];

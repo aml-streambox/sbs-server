@@ -1,6 +1,6 @@
 #version 450
 
-layout(local_size_x = 8, local_size_y = 8) in;
+layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(std430, set = 0, binding = 0) readonly buffer SrcAMLY {
     uint data[];
@@ -101,6 +101,8 @@ uint src_local_uv_y(uint y) {
 }
 
 float apply_basic_luma_filters(float y) {
+    if ((pc.filter_flags & (FILTER_BRIGHTNESS | FILTER_CONTRAST | FILTER_COLOR_CORRECTION)) == 0u)
+        return clamp(y, 0.0, 1.0);
     if ((pc.filter_flags & (FILTER_BRIGHTNESS | FILTER_COLOR_CORRECTION)) != 0u)
         y += pc.filter_params[1];
     if ((pc.filter_flags & (FILTER_CONTRAST | FILTER_COLOR_CORRECTION)) != 0u)
@@ -111,6 +113,8 @@ float apply_basic_luma_filters(float y) {
 }
 
 vec2 apply_basic_chroma_filters(vec2 vu) {
+    if ((pc.filter_flags & (FILTER_GRAYSCALE | FILTER_COLOR_CORRECTION)) == 0u)
+        return clamp(vu, 0.0, 1.0);
     if ((pc.filter_flags & FILTER_GRAYSCALE) != 0u) {
         float amount = clamp(pc.filter_params[0], 0.0, 1.0);
         vu = mix(vu, vec2(SDR_CHROMA_NEUTRAL), amount);
@@ -258,6 +262,54 @@ void main() {
     ivec2 dst_base = full_canvas
         ? ivec2(int(base.x), int(base.y))
         : ivec2(pc.dst_x + int(base.x), pc.dst_y + int(base.y));
+
+    if (!luma_key_enabled() && full_canvas && pc.opacity >= 0.999 &&
+        pc.dst_x <= 0 && pc.dst_y == 0 &&
+        pc.dst_x + int(pc.dst_w) >= int(pc.canvas_width) &&
+        pc.dst_h <= pc.canvas_height) {
+        if (base.y + 1u < pc.dst_h) {
+            uint local_x0 = uint(int(base.x) - pc.dst_x);
+            uint local_y0 = base.y;
+            uint local_x1 = local_x0 + 1u;
+            uint local_y1 = local_y0 + 1u;
+            uint src_x0 = scale_nearest(local_x0, pc.src_w, pc.y_scale_x);
+            uint src_x1 = scale_nearest(local_x1, pc.src_w, pc.y_scale_x);
+            uint src_y0 = scale_nearest(local_y0, pc.src_h, pc.y_scale_y);
+            uint src_y1 = scale_nearest(local_y1, pc.src_h, pc.y_scale_y);
+            uint y00, u0, y10, v0, y01, u1, y11, v1;
+            if (((src_x0 & 1u) == 0u) && src_x1 == src_x0 + 1u) {
+                uint pair_x = src_x0 >> 1;
+                decode_pair(src_y0 * pairs_per_row() + pair_x, y00, u0, y10, v0);
+                decode_pair(src_y1 * pairs_per_row() + pair_x, y01, u1, y11, v1);
+            } else {
+                y00 = read_y10_at(src_x0, src_y0);
+                y10 = read_y10_at(src_x1, src_y0);
+                y01 = read_y10_at(src_x0, src_y1);
+                y11 = read_y10_at(src_x1, src_y1);
+                uint src_uv_w = pairs_per_row();
+                uint local_uv_x = uint(int(base.x) + 1 - pc.dst_x) >> 1;
+                uint local_uv_y = (base.y + 1u) >> 1;
+                uint pair_x = scale_nearest(local_uv_x, src_uv_w, pc.uv_scale_x);
+                uint row0 = scale_nearest(local_uv_y * 2u, pc.src_h, pc.y_scale_y);
+                uint row1 = scale_nearest(local_uv_y * 2u + 1u, pc.src_h, pc.y_scale_y);
+                read_uv10_at(pair_x, row0, u0, v0);
+                read_uv10_at(pair_x, row1, u1, v1);
+            }
+
+            imageStore(y_img, dst_base, vec4(map_y10(y00, hdr_enabled), 0.0, 0.0, 1.0));
+            imageStore(y_img, dst_base + ivec2(1, 0), vec4(map_y10(y10, hdr_enabled), 0.0, 0.0, 1.0));
+            imageStore(y_img, dst_base + ivec2(0, 1), vec4(map_y10(y01, hdr_enabled), 0.0, 0.0, 1.0));
+            imageStore(y_img, dst_base + ivec2(1, 1), vec4(map_y10(y11, hdr_enabled), 0.0, 0.0, 1.0));
+
+            uint u_avg = (u0 + u1 + 1u) >> 1;
+            uint v_avg = (v0 + v1 + 1u) >> 1;
+            imageStore(uv_img, dst_base >> 1,
+                       vec4(map_vu10(u_avg, v_avg, hdr_enabled), 0.0, 1.0));
+            return;
+        }
+        if (base.y >= pc.dst_h)
+            return;
+    }
 
     if (!luma_key_enabled() && full_canvas && pc.opacity >= 0.999 &&
         pc.dst_x == 0 && pc.dst_y == 0 &&

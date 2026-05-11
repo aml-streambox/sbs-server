@@ -1539,17 +1539,10 @@ static bool source_worker_vfmcap_restart_now(source_state_t *state,
 
 static vfmcap_output_fmt_t vfmcap_output_fmt_from_string(const char *s)
 {
-    if (!s || strcmp(s, "auto") == 0) return VFMCAP_FMT_NV12;
-    if (strcmp(s, "nv12") == 0) return VFMCAP_FMT_NV12;
-    if (strcmp(s, "p010") == 0) return VFMCAP_FMT_P010;
+    if (!s || strcmp(s, "auto") == 0) return VFMCAP_FMT_RAW;
     if (strcmp(s, "raw") == 0 || strcmp(s, "amly") == 0) return VFMCAP_FMT_RAW;
-    if (s && (strcmp(s, "nv21") == 0 ||
-              strcmp(s, "nv12_afbc") == 0 ||
-              strcmp(s, "a2b10g10r10_afbc") == 0 ||
-              strcmp(s, "vyuy_10bit") == 0)) {
-        LOG_W("vfmcap output_format '%s' ignored; using linear NV12/P010 only", s);
-    }
-    return VFMCAP_FMT_NV12;
+    LOG_W("vfmcap output_format '%s' ignored; SBS compositor now owns raw AMLY conversion", s);
+    return VFMCAP_FMT_RAW;
 }
 
 static const char *vfmcap_output_fmt_name(vfmcap_output_fmt_t fmt)
@@ -2330,7 +2323,7 @@ int source_worker_run(sbs_worker_ctx_t *ctx)
         .dmabuf_available = false,
         .cpu_export_ring_idx = 0,
         .vfmcap_ctx      = NULL,
-        .vfmcap_output_format = VFMCAP_FMT_NV12,
+        .vfmcap_output_format = VFMCAP_FMT_RAW,
         .vfmcap_frame_timer = 0,
         .vfmcap_event_timer = 0,
         .vfmcap_stats_timer = 0,

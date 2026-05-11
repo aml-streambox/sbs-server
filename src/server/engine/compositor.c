@@ -4312,6 +4312,20 @@ static int create_native_p010_direct_pipeline(sbs_compositor_t *comp,
         LOG_W("native YUV8->P010 direct shader unavailable");
     }
 
+    snprintf(path, sizeof(path), "%s/native_amly_to_p010.comp.spv", shader_dir);
+    comp->native_amly_to_p010_shader = load_shader(comp, path);
+    if (comp->native_amly_to_p010_shader != VK_NULL_HANDLE) {
+        cpci.stage.module = comp->native_amly_to_p010_shader;
+        res = vkCreateComputePipelines(comp->device, comp->pipeline_cache, 1, &cpci,
+                                        NULL, &comp->native_amly_to_p010_pipeline);
+        if (res != VK_SUCCESS) {
+            LOG_W("native AMLY->P010 direct pipeline create failed: %d", res);
+            comp->native_amly_to_p010_pipeline = VK_NULL_HANDLE;
+        }
+    } else {
+        LOG_W("native AMLY->P010 direct shader unavailable");
+    }
+
     snprintf(path, sizeof(path), "%s/native_yuv8_to_nv21.comp.spv", shader_dir);
     comp->native_yuv8_to_nv21_shader = load_shader(comp, path);
     if (comp->native_yuv8_to_nv21_shader != VK_NULL_HANDLE) {
@@ -4338,6 +4352,20 @@ static int create_native_p010_direct_pipeline(sbs_compositor_t *comp,
         }
     } else {
         LOG_W("native AMLY->NV21 direct shader unavailable");
+    }
+
+    snprintf(path, sizeof(path), "%s/native_amly_to_nv21_src.comp.spv", shader_dir);
+    comp->native_amly_to_nv21_src_shader = load_shader(comp, path);
+    if (comp->native_amly_to_nv21_src_shader != VK_NULL_HANDLE) {
+        cpci.stage.module = comp->native_amly_to_nv21_src_shader;
+        res = vkCreateComputePipelines(comp->device, comp->pipeline_cache, 1, &cpci,
+                                        NULL, &comp->native_amly_to_nv21_src_pipeline);
+        if (res != VK_SUCCESS) {
+            LOG_W("native AMLY->NV21 source-driven pipeline create failed: %d", res);
+            comp->native_amly_to_nv21_src_pipeline = VK_NULL_HANDLE;
+        }
+    } else {
+        LOG_W("native AMLY->NV21 source-driven shader unavailable");
     }
 
     uint32_t native_layer_set_count = SBS_NATIVE_CANVAS_RING_SIZE *
@@ -4385,12 +4413,14 @@ static int create_native_p010_direct_pipeline(sbs_compositor_t *comp,
         return -1;
     }
 
-    LOG_I("native direct YUV pipelines created (p010=%d p010_nv21=%d yuv8_p010=%d yuv8_nv21=%d amly_nv21=%d)",
+    LOG_I("native direct YUV pipelines created (p010=%d p010_nv21=%d yuv8_p010=%d amly_p010=%d yuv8_nv21=%d amly_nv21=%d amly_src=%d)",
           comp->native_p010_direct_pipeline != VK_NULL_HANDLE ? 1 : 0,
           comp->native_p010_to_nv21_pipeline != VK_NULL_HANDLE ? 1 : 0,
           comp->native_yuv8_to_p010_pipeline != VK_NULL_HANDLE ? 1 : 0,
+          comp->native_amly_to_p010_pipeline != VK_NULL_HANDLE ? 1 : 0,
           comp->native_yuv8_to_nv21_pipeline != VK_NULL_HANDLE ? 1 : 0,
-          comp->native_amly_to_nv21_pipeline != VK_NULL_HANDLE ? 1 : 0);
+          comp->native_amly_to_nv21_pipeline != VK_NULL_HANDLE ? 1 : 0,
+          comp->native_amly_to_nv21_src_pipeline != VK_NULL_HANDLE ? 1 : 0);
     return 0;
 }
 
@@ -7066,7 +7096,6 @@ static bool native_canvas_can_direct_upload_format(sbs_compositor_t *comp,
     if (!comp || !comp->native_canvas.initialized ||
         comp->native_p010_direct_pipeline_layout == VK_NULL_HANDLE)
         return false;
-
     sbs_export_color_mode_t mode = comp->native_canvas.entries[0].color_mode;
     if (mode == SBS_EXPORT_COLOR_HDR10) {
         if (drm_format == DRM_FORMAT_P010)
@@ -7074,6 +7103,8 @@ static bool native_canvas_can_direct_upload_format(sbs_compositor_t *comp,
         if (drm_format == DRM_FORMAT_NV12 || drm_format == DRM_FORMAT_NV21)
             return comp->native_yuv8_to_p010_pipeline != VK_NULL_HANDLE &&
                 !ycbcr_direct_import_enabled();
+        if (drm_format == SBS_DRM_FORMAT_AMLY)
+            return comp->native_amly_to_p010_pipeline != VK_NULL_HANDLE;
     } else {
         if (drm_format == DRM_FORMAT_P010)
             return comp->native_p010_to_nv21_pipeline != VK_NULL_HANDLE;
@@ -7625,12 +7656,13 @@ static bool native_source_can_direct_yuv(const sbs_compositor_t *comp,
         return false;
     if (!native_item_filters_direct_yuv_compatible(item, entry->color_mode))
         return false;
-
     if (entry->color_mode == SBS_EXPORT_COLOR_HDR10) {
         if (tex->drm_format == DRM_FORMAT_P010)
             return comp->native_p010_direct_pipeline != VK_NULL_HANDLE;
         if (tex->drm_format == DRM_FORMAT_NV12 || tex->drm_format == DRM_FORMAT_NV21)
             return comp->native_yuv8_to_p010_pipeline != VK_NULL_HANDLE;
+        if (tex->drm_format == SBS_DRM_FORMAT_AMLY)
+            return comp->native_amly_to_p010_pipeline != VK_NULL_HANDLE;
     } else {
         if (tex->drm_format == DRM_FORMAT_P010)
             return comp->native_p010_to_nv21_pipeline != VK_NULL_HANDLE;
@@ -8298,8 +8330,10 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
     bool have_direct_pipeline = (comp->native_p010_direct_pipeline != VK_NULL_HANDLE ||
         comp->native_p010_to_nv21_pipeline != VK_NULL_HANDLE ||
         comp->native_yuv8_to_p010_pipeline != VK_NULL_HANDLE ||
+        comp->native_amly_to_p010_pipeline != VK_NULL_HANDLE ||
         comp->native_yuv8_to_nv21_pipeline != VK_NULL_HANDLE ||
-        comp->native_amly_to_nv21_pipeline != VK_NULL_HANDLE) &&
+        comp->native_amly_to_nv21_pipeline != VK_NULL_HANDLE ||
+        comp->native_amly_to_nv21_src_pipeline != VK_NULL_HANDLE) &&
         p010_direct_sets != NULL &&
         comp->native_p010_direct_pipeline_layout != VK_NULL_HANDLE;
 
@@ -8370,9 +8404,12 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                 dst_y + (int32_t)dst_h <= (int32_t)canvas_height;
             VkPipeline direct_pipeline = VK_NULL_HANDLE;
             if (entry->color_mode == SBS_EXPORT_COLOR_HDR10) {
-                direct_pipeline = tex->drm_format == DRM_FORMAT_P010
-                    ? comp->native_p010_direct_pipeline
-                    : comp->native_yuv8_to_p010_pipeline;
+                if (tex->drm_format == DRM_FORMAT_P010)
+                    direct_pipeline = comp->native_p010_direct_pipeline;
+                else if (tex->drm_format == SBS_DRM_FORMAT_AMLY)
+                    direct_pipeline = comp->native_amly_to_p010_pipeline;
+                else
+                    direct_pipeline = comp->native_yuv8_to_p010_pipeline;
             } else {
                 if (tex->drm_format == DRM_FORMAT_P010)
                     direct_pipeline = comp->native_p010_to_nv21_pipeline;
@@ -8385,10 +8422,25 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
             if (direct_pipeline == VK_NULL_HANDLE)
                 continue;
 
+            bool source_driven_amly = false;
+            if (entry->color_mode == SBS_EXPORT_COLOR_SDR &&
+                tex->drm_format == SBS_DRM_FORMAT_AMLY &&
+                direct_pipeline == comp->native_amly_to_nv21_pipeline &&
+                comp->native_amly_to_nv21_src_pipeline != VK_NULL_HANDLE &&
+                item_full_canvas_direct && layer_opacity >= 0.999f &&
+                (item->filter_flags & ~SBS_COMP_FILTER_HDR_TO_SDR_LUT) == 0 &&
+                dst_x <= 0 && dst_y == 0 &&
+                dst_x + (int32_t)dst_w >= (int32_t)canvas_width &&
+                dst_h <= canvas_height) {
+                direct_pipeline = comp->native_amly_to_nv21_src_pipeline;
+                source_driven_amly = true;
+            }
+
             if (item_full_canvas_direct && layer_opacity >= 0.999f &&
                 dst_x <= 0 && dst_y <= 0 &&
                 dst_x + (int32_t)dst_w >= (int32_t)canvas_width &&
-                dst_y + (int32_t)dst_h >= (int32_t)canvas_height) {
+                dst_y + (int32_t)dst_h >= (int32_t)canvas_height &&
+                !source_driven_amly) {
                 split_full_canvas_direct = native_build_base_visible_rects(
                     comp, entry, items, count, i, opacity_scale, scale_x, scale_y,
                     canvas_width, canvas_height, ref_items, ref_count,
@@ -8462,6 +8514,18 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                 .hdr_hue_sin = hdr_to_sdr_filter ? sinf(hdr_hue_rad) : item->filter_params[7],
             };
             memcpy(pc.filter_params, item->filter_params, sizeof(pc.filter_params));
+            if (source_driven_amly) {
+                int32_t local_x0 = -dst_x;
+                int32_t local_x1 = (int32_t)canvas_width - dst_x;
+                if (local_x0 < 0) local_x0 = 0;
+                if (local_x1 > (int32_t)dst_w) local_x1 = (int32_t)dst_w;
+                uint32_t src_x0 = (uint32_t)floorf((float)local_x0 * pc.y_scale_x);
+                uint32_t src_x1 = (uint32_t)ceilf((float)local_x1 * pc.y_scale_x) + 1u;
+                if (src_x1 > tex->width) src_x1 = tex->width;
+                pc.uv_stride = (src_x0 >> 1);
+                pc.uv_offset = src_x1 > (pc.uv_stride << 1)
+                    ? (((src_x1 + 1u) >> 1) - pc.uv_stride) : 0u;
+            }
 
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
                               direct_pipeline);
@@ -8476,6 +8540,8 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                     sbs_native_rect_t vr = visible_rects[r];
                     uint32_t block_w;
                     uint32_t block_h;
+                    uint32_t wg_x;
+                    uint32_t wg_y;
                     if (vr.x1 <= vr.x || vr.y1 <= vr.y)
                         continue;
                     pc.dst_x = vr.x;
@@ -8483,19 +8549,35 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                     pc.dst_w = (uint32_t)(vr.x1 - vr.x);
                     pc.dst_h = (uint32_t)(vr.y1 - vr.y);
                     vkCmdPushConstants(cb, comp->native_p010_direct_pipeline_layout,
-                                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+                                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
                     block_w = (pc.dst_w + 1u) / 2u;
                     block_h = (pc.dst_h + 1u) / 2u;
-                    vkCmdDispatch(cb, (block_w + 7u) / 8u, (block_h + 7u) / 8u, 1);
+                    wg_x = direct_pipeline == comp->native_amly_to_nv21_pipeline ? 16u : 8u;
+                    wg_y = direct_pipeline == comp->native_amly_to_nv21_pipeline ? 16u : 8u;
+                    vkCmdDispatch(cb, (block_w + wg_x - 1u) / wg_x,
+                                  (block_h + wg_y - 1u) / wg_y, 1);
                 }
             } else {
                 uint32_t block_w = (pc.dst_w + 1u) / 2u;
                 uint32_t block_h = (pc.dst_h + 1u) / 2u;
-                if (item_full_canvas_direct) {
+                uint32_t wg_x = direct_pipeline == comp->native_amly_to_nv21_pipeline ? 16u : 8u;
+                uint32_t wg_y = direct_pipeline == comp->native_amly_to_nv21_pipeline ? 16u : 8u;
+                if (source_driven_amly) {
+                    block_w = pc.uv_offset;
+                    block_h = pc.src_h;
+                    wg_x = 16u;
+                    wg_y = 8u;
+                } else if (item_full_canvas_direct) {
                     block_w = (canvas_width + 1u) / 2u;
                     block_h = (canvas_height + 1u) / 2u;
+                    if (tex->drm_format == SBS_DRM_FORMAT_AMLY &&
+                        pc.dst_x <= 0 && pc.dst_y == 0 &&
+                        pc.dst_x + (int32_t)pc.dst_w >= (int32_t)canvas_width &&
+                        pc.dst_h < canvas_height)
+                        block_h = (pc.dst_h + 1u) / 2u;
                 }
-                vkCmdDispatch(cb, (block_w + 7u) / 8u, (block_h + 7u) / 8u, 1);
+                vkCmdDispatch(cb, (block_w + wg_x - 1u) / wg_x,
+                              (block_h + wg_y - 1u) / wg_y, 1);
             }
             native_timing_record_layer_end(comp, cb, timing, item, tex,
                                             split_full_canvas_direct ? canvas_width : pc.dst_w,
@@ -10072,10 +10154,14 @@ void sbs_compositor_destroy(sbs_compositor_t *comp)
         vkDestroyPipeline(comp->device, comp->native_p010_to_nv21_pipeline, NULL);
     if (comp->native_yuv8_to_p010_pipeline)
         vkDestroyPipeline(comp->device, comp->native_yuv8_to_p010_pipeline, NULL);
+    if (comp->native_amly_to_p010_pipeline)
+        vkDestroyPipeline(comp->device, comp->native_amly_to_p010_pipeline, NULL);
     if (comp->native_yuv8_to_nv21_pipeline)
         vkDestroyPipeline(comp->device, comp->native_yuv8_to_nv21_pipeline, NULL);
     if (comp->native_amly_to_nv21_pipeline)
         vkDestroyPipeline(comp->device, comp->native_amly_to_nv21_pipeline, NULL);
+    if (comp->native_amly_to_nv21_src_pipeline)
+        vkDestroyPipeline(comp->device, comp->native_amly_to_nv21_src_pipeline, NULL);
     if (comp->native_p010_direct_pipeline_layout)
         vkDestroyPipelineLayout(comp->device, comp->native_p010_direct_pipeline_layout, NULL);
     if (comp->native_p010_direct_ds_pool)
@@ -10088,10 +10174,14 @@ void sbs_compositor_destroy(sbs_compositor_t *comp)
         vkDestroyShaderModule(comp->device, comp->native_p010_to_nv21_shader, NULL);
     if (comp->native_yuv8_to_p010_shader)
         vkDestroyShaderModule(comp->device, comp->native_yuv8_to_p010_shader, NULL);
+    if (comp->native_amly_to_p010_shader)
+        vkDestroyShaderModule(comp->device, comp->native_amly_to_p010_shader, NULL);
     if (comp->native_yuv8_to_nv21_shader)
         vkDestroyShaderModule(comp->device, comp->native_yuv8_to_nv21_shader, NULL);
     if (comp->native_amly_to_nv21_shader)
         vkDestroyShaderModule(comp->device, comp->native_amly_to_nv21_shader, NULL);
+    if (comp->native_amly_to_nv21_src_shader)
+        vkDestroyShaderModule(comp->device, comp->native_amly_to_nv21_src_shader, NULL);
 
     if (comp->native_downscale_sdr_pipeline)
         vkDestroyPipeline(comp->device, comp->native_downscale_sdr_pipeline, NULL);

@@ -55,7 +55,8 @@ static void source_config_rate(sbs_source_state_t *source, const char *key,
 
 static const char *canvas_vfmcap_output_format(const sbs_canvas_state_t *canvas)
 {
-    return canvas && canvas->color_mode == SBS_SCENE_COLOR_MODE_HDR10 ? "p010" : "raw";
+    (void)canvas;
+    return "raw";
 }
 
 static bool graph_has_enabled_vfmcap(const sbs_scene_graph_t *graph,

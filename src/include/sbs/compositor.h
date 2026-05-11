@@ -366,6 +366,7 @@ typedef struct sbs_compositor {
     VkShaderModule          native_p010_to_nv21_shader;
     VkShaderModule          native_yuv8_to_p010_shader;
     VkShaderModule          native_amly_to_p010_shader;
+    VkShaderModule          native_amly_to_p010_src_shader;
     VkShaderModule          native_yuv8_to_nv21_shader;
     VkShaderModule          native_amly_to_nv21_shader;
     VkShaderModule          native_amly_to_nv21_src_shader;
@@ -374,6 +375,7 @@ typedef struct sbs_compositor {
     VkPipeline              native_p010_to_nv21_pipeline;
     VkPipeline              native_yuv8_to_p010_pipeline;
     VkPipeline              native_amly_to_p010_pipeline;
+    VkPipeline              native_amly_to_p010_src_pipeline;
     VkPipeline              native_yuv8_to_nv21_pipeline;
     VkPipeline              native_amly_to_nv21_pipeline;
     VkPipeline              native_amly_to_nv21_src_pipeline;

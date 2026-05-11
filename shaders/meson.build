@@ -17,6 +17,7 @@ shader_spv_files = [
     'native_p010_to_nv21.comp.spv',
     'native_yuv8_to_p010.comp.spv',
     'native_amly_to_p010.comp.spv',
+    'native_amly_to_p010_src.comp.spv',
     'native_yuv8_to_nv21.comp.spv',
     'native_amly_to_nv21.comp.spv',
     'native_amly_to_nv21_src.comp.spv',
@@ -140,6 +141,14 @@ if glslang.found() and get_option('shader_compile')
     custom_target('native_amly_to_p010.comp.spv',
         input  : 'native_amly_to_p010.comp',
         output : 'native_amly_to_p010.comp.spv',
+        command : [glslang, '-V', '@INPUT@', '-o', '@OUTPUT@'],
+        install : true,
+        install_dir : get_option('datadir') / 'sbs' / 'shaders',
+    )
+
+    custom_target('native_amly_to_p010_src.comp.spv',
+        input  : 'native_amly_to_p010_src.comp',
+        output : 'native_amly_to_p010_src.comp.spv',
         command : [glslang, '-V', '@INPUT@', '-o', '@OUTPUT@'],
         install : true,
         install_dir : get_option('datadir') / 'sbs' / 'shaders',

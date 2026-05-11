@@ -423,6 +423,39 @@ static void drain_eventfd(int fd)
         ;
 }
 
+static int64_t timespec_diff_ns(const struct timespec *future,
+                                const struct timespec *past)
+{
+    return (future->tv_sec - past->tv_sec) * 1000000000LL +
+        (future->tv_nsec - past->tv_nsec);
+}
+
+static void timespec_add_ns(struct timespec *ts, int64_t ns)
+{
+    if (!ts)
+        return;
+    ts->tv_nsec += ns;
+    while (ts->tv_nsec >= 1000000000L) {
+        ts->tv_nsec -= 1000000000L;
+        ts->tv_sec++;
+    }
+    while (ts->tv_nsec < 0) {
+        ts->tv_nsec += 1000000000L;
+        ts->tv_sec--;
+    }
+}
+
+static void reset_render_deadline(sbs_compositor_thread_t *ct,
+                                  struct timespec *next_deadline)
+{
+    if (!next_deadline)
+        return;
+    clock_gettime(CLOCK_MONOTONIC, next_deadline);
+    if (ct)
+        ct->last_loop_start_ns = next_deadline->tv_sec * 1000000000LL +
+            next_deadline->tv_nsec;
+}
+
 static bool native_canvas_repeat_late_frames_enabled(void)
 {
     const char *env = getenv("SBS_NATIVE_CANVAS_REPEAT_LATE_FRAMES");
@@ -578,6 +611,7 @@ static void *compositor_thread_func(void *arg)
                 ct->scene_state.background_rgba[2] = cmd->b;
                 ct->scene_state.background_rgba[3] = cmd->a;
                 ct->scene_dirty = true;
+                reset_render_deadline(ct, &next_deadline);
             }
             if (cmd->type == SBS_COMP_CMD_SET_SCENE) {
                 int64_t previous_transition_start_us = ct->scene_state.transition_start_time_us;
@@ -594,6 +628,7 @@ static void *compositor_thread_func(void *arg)
                 }
                 ct->scene_dirty = true;
                 update_pipeline_mode(ct, &ct->scene_state);
+                reset_render_deadline(ct, &next_deadline);
                 if (ct->scene_state.active_item_count > 0) {
                     const sbs_comp_scene_item_t *item = &ct->scene_state.active_items[0];
                     LOG_I("comp-thread scene applied item=%s flags=0x%x tint=(%.3f,%.3f,%.3f)",
@@ -612,6 +647,7 @@ static void *compositor_thread_func(void *arg)
                           cmd->preview_frame_interval);
                 }
                 ct->scene_dirty = true;
+                reset_render_deadline(ct, &next_deadline);
             }
             free(cmd);
         }
@@ -928,16 +964,11 @@ retire_done:
         /* Deadline-based sleep: advance next_deadline by one frame interval
          * and sleep only the remaining time. This ensures we maintain the
          * target framerate regardless of how long the render took. */
-        next_deadline.tv_nsec += frame_interval_ns;
-        while (next_deadline.tv_nsec >= 1000000000L) {
-            next_deadline.tv_nsec -= 1000000000L;
-            next_deadline.tv_sec++;
-        }
+        timespec_add_ns(&next_deadline, frame_interval_ns);
 
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        int64_t remain_ns = (next_deadline.tv_sec - now.tv_sec) * 1000000000LL
-                          + (next_deadline.tv_nsec - now.tv_nsec);
+        int64_t remain_ns = timespec_diff_ns(&next_deadline, &now);
         if (remain_ns > 1000000LL) {
             /* Sleep remaining time (min 1ms to avoid busy spin from rounding) */
             usleep((useconds_t)(remain_ns / 1000));
@@ -953,19 +984,19 @@ retire_done:
                     LOG_I("native canvas late repeat: published=%u behind=%.2fms",
                           repeated, (double)(-remain_ns) / 1000000.0);
                 }
-                for (uint32_t i = 0; i < repeated; i++) {
-                    next_deadline.tv_nsec += frame_interval_ns;
-                    while (next_deadline.tv_nsec >= 1000000000L) {
-                        next_deadline.tv_nsec -= 1000000000L;
-                        next_deadline.tv_sec++;
-                    }
-                }
+                for (uint32_t i = 0; i < repeated; i++)
+                    timespec_add_ns(&next_deadline, frame_interval_ns);
             }
 
-            if (repeated == 0) {
-                /* We're more than a full frame behind and cannot publish a
-                 * repeat frame. Reset deadline to avoid a burst of renders. */
-                clock_gettime(CLOCK_MONOTONIC, &next_deadline);
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            remain_ns = timespec_diff_ns(&next_deadline, &now);
+            if (remain_ns < -frame_interval_ns) {
+                /* A slow previous scene/transform can leave next_deadline far
+                 * in the past. Repeat publication is deliberately capped, so
+                 * resync once the cap has been used instead of letting old
+                 * lateness poison future renderer cadence until restart. */
+                reset_render_deadline(ct, &next_deadline);
+                remain_ns = 0;
             }
         }
         /* else: we're late but within one frame — skip sleep, render immediately */

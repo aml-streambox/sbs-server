@@ -212,15 +212,19 @@ int sbs_api_handle_canvas_update(sbs_api_server_t *server, sbs_api_client_t *cli
     uint32_t new_h = (uint32_t)json_num(canvas_obj, "height", graph->canvas.height);
     uint32_t new_fps_num = (uint32_t)json_num(canvas_obj, "fps_num", graph->canvas.fps_num);
     uint32_t new_fps_den = (uint32_t)json_num(canvas_obj, "fps_den", graph->canvas.fps_den);
+    cJSON *width_item = cJSON_GetObjectItemCaseSensitive(canvas_obj, "width");
+    cJSON *height_item = cJSON_GetObjectItemCaseSensitive(canvas_obj, "height");
     const char *new_bg = json_str(canvas_obj, "background_color");
     const char *new_cm = json_str(canvas_obj, "color_mode");
     const char *resolved_cm = new_cm ? new_cm : (graph->canvas.color_mode == SBS_SCENE_COLOR_MODE_HDR10 ? "hdr10" : "sdr");
     const char *resolved_bg = new_bg ? new_bg : graph->canvas.background_color;
+    bool resolution_changed = cJSON_IsNumber(width_item) || cJSON_IsNumber(height_item);
 
     if (!new_fps_den) {
         new_fps_den = 1;
     }
-    if (new_w == 0 || new_h == 0 || (new_w & 63u) != 0 || (new_h & 63u) != 0) {
+    if (resolution_changed &&
+        (new_w == 0 || new_h == 0 || (new_w & 63u) != 0 || (new_h & 63u) != 0)) {
         *error = api_error(-32602, "Canvas width and height must be positive multiples of 64");
         return SBS_ERR_INVAL;
     }
@@ -294,23 +298,13 @@ int sbs_api_handle_canvas_apply(sbs_api_server_t *server, sbs_api_client_t *clie
                                       &pending_w, &pending_h,
                                       &pending_fps_num, &pending_fps_den,
                                       &pending_cm, &pending_bg)) {
-        LOG_I("saved canvas requires compositor restart; leaving runtime unchanged: %ux%u@%u/%u color=%s",
+        LOG_I("saved canvas requires compositor restart; applying supervised restart: %ux%u@%u/%u color=%s",
               pending_w, pending_h, pending_fps_num, pending_fps_den,
               pending_cm ? pending_cm : "sdr");
-        *result = cJSON_CreateObject();
-        add_running_canvas_result(*result, server->scene_graph);
-        add_pending_canvas_result(*result, pending_w, pending_h,
-                                  pending_fps_num, pending_fps_den,
-                                  pending_cm ? pending_cm : "sdr",
-                                  pending_bg ? pending_bg : "#000000");
-        cJSON_AddBoolToObject(*result, "applied", false);
-        cJSON_AddBoolToObject(*result, "restart_required", true);
         set_server_pending_canvas(server, pending_w, pending_h,
                                   pending_fps_num, pending_fps_den,
                                   pending_cm ? pending_cm : "sdr",
                                   pending_bg ? pending_bg : "#000000");
-        cJSON_Delete(bundle);
-        return SBS_OK;
     }
 
     LOG_I("applying saved canvas settings via full runtime reinitialization");

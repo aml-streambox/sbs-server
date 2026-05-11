@@ -406,6 +406,72 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
     sbs_api_server_refresh_scene(server);
 }
 
+static gboolean restart_instance_cb(gpointer user_data)
+{
+    const char *reason = user_data ? user_data : "canvas config changed";
+    LOG_I("exiting instance for supervised restart: %s", reason);
+    exit(EXIT_SUCCESS);
+    return G_SOURCE_REMOVE;
+}
+
+static void schedule_instance_restart(const char *reason)
+{
+    g_timeout_add(250, restart_instance_cb, (gpointer)reason);
+}
+
+static int reconfigure_canvas_runtime_from_graph(sbs_api_server_t *server)
+{
+    uint32_t width;
+    uint32_t height;
+    uint32_t fps_num;
+    uint32_t fps_den;
+    sbs_export_color_mode_t color_mode;
+    bool hdr10;
+    bool comp_needs_reconfigure = false;
+
+    if (!server || !server->scene_graph)
+        return SBS_ERR_INVAL;
+
+    width = server->scene_graph->canvas.width;
+    height = server->scene_graph->canvas.height;
+    fps_num = server->scene_graph->canvas.fps_num;
+    fps_den = server->scene_graph->canvas.fps_den ? server->scene_graph->canvas.fps_den : 1;
+    hdr10 = server->scene_graph->canvas.color_mode == SBS_SCENE_COLOR_MODE_HDR10;
+    color_mode = hdr10 ? SBS_EXPORT_COLOR_HDR10 : SBS_EXPORT_COLOR_SDR;
+
+    if (server->comp_thread) {
+        uint32_t cur_w = 0;
+        uint32_t cur_h = 0;
+        uint32_t cur_fps = 0;
+        sbs_export_color_mode_t cur_color = SBS_EXPORT_COLOR_SDR;
+        sbs_compositor_thread_get_canvas_config(server->comp_thread,
+                                                &cur_w, &cur_h, &cur_fps,
+                                                &cur_color);
+        comp_needs_reconfigure = cur_w != width || cur_h != height ||
+                                 cur_fps != fps_num || cur_color != color_mode;
+    }
+
+    if (comp_needs_reconfigure) {
+        LOG_I("canvas change requires supervised instance restart: %ux%u@%u/%u color=%s",
+              width, height, fps_num, fps_den, hdr10 ? "hdr10" : "sdr");
+        return SBS_ERR_WOULD_BLOCK;
+    }
+
+    if (server->encoder_mgr) {
+        int rc = sbs_encoder_manager_reconfigure_video(server->encoder_mgr,
+                                                       width, height,
+                                                       fps_num, fps_den,
+                                                       hdr10);
+        if (rc != SBS_OK)
+            return rc;
+    }
+
+    if (server->output_router)
+        sbs_output_router_set_color_mode(server->output_router, color_mode);
+
+    return SBS_OK;
+}
+
 void sbs_config_manager_start_runtime(sbs_api_server_t *server)
 {
     restart_runtime_from_graph(server);
@@ -686,12 +752,24 @@ void sbs_config_manager_mark_dirty(sbs_config_manager_t *mgr, sbs_api_server_t *
 int sbs_config_manager_apply_bundle(sbs_config_manager_t *mgr, sbs_api_server_t *server, cJSON *bundle)
 {
     cJSON *state = cJSON_GetObjectItemCaseSensitive(bundle, "state");
+    int rc;
     if (!mgr || !server || !cJSON_IsObject(state)) return SBS_ERR_INVAL;
     if (migrate_bundle(bundle) != SBS_OK || validate_bundle(bundle) != SBS_OK) return SBS_ERR_INVAL;
     LOG_I("applying persisted config bundle");
     stop_runtime(server);
     if (apply_scene_graph_bundle(server, state) != SBS_OK) {
         LOG_W("failed to apply scene graph state from persisted config");
+        return SBS_ERR_INVAL;
+    }
+    rc = reconfigure_canvas_runtime_from_graph(server);
+    if (rc == SBS_ERR_WOULD_BLOCK) {
+        int save_rc = sbs_config_manager_save_bundle(mgr, bundle);
+        if (save_rc == SBS_OK)
+            schedule_instance_restart("canvas config changed");
+        return save_rc;
+    }
+    if (rc != SBS_OK) {
+        LOG_W("failed to reconfigure runtime canvas from persisted config");
         return SBS_ERR_INVAL;
     }
     restart_runtime_from_graph(server);
@@ -701,6 +779,7 @@ int sbs_config_manager_apply_bundle(sbs_config_manager_t *mgr, sbs_api_server_t 
 int sbs_config_manager_reset(sbs_config_manager_t *mgr, sbs_api_server_t *server)
 {
     cJSON *bundle;
+    int rc;
     if (!mgr || !server) return SBS_ERR_INVAL;
     stop_runtime(server);
     sbs_scene_graph_free(server->scene_graph);
@@ -710,6 +789,15 @@ int sbs_config_manager_reset(sbs_config_manager_t *mgr, sbs_api_server_t *server
     bundle = sbs_config_manager_build_bundle(server);
     sbs_config_manager_save_bundle(mgr, bundle);
     cJSON_Delete(bundle);
+    rc = reconfigure_canvas_runtime_from_graph(server);
+    if (rc == SBS_ERR_WOULD_BLOCK) {
+        schedule_instance_restart("config reset changed canvas");
+        return SBS_OK;
+    }
+    if (rc != SBS_OK) {
+        LOG_W("failed to reconfigure runtime canvas during reset");
+        return SBS_ERR_INVAL;
+    }
     restart_runtime_from_graph(server);
     return SBS_OK;
 }

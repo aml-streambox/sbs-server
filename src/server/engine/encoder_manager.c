@@ -2253,6 +2253,49 @@ int sbs_encoder_manager_update_config(sbs_encoder_manager_t *mgr,
     return SBS_OK;
 }
 
+int sbs_encoder_manager_reconfigure_video(sbs_encoder_manager_t *mgr,
+                                           uint32_t width,
+                                           uint32_t height,
+                                           uint32_t fps_num,
+                                           uint32_t fps_den,
+                                           bool hdr10)
+{
+    uint32_t old_fps_num;
+
+    if (!mgr || width == 0 || height == 0 || fps_num == 0)
+        return SBS_ERR_INVAL;
+    if (fps_den == 0)
+        fps_den = 1;
+
+    pthread_mutex_lock(&mgr->pipeline_mutex);
+    if (mgr->width == width && mgr->height == height &&
+        mgr->fps_num == fps_num && mgr->fps_den == fps_den &&
+        mgr->hdr10 == hdr10) {
+        pthread_mutex_unlock(&mgr->pipeline_mutex);
+        return SBS_OK;
+    }
+
+    LOG_I("reconfiguring encoder video: %ux%u@%u/%u hdr10=%d -> %ux%u@%u/%u hdr10=%d",
+          mgr->width, mgr->height, mgr->fps_num, mgr->fps_den, mgr->hdr10,
+          width, height, fps_num, fps_den, hdr10);
+
+    mgr->pipeline_active = false;
+    teardown_pipeline(mgr);
+
+    old_fps_num = mgr->fps_num;
+    mgr->width = width;
+    mgr->height = height;
+    mgr->fps_num = fps_num;
+    mgr->fps_den = fps_den;
+    mgr->hdr10 = hdr10;
+    if (mgr->gop_size == old_fps_num)
+        mgr->gop_size = fps_num;
+    mgr->force_next_idr = true;
+
+    pthread_mutex_unlock(&mgr->pipeline_mutex);
+    return SBS_OK;
+}
+
 /* sbs_encoder_manager_consume_frame — REMOVED (was fd-based memfd path) */
 
 void sbs_encoder_manager_consume_frame_ptr(sbs_encoder_manager_t *mgr,

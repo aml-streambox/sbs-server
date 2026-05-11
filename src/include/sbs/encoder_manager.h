@@ -177,6 +177,13 @@ bool sbs_encoder_manager_is_active(const sbs_encoder_manager_t *mgr);
 void sbs_encoder_manager_get_config(const sbs_encoder_manager_t *mgr,
                                      sbs_encoder_config_t *out_config);
 
+int sbs_encoder_manager_reconfigure_video(sbs_encoder_manager_t *mgr,
+                                           uint32_t width,
+                                           uint32_t height,
+                                           uint32_t fps_num,
+                                           uint32_t fps_den,
+                                           bool hdr10);
+
 /**
  * Get the video resolution/fps being used.
  */

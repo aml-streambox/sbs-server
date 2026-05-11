@@ -7630,6 +7630,7 @@ _Static_assert(sizeof(sbs_native_downscale_pc_t) == SBS_NATIVE_DOWNSCALE_PC_SIZE
 #define SBS_NATIVE_P010_DIRECT_DST_IN_BOUNDS 8u
 #define SBS_NATIVE_P010_DIRECT_SRC_OFFSET 16u
 #define SBS_NATIVE_P010_DIRECT_SRC_RECT_OFFSET 32u
+#define SBS_NATIVE_P010_DIRECT_SOURCE_DRIVEN 64u
 
 static bool native_item_filters_direct_yuv_compatible(const sbs_comp_scene_item_t *item,
                                                       sbs_export_color_mode_t color_mode)
@@ -8500,6 +8501,7 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                 continue;
 
             bool source_driven_amly = false;
+            bool source_driven_yuv8 = false;
             if (entry->color_mode == SBS_EXPORT_COLOR_SDR &&
                 tex->drm_format == SBS_DRM_FORMAT_AMLY &&
                 direct_pipeline == comp->native_amly_to_nv21_pipeline &&
@@ -8512,6 +8514,17 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                 dst_y + (int32_t)dst_h > 0) {
                 direct_pipeline = comp->native_amly_to_nv21_src_pipeline;
                 source_driven_amly = true;
+            }
+            if (entry->color_mode == SBS_EXPORT_COLOR_SDR &&
+                (tex->drm_format == DRM_FORMAT_NV12 || tex->drm_format == DRM_FORMAT_NV21) &&
+                direct_pipeline == comp->native_yuv8_to_nv21_pipeline &&
+                layer_opacity >= 0.999f && item->filter_flags == 0 &&
+                dst_in_bounds && (dst_x & 1) == 0 && (dst_y & 1) == 0) {
+                uint64_t src_blocks = (((uint64_t)tex->width + 1u) >> 1) *
+                    (uint64_t)tex->height;
+                uint64_t dst_blocks = (((uint64_t)dst_w + 1u) >> 1) *
+                    (((uint64_t)dst_h + 1u) >> 1);
+                source_driven_yuv8 = src_blocks < dst_blocks;
             }
 
             if (item_full_canvas_direct && layer_opacity >= 0.999f &&
@@ -8570,6 +8583,8 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                 flags |= SBS_NATIVE_P010_DIRECT_SOURCE_NV21;
             if (dst_in_bounds)
                 flags |= SBS_NATIVE_P010_DIRECT_DST_IN_BOUNDS;
+            if (source_driven_yuv8)
+                flags |= SBS_NATIVE_P010_DIRECT_SOURCE_DRIVEN;
             if (split_full_canvas_direct)
                 flags = (flags & ~SBS_NATIVE_P010_DIRECT_FULL_CANVAS) |
                     SBS_NATIVE_P010_DIRECT_SRC_OFFSET |
@@ -8778,6 +8793,13 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                         pc.dst_x + (int32_t)pc.dst_w >= (int32_t)canvas_width &&
                         pc.dst_h < canvas_height)
                         block_h = (pc.dst_h + 1u) / 2u;
+                } else if (source_driven_yuv8) {
+                    pc.src_offset_x = 0;
+                    pc.src_offset_y = (pc.src_w + 1u) >> 1;
+                    block_w = pc.src_offset_y;
+                    block_h = pc.src_h;
+                    vkCmdPushConstants(cb, comp->native_p010_direct_pipeline_layout,
+                                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
                 }
                 vkCmdDispatch(cb, (block_w + wg_x - 1u) / wg_x,
                               (block_h + wg_y - 1u) / wg_y, 1);
@@ -8911,8 +8933,10 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                 sub_pc.src_rect_h = src_y1 - src_y0;
                 vkCmdPushConstants(cb, comp->native_yuv_pipeline_layout,
                                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(sub_pc), &sub_pc);
-                vkCmdDispatch(cb, (sub_pc.dst_w + 15u) / 16u,
-                              (sub_pc.dst_h + 15u) / 16u, 1);
+                uint32_t wg_px_x = entry->color_mode == SBS_EXPORT_COLOR_SDR ? 32u : 16u;
+                uint32_t wg_px_y = entry->color_mode == SBS_EXPORT_COLOR_SDR ? 16u : 16u;
+                vkCmdDispatch(cb, (sub_pc.dst_w + wg_px_x - 1u) / wg_px_x,
+                              (sub_pc.dst_h + wg_px_y - 1u) / wg_px_y, 1);
             }
             if (visible_rect_count > 0) {
                 native_timing_record_layer_end(comp, cb, timing, item, tex,
@@ -8923,7 +8947,10 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
         } else {
             vkCmdPushConstants(cb, comp->native_yuv_pipeline_layout,
                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-            vkCmdDispatch(cb, (pc.dst_w + 15u) / 16u, (pc.dst_h + 15u) / 16u, 1);
+            uint32_t wg_px_x = entry->color_mode == SBS_EXPORT_COLOR_SDR ? 32u : 16u;
+            uint32_t wg_px_y = entry->color_mode == SBS_EXPORT_COLOR_SDR ? 16u : 16u;
+            vkCmdDispatch(cb, (pc.dst_w + wg_px_x - 1u) / wg_px_x,
+                          (pc.dst_h + wg_px_y - 1u) / wg_px_y, 1);
             native_timing_record_layer_end(comp, cb, timing, item, tex,
                                             pc.dst_w, pc.dst_h, pc.dst_x, pc.dst_y,
                                             false);

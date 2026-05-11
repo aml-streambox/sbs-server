@@ -45,6 +45,7 @@ const uint FLAG_SOURCE_NV21 = 4u;
 const uint FLAG_DST_IN_BOUNDS = 8u;
 const uint FLAG_SRC_OFFSET = 16u;
 const uint FLAG_SRC_RECT_OFFSET = 32u;
+const uint FLAG_SOURCE_DRIVEN = 64u;
 const uint FILTER_GRAYSCALE = 1u;
 const uint FILTER_BRIGHTNESS = 2u;
 const uint FILTER_CONTRAST = 4u;
@@ -57,6 +58,7 @@ bool dst_in_bounds() { return (pc.flags & FLAG_DST_IN_BOUNDS) != 0u; }
 bool filter_hdr_to_sdr() { return (pc.filter_flags & FILTER_HDR_TO_SDR) != 0u; }
 bool src_offset_enabled() { return (pc.flags & FLAG_SRC_OFFSET) != 0u; }
 bool src_rect_offset_enabled() { return (pc.flags & FLAG_SRC_RECT_OFFSET) != 0u; }
+bool source_driven_enabled() { return (pc.flags & FLAG_SOURCE_DRIVEN) != 0u; }
 bool luma_key_enabled() { return (pc.filter_flags & FILTER_LUMA_KEY) != 0u; }
 
 float luma_key_alpha(float y) {
@@ -259,6 +261,15 @@ uint scale_nearest(uint pos, uint src_extent, float scale) {
     return min(v, src_extent - 1u);
 }
 
+uint out_begin_for_src(uint s, float inv_scale) {
+    return uint(max(ceil(float(s) * inv_scale - 0.5), 0.0));
+}
+
+uint out_end_for_src(uint s, float inv_scale, uint limit) {
+    float end_f = ceil(float(s + 1u) * inv_scale - 0.5);
+    return uint(clamp(end_f, 0.0, float(limit)));
+}
+
 float map_y8(uint y8, bool hdr_enabled) {
     if (!hdr_enabled)
         return apply_basic_luma_filters(float(y8) / 255.0);
@@ -340,7 +351,93 @@ float sample_luma_key_alpha_uv(uint local_uv_x, uint local_uv_y, bool hdr_enable
                    luma_key_alpha(sample_y(x1, y1, hdr_enabled)));
 }
 
+void write_luma_rect(uint src_x, uint src_y, float y) {
+    float inv_x = 1.0 / pc.y_scale_x;
+    float inv_y = 1.0 / pc.y_scale_y;
+    uint lx0 = out_begin_for_src(src_x, inv_x);
+    uint lx1 = out_end_for_src(src_x, inv_x, pc.dst_w);
+    uint ly0 = out_begin_for_src(src_y, inv_y);
+    uint ly1 = out_end_for_src(src_y, inv_y, pc.dst_h);
+
+    int visible_lx0 = max(int(lx0), -pc.dst_x);
+    int visible_lx1 = min(int(lx1), int(pc.canvas_width) - pc.dst_x);
+    int visible_ly0 = max(int(ly0), -pc.dst_y);
+    int visible_ly1 = min(int(ly1), int(pc.canvas_height) - pc.dst_y);
+    if (visible_lx1 <= visible_lx0 || visible_ly1 <= visible_ly0)
+        return;
+
+    for (int ly = visible_ly0; ly < visible_ly1; ly++) {
+        int dy = pc.dst_y + ly;
+        for (int lx = visible_lx0; lx < visible_lx1; lx++)
+            imageStore(y_img, ivec2(pc.dst_x + lx, dy), vec4(y, 0.0, 0.0, 1.0));
+    }
+}
+
+void write_chroma_rect(uint src_uv_x, uint src_uv_y, vec2 vu) {
+    uint dst_uv_w = max((pc.dst_w + 1u) >> 1, 1u);
+    uint dst_uv_h = max((pc.dst_h + 1u) >> 1, 1u);
+    float inv_x = 1.0 / pc.uv_scale_x;
+    float inv_y = 1.0 / pc.uv_scale_y;
+    uint ux0 = out_begin_for_src(src_uv_x, inv_x);
+    uint ux1 = out_end_for_src(src_uv_x, inv_x, dst_uv_w);
+    uint uy0 = out_begin_for_src(src_uv_y, inv_y);
+    uint uy1 = out_end_for_src(src_uv_y, inv_y, dst_uv_h);
+
+    int dst_uv_x = pc.dst_x >> 1;
+    int dst_uv_y = pc.dst_y >> 1;
+    int visible_ux0 = max(int(ux0), -dst_uv_x);
+    int visible_ux1 = min(int(ux1), int(pc.canvas_width >> 1) - dst_uv_x);
+    int visible_uy0 = max(int(uy0), -dst_uv_y);
+    int visible_uy1 = min(int(uy1), int(pc.canvas_height >> 1) - dst_uv_y);
+    if (visible_ux1 <= visible_ux0 || visible_uy1 <= visible_uy0)
+        return;
+
+    for (int uy = visible_uy0; uy < visible_uy1; uy++) {
+        int dy = dst_uv_y + uy;
+        for (int ux = visible_ux0; ux < visible_ux1; ux++)
+            imageStore(uv_img, ivec2(dst_uv_x + ux, dy), vec4(vu, 0.0, 1.0));
+    }
+}
+
+void render_source_driven() {
+    uint local_pair = gl_GlobalInvocationID.x;
+    uint src_y = gl_GlobalInvocationID.y;
+    uint pair_start = pc.src_offset_x;
+    uint pair_count = pc.src_offset_y;
+    if (local_pair >= pair_count || src_y >= pc.src_h)
+        return;
+
+    uint pair_x = pair_start + local_pair;
+    uint src_uv_w = max((pc.src_w + 1u) >> 1, 1u);
+    if (pair_x >= src_uv_w)
+        return;
+
+    uint x0 = pair_x * 2u;
+    uint x1 = min(x0 + 1u, pc.src_w - 1u);
+    float y0 = map_y8(read_y8_at(x0, src_y), false);
+    float y1 = map_y8(read_y8_at(x1, src_y), false);
+    write_luma_rect(x0, src_y, y0);
+    if (x1 != x0)
+        write_luma_rect(x1, src_y, y1);
+
+    if ((src_y & 1u) == 0u) {
+        uint src_uv_y = src_y >> 1;
+        uint uv_addr = pc.uv_offset + src_uv_y * pc.uv_stride + pair_x * 2u;
+        uint a = read_u8(uv_addr);
+        uint b = read_u8(uv_addr + 1u);
+        uint u8 = source_is_nv21() ? b : a;
+        uint v8 = source_is_nv21() ? a : b;
+        write_chroma_rect(pair_x, src_uv_y,
+                          vec2(float(v8) / 255.0, float(u8) / 255.0));
+    }
+}
+
 void main() {
+    if (source_driven_enabled()) {
+        render_source_driven();
+        return;
+    }
+
     bool full_canvas = (pc.flags & FLAG_FULL_CANVAS) != 0u;
     uvec2 base = gl_GlobalInvocationID.xy * 2u;
     uint limit_w = full_canvas ? pc.canvas_width : pc.dst_w;

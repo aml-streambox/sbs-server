@@ -9372,7 +9372,10 @@ static int sbs_compositor_submit_native_preview_from_entry(sbs_compositor_t *com
     dst_entry->y.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     dst_entry->uv.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    native_record_encoder_copy(cb, dst_entry);
+    /* HDR preview is submitted to the direct encoder via the preview DMA-BUF.
+     * The host readback buffer is only needed by the SDR pointer path. */
+    if (dst_entry->color_mode != SBS_EXPORT_COLOR_HDR10)
+        native_record_encoder_copy(cb, dst_entry);
 
     res = vkEndCommandBuffer(cb);
     if (res != VK_SUCCESS) {

@@ -51,6 +51,8 @@ typedef struct preview_runtime {
     GMutex ice_mutex;
     GPtrArray *ice_candidates; /* pending ICE candidates as cJSON strings */
     bool webrtc_ready;
+    bool reference_color;
+    sbs_preview_color_mode_t active_color_mode;
     GMutex ready_mutex;
     GCond ready_cond;
     sbs_preview_engine_t *engine; /* back-pointer for callbacks */
@@ -278,6 +280,8 @@ static sbs_preview_profile_t *profile_new(const char *id,
     profile->available = available;
     profile->requestable = requestable;
     profile->active = available && !requires_additional_encode;
+    profile->reference_color = false;
+    profile->active_color_mode = SBS_PREVIEW_COLOR_MODE_SDR;
     profile->viewer_count = 0;
     profile->stream_url = g_strdup(stream_url);
     return profile;
@@ -490,6 +494,26 @@ sbs_preview_profile_t *sbs_preview_engine_active_fallback(const sbs_preview_engi
 
 #ifdef SBS_HAVE_GSTREAMER_PREVIEW
 
+static void set_appsrc_queue_limits(GstElement *appsrc,
+                                    guint64 max_bytes,
+                                    guint max_buffers)
+{
+    if (!appsrc)
+        return;
+
+    g_object_set(appsrc,
+        "block", FALSE,
+        "max-bytes", max_bytes,
+        NULL);
+
+    if (g_object_class_find_property(G_OBJECT_GET_CLASS(appsrc), "max-buffers")) {
+        g_object_set(appsrc, "max-buffers", max_buffers, NULL);
+    }
+    if (g_object_class_find_property(G_OBJECT_GET_CLASS(appsrc), "leaky-type")) {
+        g_object_set(appsrc, "leaky-type", 2, NULL); /* downstream: drop oldest */
+    }
+}
+
 /* ── WebRTC callbacks ─────────────────────────────────────────── */
 
 static void on_ice_candidate(GstElement *webrtcbin, guint mline_index,
@@ -534,13 +558,10 @@ static void on_offer_created(GstPromise *promise, gpointer user_data)
     sdp_text = gst_sdp_message_as_text(offer->sdp);
     LOG_I("WebRTC SDP offer created (%zu bytes)", strlen(sdp_text));
 
-    /* Rewrite profile-level-id to constrained-baseline (42e01f) for browser
-     * compatibility.  The actual H.264 bitstream may be High profile, but
-     * all modern browsers decode High profile just fine — they only use the
-     * profile-level-id for SDP negotiation / codec matching.
-     * Also remove sprop-parameter-sets since the in-SDP SPS contains the
-     * real profile (High) which would conflict with our claimed profile. */
-    {
+    /* For true HDR10 preview, advertise the High 10 profile honestly and let
+     * the browser reject it if unsupported.  The WebUI can then retry the
+     * SDR-reference path. */
+    if (runtime->active_color_mode != SBS_PREVIEW_COLOR_MODE_HDR10) {
         char *p = strstr(sdp_text, "profile-level-id=");
         if (p) {
             p += strlen("profile-level-id=");
@@ -763,7 +784,7 @@ static preview_runtime_t *start_webrtc_runtime(sbs_preview_engine_t *engine,
     uint32_t src_w  = profile->width ? profile->width : (engine->src_width ? engine->src_width : 1920);
     uint32_t src_h  = profile->height ? profile->height : (engine->src_height ? engine->src_height : 1080);
     uint32_t src_fps = profile->framerate ? profile->framerate : (engine->src_fps ? engine->src_fps : 60);
-    hdr10 = engine->src_color_mode == SBS_PREVIEW_COLOR_MODE_HDR10;
+    hdr10 = profile->active_color_mode == SBS_PREVIEW_COLOR_MODE_HDR10;
     codec = "h264";
     caps_name = "video/x-h264";
     parser_name = "h264parse";
@@ -777,6 +798,8 @@ static preview_runtime_t *start_webrtc_runtime(sbs_preview_engine_t *engine,
     g_cond_init(&runtime->ready_cond);
     runtime->ice_candidates = g_ptr_array_new_with_free_func(g_free);
     runtime->engine = engine;
+    runtime->reference_color = profile->reference_color;
+    runtime->active_color_mode = profile->active_color_mode;
 
     /* Create a dedicated GMainContext for this WebRTC pipeline so that
      * webrtcbin's internal DTLS/RTCP/ICE processing isn't starved by the
@@ -799,6 +822,7 @@ static preview_runtime_t *start_webrtc_runtime(sbs_preview_engine_t *engine,
             "do-timestamp", FALSE,
             "format", GST_FORMAT_TIME,
             NULL);
+        set_appsrc_queue_limits(appsrc, 2u * 1024u * 1024u, 4u);
         src_caps = gst_caps_new_simple(caps_name,
             "stream-format", G_TYPE_STRING, "byte-stream",
             "alignment", G_TYPE_STRING, "au",
@@ -1155,6 +1179,8 @@ int sbs_preview_engine_release_profile(sbs_preview_engine_t *engine,
         g_hash_table_remove(engine->runtimes, profile->id);
         profile->active = false;
         profile->available = false;
+        profile->reference_color = false;
+        profile->active_color_mode = SBS_PREVIEW_COLOR_MODE_SDR;
     }
     if (out_profile) {
         *out_profile = profile;
@@ -1596,6 +1622,8 @@ static cJSON *get_webrtc_ice_candidates(sbs_preview_engine_t *engine,
 typedef struct {
     sbs_preview_engine_t *engine;
     const char *profile_id;
+    sbs_preview_color_mode_t color_mode;
+    bool reference_color;
     sbs_preview_profile_t *profile;
     int rc;
     const char *offer_sdp;
@@ -1609,6 +1637,16 @@ static gboolean webrtc_start_on_main_loop(gpointer user_data)
 {
     webrtc_start_ctx_t *ctx = user_data;
     preview_runtime_t *runtime;
+    sbs_preview_profile_t *profile;
+
+    g_mutex_lock(&ctx->engine->lock);
+    profile = preview_engine_get_profile_unlocked(ctx->engine, ctx->profile_id);
+    if (profile) {
+        profile->active_color_mode = ctx->engine->src_color_mode == SBS_PREVIEW_COLOR_MODE_HDR10
+            ? ctx->color_mode : SBS_PREVIEW_COLOR_MODE_SDR;
+        profile->reference_color = ctx->reference_color;
+    }
+    g_mutex_unlock(&ctx->engine->lock);
 
     /* ensure_profile on main loop thread */
     ctx->rc = sbs_preview_engine_ensure_profile(ctx->engine, ctx->profile_id, &ctx->profile);
@@ -1671,6 +1709,8 @@ done:
 
 int sbs_preview_engine_webrtc_start(sbs_preview_engine_t *engine,
                                     const char *profile_id,
+                                    sbs_preview_color_mode_t color_mode,
+                                    bool reference_color,
                                     sbs_preview_profile_t **out_profile,
                                     const char **out_sdp,
                                     cJSON **out_ice_candidates)
@@ -1678,6 +1718,8 @@ int sbs_preview_engine_webrtc_start(sbs_preview_engine_t *engine,
     webrtc_start_ctx_t ctx = {0};
     ctx.engine = engine;
     ctx.profile_id = profile_id;
+    ctx.color_mode = color_mode;
+    ctx.reference_color = reference_color;
     g_mutex_init(&ctx.mutex);
     g_cond_init(&ctx.cond);
 
@@ -1928,6 +1970,10 @@ cJSON *sbs_preview_serialize_profile(const sbs_preview_profile_t *profile)
     cJSON_AddBoolToObject(obj, "available", profile->available);
     cJSON_AddBoolToObject(obj, "requestable", profile->requestable);
     cJSON_AddBoolToObject(obj, "active", profile->active);
+    cJSON_AddStringToObject(obj, "color_mode",
+                            profile->active_color_mode == SBS_PREVIEW_COLOR_MODE_HDR10
+                                ? "hdr10" : "sdr_reference");
+    cJSON_AddBoolToObject(obj, "reference_color", profile->reference_color);
     cJSON_AddNumberToObject(obj, "viewer_count", profile->viewer_count);
     cJSON_AddNumberToObject(obj, "bitrate_kbps", profile->bitrate_kbps);
     cJSON_AddStringToObject(obj, "stream_url", profile->stream_url ? profile->stream_url : "");

@@ -258,10 +258,14 @@ static gboolean on_incoming(GSocketService *service,
     (void)service;
     (void)source_object;
 
+    /* Handshake reads run on the GLib main loop.  Do not let an idle TCP
+     * preconnect or half-open client wedge every HTTP/API connection. */
+    g_socket_set_timeout(g_socket_connection_get_socket(connection), 2);
     if (!perform_handshake(connection)) {
         return FALSE;
     }
 
+    g_socket_set_timeout(g_socket_connection_get_socket(connection), 0);
     g_socket_set_blocking(g_socket_connection_get_socket(connection), TRUE);
 
     client = sbs_api_client_new(0);
@@ -423,6 +427,9 @@ static gboolean on_preview_incoming(GSocketService *service,
     (void)source_object;
     (void)user_data;
 
+    /* This callback also runs on the main loop.  Browser speculative
+     * connections may not send a request line; time them out quickly. */
+    g_socket_set_timeout(g_socket_connection_get_socket(connection), 2);
     line = g_data_input_stream_read_line(din, &line_len, NULL, NULL);
     if (line) {
         gchar **parts = g_strsplit(line, " ", 3);

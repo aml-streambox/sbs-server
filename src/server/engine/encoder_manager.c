@@ -83,6 +83,24 @@ typedef struct sink_branch {
 
 #define SBS_ENCODER_PACER_DELAY_NS (100ULL * GST_MSECOND)
 
+static void set_appsrc_queue_limits(GstElement *appsrc,
+                                    guint64 max_bytes,
+                                    guint max_buffers)
+{
+    if (!appsrc)
+        return;
+
+    g_object_set(appsrc,
+        "block", FALSE,
+        "max-bytes", max_bytes,
+        NULL);
+
+    if (g_object_class_find_property(G_OBJECT_GET_CLASS(appsrc), "max-buffers"))
+        g_object_set(appsrc, "max-buffers", max_buffers, NULL);
+    if (g_object_class_find_property(G_OBJECT_GET_CLASS(appsrc), "leaky-type"))
+        g_object_set(appsrc, "leaky-type", 2, NULL); /* downstream: drop oldest */
+}
+
 /* ── Encoder Manager State ────────────────────────────────────── */
 
 struct sbs_encoder_manager {
@@ -945,9 +963,8 @@ static int ensure_pipeline(sbs_encoder_manager_t *mgr)
         "format",       GST_FORMAT_TIME,
         "is-live",      TRUE,
         "do-timestamp", FALSE,
-        "block",        FALSE,
-        "max-bytes",    (guint64)(mgr->bitrate_kbps * 1000),
         NULL);
+    set_appsrc_queue_limits(appsrc, (guint64)(mgr->bitrate_kbps * 1000), 8u);
     gst_caps_unref(vcaps);
 
     /* Configure audio appsrc */
@@ -1412,9 +1429,9 @@ static int start_srt_session(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
         "format",       GST_FORMAT_TIME,
         "is-live",      TRUE,
         "do-timestamp", FALSE,
-        "block",        FALSE,
-        "max-bytes",    (guint64)(mgr->bitrate_kbps * 1000 / 2),
         NULL);
+    set_appsrc_queue_limits(video_src,
+                            (guint64)(mgr->bitrate_kbps * 1000 / 2), 8u);
     gst_caps_unref(video_caps);
 
     audio_caps = gst_caps_new_simple("audio/x-raw",

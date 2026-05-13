@@ -788,7 +788,7 @@ static int create_native_preview_ring(sbs_compositor_t *comp,
             destroy_native_preview_ring(comp);
             return -1;
         }
-        if (!entry->encoder_mapped &&
+        if (color_mode != SBS_EXPORT_COLOR_HDR10 && !entry->encoder_mapped &&
             create_native_encoder_buffer(comp, entry, entry->backing_size) != 0) {
             LOG_E("native preview[%u] host buffer allocation failed", i);
             destroy_native_preview_ring(comp);
@@ -9372,8 +9372,6 @@ static int sbs_compositor_submit_native_preview_from_entry(sbs_compositor_t *com
     dst_entry->y.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     dst_entry->uv.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    /* HDR preview is submitted to the direct encoder via the preview DMA-BUF.
-     * The host readback buffer is only needed by the SDR pointer path. */
     if (dst_entry->color_mode != SBS_EXPORT_COLOR_HDR10)
         native_record_encoder_copy(cb, dst_entry);
 

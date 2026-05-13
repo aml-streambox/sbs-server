@@ -36,6 +36,8 @@ typedef struct sbs_preview_profile {
     bool available;
     bool requestable;
     bool active;
+    bool reference_color;
+    sbs_preview_color_mode_t active_color_mode;
     uint32_t viewer_count;
     char *stream_url;
     uint32_t bitrate_kbps;
@@ -99,6 +101,8 @@ void sbs_preview_engine_collect_telemetry(const sbs_preview_engine_t *engine,
 /* WebRTC signaling */
 int sbs_preview_engine_webrtc_start(sbs_preview_engine_t *engine,
                                     const char *profile_id,
+                                    sbs_preview_color_mode_t color_mode,
+                                    bool reference_color,
                                     sbs_preview_profile_t **out_profile,
                                     const char **out_sdp,
                                     cJSON **out_ice_candidates);

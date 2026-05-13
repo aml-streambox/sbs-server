@@ -371,6 +371,20 @@ static void pending_frame_push(sbs_direct_venc_t *enc,
     g_queue_push_tail(enc->pending_frames, pending);
 }
 
+static void pending_frame_prune(sbs_direct_venc_t *enc)
+{
+    uint32_t keep;
+
+    if (!enc || !enc->pending_frames)
+        return;
+
+    keep = enc->bframe_enabled ? gop_pattern_delay_frames(enc->gop_pattern) + 4u : 2u;
+    while (g_queue_get_length(enc->pending_frames) > keep) {
+        sbs_pending_frame_t *old = g_queue_pop_head(enc->pending_frames);
+        pending_frame_free(old);
+    }
+}
+
 /* ---- dlopen / dlsym ---- */
 
 static int load_symbols(sbs_direct_venc_t *enc)
@@ -534,7 +548,15 @@ static int submit_common(sbs_direct_venc_t *enc,
     }
 
     if (meta.encoded_data_length_in_bytes <= 0)
+    {
+        if (!enc->bframe_enabled) {
+            sbs_pending_frame_t *pending = pending_frame_take_match(enc, meta.input_frame_num);
+            pending_frame_free(pending);
+        } else {
+            pending_frame_prune(enc);
+        }
         return SBS_OK;
+    }
 
     packet->data = enc->outbuf;
     packet->size = (size_t)meta.encoded_data_length_in_bytes;

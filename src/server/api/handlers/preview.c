@@ -153,17 +153,27 @@ int sbs_api_handle_preview_webrtc_start(sbs_api_server_t *server, sbs_api_client
                                         cJSON *params, cJSON **result, cJSON **error)
 {
     const char *profile_id = json_str(params, "profile_id");
+    const char *color_mode = json_str(params, "color_mode");
     sbs_preview_profile_t *profile = NULL;
     const char *offer_sdp = NULL;
     cJSON *candidates = NULL;
+    sbs_preview_color_mode_t preview_color_mode = SBS_PREVIEW_COLOR_MODE_HDR10;
+    bool reference_color = false;
     int rc;
     (void)client;
 
     if (!profile_id) profile_id = "preview-h264-webrtc";
+    if (g_strcmp0(color_mode, "sdr_reference") == 0 ||
+        g_strcmp0(color_mode, "sdr") == 0) {
+        preview_color_mode = SBS_PREVIEW_COLOR_MODE_SDR;
+        reference_color = true;
+    }
 
     /* Run ensure_profile + offer generation on the main loop thread.
      * This function blocks until the offer is ready or times out. */
     rc = sbs_preview_engine_webrtc_start(server->preview, profile_id,
+                                         preview_color_mode,
+                                         reference_color,
                                          &profile, &offer_sdp, &candidates);
     if (rc != SBS_OK || !offer_sdp) {
         if (candidates) cJSON_Delete(candidates);
@@ -181,6 +191,10 @@ int sbs_api_handle_preview_webrtc_start(sbs_api_server_t *server, sbs_api_client
 
     *result = cJSON_CreateObject();
     cJSON_AddStringToObject(*result, "profile_id", profile_id);
+    cJSON_AddStringToObject(*result, "color_mode",
+                            preview_color_mode == SBS_PREVIEW_COLOR_MODE_HDR10
+                                ? "hdr10" : "sdr_reference");
+    cJSON_AddBoolToObject(*result, "reference_color", reference_color);
     cJSON_AddStringToObject(*result, "type", "offer");
     cJSON_AddStringToObject(*result, "sdp", offer_sdp);
     if (candidates) {

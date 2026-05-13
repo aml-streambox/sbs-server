@@ -48,6 +48,12 @@ typedef struct {
     sbs_api_client_t *client;
 } ws_thread_ctx_t;
 
+typedef struct {
+    GSocketConnection *connection;
+} preview_http_thread_ctx_t;
+
+static gpointer preview_http_thread_main(gpointer data);
+
 static char *build_ws_frame(const char *payload)
 {
     gsize len = payload ? strlen(payload) : 0;
@@ -222,6 +228,15 @@ static gpointer client_thread_main(gpointer data)
     GSocketConnection *conn = G_SOCKET_CONNECTION(ctx->client->connection);
     int fd = g_socket_get_fd(g_socket_connection_get_socket(conn));
 
+    g_socket_set_timeout(g_socket_connection_get_socket(conn), 2);
+    if (!perform_handshake(conn)) {
+        ctx->client->connected = false;
+        g_free(ctx);
+        return NULL;
+    }
+    g_socket_set_timeout(g_socket_connection_get_socket(conn), 0);
+    g_socket_set_blocking(g_socket_connection_get_socket(conn), TRUE);
+
     while (ctx->server->running && ctx->client->connected) {
         char *request = read_ws_text_frame(fd);
         char *response = NULL;
@@ -257,16 +272,6 @@ static gboolean on_incoming(GSocketService *service,
     ws_thread_ctx_t *ctx;
     (void)service;
     (void)source_object;
-
-    /* Handshake reads run on the GLib main loop.  Do not let an idle TCP
-     * preconnect or half-open client wedge every HTTP/API connection. */
-    g_socket_set_timeout(g_socket_connection_get_socket(connection), 2);
-    if (!perform_handshake(connection)) {
-        return FALSE;
-    }
-
-    g_socket_set_timeout(g_socket_connection_get_socket(connection), 0);
-    g_socket_set_blocking(g_socket_connection_get_socket(connection), TRUE);
 
     client = sbs_api_client_new(0);
     client->connection = g_object_ref(connection);
@@ -419,16 +424,26 @@ static gboolean on_preview_incoming(GSocketService *service,
                                     GObject *source_object,
                                     gpointer user_data)
 {
-    GInputStream *in = g_io_stream_get_input_stream(G_IO_STREAM(connection));
-    GDataInputStream *din = g_data_input_stream_new(in);
-    gchar *line;
-    gsize line_len = 0;
+    preview_http_thread_ctx_t *ctx;
     (void)service;
     (void)source_object;
     (void)user_data;
 
-    /* This callback also runs on the main loop.  Browser speculative
-     * connections may not send a request line; time them out quickly. */
+    ctx = g_new0(preview_http_thread_ctx_t, 1);
+    ctx->connection = g_object_ref(connection);
+    g_thread_unref(g_thread_new("sbs-http-client", preview_http_thread_main, ctx));
+    return TRUE;
+}
+
+static gpointer preview_http_thread_main(gpointer data)
+{
+    preview_http_thread_ctx_t *ctx = data;
+    GSocketConnection *connection = ctx->connection;
+    GInputStream *in = g_io_stream_get_input_stream(G_IO_STREAM(connection));
+    GDataInputStream *din = g_data_input_stream_new(in);
+    gchar *line;
+    gsize line_len = 0;
+
     g_socket_set_timeout(g_socket_connection_get_socket(connection), 2);
     line = g_data_input_stream_read_line(din, &line_len, NULL, NULL);
     if (line) {
@@ -440,7 +455,9 @@ static gboolean on_preview_incoming(GSocketService *service,
         g_free(line);
     }
     g_object_unref(din);
-    return FALSE;
+    g_object_unref(connection);
+    g_free(ctx);
+    return NULL;
 }
 
 static gboolean on_unix_incoming(GSocketService *service,
@@ -575,7 +592,7 @@ int sbs_api_server_start(sbs_api_server_t *server, uint16_t port)
     if (server->running) {
         return SBS_OK;
     }
-    server->socket_service = g_socket_service_new();
+    server->socket_service = g_threaded_socket_service_new(32);
     server->port = port;
     server->preview_port = port + 1;
     sbs_preview_engine_set_api_port(server->preview, port);
@@ -587,7 +604,7 @@ int sbs_api_server_start(sbs_api_server_t *server, uint16_t port)
         return SBS_ERR_IO;
     }
     g_socket_service_start(G_SOCKET_SERVICE(server->socket_service));
-    server->preview_socket_service = g_socket_service_new();
+    server->preview_socket_service = g_threaded_socket_service_new(32);
     g_signal_connect(server->preview_socket_service, "incoming", G_CALLBACK(on_preview_incoming), server);
     if (!g_socket_listener_add_inet_port(G_SOCKET_LISTENER(server->preview_socket_service), server->preview_port, NULL, NULL)) {
         g_object_unref(server->preview_socket_service);

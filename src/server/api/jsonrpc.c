@@ -85,6 +85,7 @@ void sbs_api_register_core_methods(sbs_api_server_t *server)
     register_method(server, "source.listKinds", sbs_api_handle_source_list_kinds);
     register_method(server, "source.describeKind", sbs_api_handle_source_describe_kind);
     register_method(server, "source.discoverV4L2", sbs_api_handle_source_discover_v4l2);
+    register_method(server, "source.discoverALSA", sbs_api_handle_source_discover_alsa);
     register_method(server, "source.uploadAsset", sbs_api_handle_source_upload_asset);
     register_method(server, "source.create", sbs_api_handle_source_create);
     register_method(server, "source.update", sbs_api_handle_source_update);

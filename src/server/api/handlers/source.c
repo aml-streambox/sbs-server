@@ -224,6 +224,93 @@ static void sync_alsa_audio_source_config(sbs_source_state_t *source)
     }
 }
 
+static char *read_alsa_card_id(uint32_t card)
+{
+    char *path = g_strdup_printf("/proc/asound/card%u/id", card);
+    gchar *contents = NULL;
+    gsize length = 0;
+
+    if (!g_file_get_contents(path, &contents, &length, NULL)) {
+        g_free(path);
+        return NULL;
+    }
+    g_strstrip(contents);
+    g_free(path);
+    return contents;
+}
+
+static void add_alsa_capture_device(cJSON *devices,
+                                    uint32_t card,
+                                    uint32_t device,
+                                    const char *name)
+{
+    char *card_id = read_alsa_card_id(card);
+    char *hw_device = g_strdup_printf("hw:%u,%u", card, device);
+    char *pcm_device = card_id && card_id[0]
+        ? g_strdup_printf("plughw:%s,%u", card_id, device)
+        : g_strdup(hw_device);
+    char *id = g_strdup_printf("alsa-%u-%u", card, device);
+    char *display = g_strdup_printf("%s (%s)",
+                                    name && name[0] ? name : "ALSA Capture",
+                                    pcm_device);
+    cJSON *obj = cJSON_CreateObject();
+
+    cJSON_AddStringToObject(obj, "id", id);
+    cJSON_AddNumberToObject(obj, "card", card);
+    cJSON_AddNumberToObject(obj, "device_index", device);
+    cJSON_AddStringToObject(obj, "card_id", card_id ? card_id : "");
+    cJSON_AddStringToObject(obj, "name", name && name[0] ? name : "ALSA Capture");
+    cJSON_AddStringToObject(obj, "display_name", display);
+    cJSON_AddStringToObject(obj, "device", pcm_device);
+    cJSON_AddStringToObject(obj, "hw_device", hw_device);
+    cJSON_AddItemToArray(devices, obj);
+
+    g_free(display);
+    g_free(id);
+    g_free(pcm_device);
+    g_free(hw_device);
+    g_free(card_id);
+}
+
+static cJSON *discover_alsa_capture_devices(void)
+{
+    gchar *contents = NULL;
+    gchar **lines;
+    cJSON *devices = cJSON_CreateArray();
+
+    if (!g_file_get_contents("/proc/asound/pcm", &contents, NULL, NULL)) {
+        return devices;
+    }
+
+    lines = g_strsplit(contents, "\n", -1);
+    for (guint i = 0; lines && lines[i]; i++) {
+        char *line = lines[i];
+        char *colon;
+        char *name_start;
+        char *name_end;
+        uint32_t card = 0;
+        uint32_t device = 0;
+
+        if (!strstr(line, "capture") || sscanf(line, "%u-%u:", &card, &device) != 2) {
+            continue;
+        }
+
+        colon = strchr(line, ':');
+        name_start = colon ? colon + 1 : line;
+        while (*name_start == ' ') name_start++;
+        name_end = strstr(name_start, " : ");
+        if (name_end) {
+            *name_end = '\0';
+        }
+        g_strstrip(name_start);
+        add_alsa_capture_device(devices, card, device, name_start);
+    }
+
+    g_strfreev(lines);
+    g_free(contents);
+    return devices;
+}
+
 static void publish_source_event(sbs_api_server_t *server, const char *topic, sbs_source_state_t *source)
 {
     sbs_api_server_publish(server, topic, sbs_scene_graph_serialize_source(source));
@@ -315,6 +402,19 @@ int sbs_api_handle_source_discover_v4l2(sbs_api_server_t *server, sbs_api_client
 
     *result = cJSON_CreateObject();
     cJSON_AddItemToObject(*result, "devices", sbs_v4l2_discovery_list_devices());
+    return SBS_OK;
+}
+
+int sbs_api_handle_source_discover_alsa(sbs_api_server_t *server, sbs_api_client_t *client,
+                                        cJSON *params, cJSON **result, cJSON **error)
+{
+    (void)server;
+    (void)client;
+    (void)params;
+    (void)error;
+
+    *result = cJSON_CreateObject();
+    cJSON_AddItemToObject(*result, "devices", discover_alsa_capture_devices());
     return SBS_OK;
 }
 

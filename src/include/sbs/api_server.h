@@ -154,9 +154,11 @@ int sbs_api_handle_source_list_kinds(sbs_api_server_t *server, sbs_api_client_t 
 int sbs_api_handle_source_describe_kind(sbs_api_server_t *server, sbs_api_client_t *client,
                                         cJSON *params, cJSON **result, cJSON **error);
 int sbs_api_handle_source_discover_v4l2(sbs_api_server_t *server, sbs_api_client_t *client,
+                                         cJSON *params, cJSON **result, cJSON **error);
+int sbs_api_handle_source_discover_alsa(sbs_api_server_t *server, sbs_api_client_t *client,
                                         cJSON *params, cJSON **result, cJSON **error);
 int sbs_api_handle_source_upload_asset(sbs_api_server_t *server, sbs_api_client_t *client,
-                                       cJSON *params, cJSON **result, cJSON **error);
+                                        cJSON *params, cJSON **result, cJSON **error);
 int sbs_api_handle_source_create(sbs_api_server_t *server, sbs_api_client_t *client,
                                  cJSON *params, cJSON **result, cJSON **error);
 int sbs_api_handle_source_update(sbs_api_server_t *server, sbs_api_client_t *client,

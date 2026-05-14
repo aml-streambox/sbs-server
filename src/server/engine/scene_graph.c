@@ -889,6 +889,8 @@ static cJSON *output_encoder_to_public_json(GHashTable *map)
         if (g_strcmp0((const char *)key, "rtmp_passcode") == 0) {
             cJSON_AddBoolToObject(obj, "rtmp_passcode_set",
                                   value && ((const char *)value)[0] != '\0');
+            cJSON_AddBoolToObject(obj, "rtmp_stream_key_set",
+                                  value && ((const char *)value)[0] != '\0');
             continue;
         }
         cJSON_AddStringToObject(obj, (const char *)key, (const char *)value);

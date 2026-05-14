@@ -89,6 +89,9 @@ typedef struct sbs_output_entry {
     char        *cfg_rtmp_uri;
     char        *cfg_rtmp_passcode;
     char        *cfg_file_path;
+    char        *cfg_file_path_mode;
+    char        *cfg_file_prefix;
+    char        *cfg_file_container;
 
     /* Back-reference to supervisor */
     struct sbs_output_supervisor *supervisor;
@@ -256,6 +259,9 @@ int sbs_output_supervisor_start_output(sbs_output_supervisor_t *sup,
     entry->cfg_rtmp_uri  = config->rtmp_uri ? strdup(config->rtmp_uri) : NULL;
     entry->cfg_rtmp_passcode = config->rtmp_passcode ? strdup(config->rtmp_passcode) : NULL;
     entry->cfg_file_path = config->file_path ? strdup(config->file_path) : NULL;
+    entry->cfg_file_path_mode = config->file_path_mode ? strdup(config->file_path_mode) : NULL;
+    entry->cfg_file_prefix = config->file_prefix ? strdup(config->file_prefix) : NULL;
+    entry->cfg_file_container = config->file_container ? strdup(config->file_container) : NULL;
 
     entry->config_copy.codec     = entry->cfg_codec;
     entry->config_copy.encoder   = entry->cfg_encoder;
@@ -264,6 +270,9 @@ int sbs_output_supervisor_start_output(sbs_output_supervisor_t *sup,
     entry->config_copy.rtmp_uri  = entry->cfg_rtmp_uri;
     entry->config_copy.rtmp_passcode = entry->cfg_rtmp_passcode;
     entry->config_copy.file_path = entry->cfg_file_path;
+    entry->config_copy.file_path_mode = entry->cfg_file_path_mode;
+    entry->config_copy.file_prefix = entry->cfg_file_prefix;
+    entry->config_copy.file_container = entry->cfg_file_container;
 
     /* Insert into hash table (key is borrowed from entry->output_id) */
     g_hash_table_insert(sup->outputs, entry->output_id, entry);
@@ -587,6 +596,9 @@ static void output_entry_free(sbs_output_entry_t *entry)
     free(entry->cfg_rtmp_uri);
     free(entry->cfg_rtmp_passcode);
     free(entry->cfg_file_path);
+    free(entry->cfg_file_path_mode);
+    free(entry->cfg_file_prefix);
+    free(entry->cfg_file_container);
 
     free(entry->output_id);
     free(entry->socket_path);
@@ -641,6 +653,15 @@ static char *build_config_json(const sbs_output_entry_t *entry)
     }
     if (cfg->file_path) {
         cJSON_AddStringToObject(obj, "file_path", cfg->file_path);
+    }
+    if (cfg->file_path_mode) {
+        cJSON_AddStringToObject(obj, "file_path_mode", cfg->file_path_mode);
+    }
+    if (cfg->file_prefix) {
+        cJSON_AddStringToObject(obj, "file_prefix", cfg->file_prefix);
+    }
+    if (cfg->file_container) {
+        cJSON_AddStringToObject(obj, "file_container", cfg->file_container);
     }
     if (cfg->gop_size > 0) {
         cJSON_AddNumberToObject(obj, "gop_size", cfg->gop_size);

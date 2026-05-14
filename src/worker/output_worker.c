@@ -17,6 +17,7 @@
 
 #include <errno.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -227,6 +228,59 @@ static char *build_rtmp_location(const char *rtmp_uri, const char *rtmp_passcode
     return g_strconcat(rtmp_uri, sep, rtmp_passcode, NULL);
 }
 
+static const char *normalized_file_container(const char *container)
+{
+    if (container && (strcmp(container, "mkv") == 0 ||
+                      strcmp(container, "flv") == 0 ||
+                      strcmp(container, "mp4") == 0 ||
+                      strcmp(container, "ts") == 0)) {
+        return container;
+    }
+    return "ts";
+}
+
+static char *sanitize_file_prefix(const char *prefix)
+{
+    char *safe = g_strdup((prefix && *prefix) ? prefix : "stream");
+    for (char *p = safe; *p; p++) {
+        if (*p == '/' || *p == '\\' || (unsigned char)*p < 0x20) {
+            *p = '_';
+        }
+    }
+    return safe;
+}
+
+static char *resolve_file_location(const sbs_worker_config_t *config)
+{
+    const char *container = normalized_file_container(config->output.file_container);
+    const char *mode = config->output.file_path_mode ? config->output.file_path_mode : "file";
+    const char *path = config->output.file_path;
+
+    if (!path || !*path)
+        return NULL;
+
+    if (strcmp(mode, "directory") != 0)
+        return g_strdup(path);
+
+    if (g_mkdir_with_parents(path, 0755) != 0) {
+        LOG_W("failed to create file output directory '%s'", path);
+    }
+
+    time_t now = time(NULL);
+    struct tm tm_now;
+    char timestamp[32];
+    char *prefix = sanitize_file_prefix(config->output.file_prefix);
+    if (!localtime_r(&now, &tm_now) ||
+        strftime(timestamp, sizeof(timestamp), "%Y%m%d-%H%M%S", &tm_now) == 0) {
+        g_strlcpy(timestamp, "unknown-time", sizeof(timestamp));
+    }
+    char *filename = g_strdup_printf("%s-%s.%s", prefix, timestamp, container);
+    char *location = g_build_filename(path, filename, NULL);
+    g_free(prefix);
+    g_free(filename);
+    return location;
+}
+
 static GstElement *build_output_pipeline(sbs_worker_config_t *config)
 {
     const char *codec    = config->output.codec ? config->output.codec : "h265";
@@ -324,12 +378,23 @@ static GstElement *build_output_pipeline(sbs_worker_config_t *config)
             NULL);
     }
 
-    /* Create muxer — flvmux for H.264+RTMP, mpegtsmux for everything else */
+    /* Create muxer */
     bool is_rtmp = (config->output.sink_type && strcmp(config->output.sink_type, "rtmp") == 0);
+    bool is_file = (config->output.sink_type && strcmp(config->output.sink_type, "file") == 0);
     bool is_h264 = (codec && strcmp(codec, "h264") == 0);
-    GstElement *muxer = (is_rtmp && is_h264)
-        ? gst_element_factory_make("flvmux", "mux")
-        : gst_element_factory_make("mpegtsmux", "mux");
+    const char *file_container = normalized_file_container(config->output.file_container);
+    GstElement *muxer = NULL;
+    if (is_file && strcmp(file_container, "mkv") == 0) {
+        muxer = gst_element_factory_make("matroskamux", "mux");
+    } else if (is_file && strcmp(file_container, "flv") == 0) {
+        muxer = gst_element_factory_make("flvmux", "mux");
+    } else if (is_file && strcmp(file_container, "mp4") == 0) {
+        muxer = gst_element_factory_make("mp4mux", "mux");
+    } else if (is_rtmp && is_h264) {
+        muxer = gst_element_factory_make("flvmux", "mux");
+    } else {
+        muxer = gst_element_factory_make("mpegtsmux", "mux");
+    }
     GstElement *aq1 = gst_element_factory_make("queue", "aq1");
     GstElement *aconv = gst_element_factory_make("audioconvert", "aconv");
     GstElement *aresample = gst_element_factory_make("audioresample", "aresample");
@@ -347,13 +412,13 @@ static GstElement *build_output_pipeline(sbs_worker_config_t *config)
     if (aenc) {
         g_object_set(aenc, "bitrate", 128000, NULL);
     }
-    if (muxer && !is_rtmp) {
+    if (muxer && (!is_rtmp && (!is_file || strcmp(file_container, "ts") == 0))) {
         g_object_set(muxer,
             "alignment", (gint)7,
             "latency",   (guint64)100000000,
             NULL);
     }
-    if (muxer && is_rtmp) {
+    if (muxer && (is_rtmp || (is_file && strcmp(file_container, "flv") == 0))) {
         g_object_set(muxer, "streamable", TRUE, NULL);
     }
 
@@ -386,18 +451,20 @@ static GstElement *build_output_pipeline(sbs_worker_config_t *config)
                 "sync",     FALSE,
                 NULL);
             LOG_I("RTMP sink: %s%s", rtmp_uri,
-                  rtmp_passcode && *rtmp_passcode ? " (passcode set)" : "");
+                  rtmp_passcode && *rtmp_passcode ? " (stream key set)" : "");
         }
         g_free(location);
     } else if (sink_type && strcmp(sink_type, "file") == 0 && file_path && strlen(file_path) > 0) {
+        char *location = resolve_file_location(config);
         sink = gst_element_factory_make("filesink", "sink");
         if (sink) {
             g_object_set(sink,
-                "location", file_path,
+                "location", location ? location : file_path,
                 "sync",     FALSE,
                 NULL);
-            LOG_I("File sink: %s", file_path);
+            LOG_I("File sink: %s", location ? location : file_path);
         }
+        g_free(location);
     } else if (sink_type && strcmp(sink_type, "fakesink") == 0) {
         sink = gst_element_factory_make("fakesink", "sink");
         if (sink) {

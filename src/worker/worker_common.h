@@ -51,8 +51,11 @@ typedef struct sbs_output_config {
     char     *srt_uri;          /* SRT listener/caller URI */
     uint32_t  srt_latency_ms;  /* SRT latency (default: 600) */
     char     *rtmp_uri;         /* RTMP URI (e.g. "rtmp://server/live/key") */
-    char     *rtmp_passcode;    /* Optional RTMP stream key/passcode */
+    char     *rtmp_passcode;    /* Optional RTMP stream key */
     char     *file_path;        /* File output path (e.g. "/tmp/stream.ts") */
+    char     *file_path_mode;   /* "file" or "directory" */
+    char     *file_prefix;      /* Directory mode filename prefix */
+    char     *file_container;   /* "ts", "mkv", "flv", or "mp4" */
     char     *encoder;          /* Override encoder element name (NULL = auto) */
     uint32_t  gop_size;         /* Keyframe interval in frames */
 } sbs_output_config_t;

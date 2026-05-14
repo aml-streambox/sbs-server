@@ -19,6 +19,12 @@ static const char *json_str(cJSON *obj, const char *key)
     return cJSON_IsString(item) ? cJSON_GetStringValue(item) : NULL;
 }
 
+static const char *json_str_alias(cJSON *obj, const char *key, const char *alias)
+{
+    const char *value = json_str(obj, key);
+    return value ? value : json_str(obj, alias);
+}
+
 static double json_num_def(cJSON *obj, const char *key, double fallback)
 {
     cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
@@ -49,7 +55,8 @@ static void output_replace_encoder_from_json(sbs_output_state_t *output, cJSON *
     output->encoder = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
     for (entry = encoder_obj->child; entry; entry = entry->next) {
         if (cJSON_IsString(entry)) {
-            g_hash_table_insert(output->encoder, g_strdup(entry->string),
+            const char *key = g_strcmp0(entry->string, "rtmp_stream_key") == 0 ? "rtmp_passcode" : entry->string;
+            g_hash_table_insert(output->encoder, g_strdup(key),
                                 g_strdup(cJSON_GetStringValue(entry)));
         } else if (cJSON_IsNumber(entry)) {
             char buf[32];
@@ -174,11 +181,20 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
         const char *rtmp_uri = json_str(params, "rtmp_uri");
         sink_cfg.rtmp_uri = rtmp_uri ? rtmp_uri : encoder_str(output->encoder, "rtmp_uri", NULL);
 
-        const char *rtmp_passcode = json_str(params, "rtmp_passcode");
+        const char *rtmp_passcode = json_str_alias(params, "rtmp_stream_key", "rtmp_passcode");
         sink_cfg.rtmp_passcode = rtmp_passcode ? rtmp_passcode : encoder_str(output->encoder, "rtmp_passcode", NULL);
 
         const char *file_path = json_str(params, "file_path");
         sink_cfg.file_path = file_path ? file_path : encoder_str(output->encoder, "file_path", NULL);
+
+        const char *file_path_mode = json_str(params, "file_path_mode");
+        sink_cfg.file_path_mode = file_path_mode ? file_path_mode : encoder_str(output->encoder, "file_path_mode", "file");
+
+        const char *file_prefix = json_str(params, "file_prefix");
+        sink_cfg.file_prefix = file_prefix ? file_prefix : encoder_str(output->encoder, "file_prefix", "stream");
+
+        const char *file_container = json_str(params, "file_container");
+        sink_cfg.file_container = file_container ? file_container : encoder_str(output->encoder, "file_container", "ts");
 
         rc = sbs_encoder_manager_add_sink(server->encoder_mgr, &sink_cfg);
         if (rc != SBS_OK) {
@@ -204,6 +220,12 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
             g_hash_table_insert(output->encoder, g_strdup("rtmp_passcode"), g_strdup(sink_cfg.rtmp_passcode));
         if (sink_cfg.file_path)
             g_hash_table_insert(output->encoder, g_strdup("file_path"), g_strdup(sink_cfg.file_path));
+        if (sink_cfg.file_path_mode)
+            g_hash_table_insert(output->encoder, g_strdup("file_path_mode"), g_strdup(sink_cfg.file_path_mode));
+        if (sink_cfg.file_prefix)
+            g_hash_table_insert(output->encoder, g_strdup("file_prefix"), g_strdup(sink_cfg.file_prefix));
+        if (sink_cfg.file_container)
+            g_hash_table_insert(output->encoder, g_strdup("file_container"), g_strdup(sink_cfg.file_container));
     } else {
         /* Legacy supervisor path */
         memset(&cfg, 0, sizeof(cfg));
@@ -231,11 +253,20 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
         const char *rtmp_uri = json_str(params, "rtmp_uri");
         cfg.rtmp_uri = rtmp_uri ? rtmp_uri : encoder_str(output->encoder, "rtmp_uri", NULL);
 
-        const char *rtmp_passcode = json_str(params, "rtmp_passcode");
+        const char *rtmp_passcode = json_str_alias(params, "rtmp_stream_key", "rtmp_passcode");
         cfg.rtmp_passcode = rtmp_passcode ? rtmp_passcode : encoder_str(output->encoder, "rtmp_passcode", NULL);
 
         const char *file_path = json_str(params, "file_path");
         cfg.file_path = file_path ? file_path : encoder_str(output->encoder, "file_path", NULL);
+
+        const char *file_path_mode = json_str(params, "file_path_mode");
+        cfg.file_path_mode = file_path_mode ? file_path_mode : encoder_str(output->encoder, "file_path_mode", "file");
+
+        const char *file_prefix = json_str(params, "file_prefix");
+        cfg.file_prefix = file_prefix ? file_prefix : encoder_str(output->encoder, "file_prefix", "stream");
+
+        const char *file_container = json_str(params, "file_container");
+        cfg.file_container = file_container ? file_container : encoder_str(output->encoder, "file_container", "ts");
 
         cfg.gop_size = (uint32_t)json_num_def(params, "gop_size",
             encoder_num(output->encoder, "gop_size", cfg.framerate_num));
@@ -264,6 +295,12 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
             g_hash_table_insert(output->encoder, g_strdup("rtmp_passcode"), g_strdup(cfg.rtmp_passcode));
         if (cfg.file_path)
             g_hash_table_insert(output->encoder, g_strdup("file_path"), g_strdup(cfg.file_path));
+        if (cfg.file_path_mode)
+            g_hash_table_insert(output->encoder, g_strdup("file_path_mode"), g_strdup(cfg.file_path_mode));
+        if (cfg.file_prefix)
+            g_hash_table_insert(output->encoder, g_strdup("file_prefix"), g_strdup(cfg.file_prefix));
+        if (cfg.file_container)
+            g_hash_table_insert(output->encoder, g_strdup("file_container"), g_strdup(cfg.file_container));
     }
 
     output->autostart = true;
@@ -347,6 +384,9 @@ int sbs_api_handle_output_update(sbs_api_server_t *server, sbs_api_client_t *cli
             sink_cfg.rtmp_uri = encoder_str(output->encoder, "rtmp_uri", NULL);
             sink_cfg.rtmp_passcode = encoder_str(output->encoder, "rtmp_passcode", NULL);
             sink_cfg.file_path = encoder_str(output->encoder, "file_path", NULL);
+            sink_cfg.file_path_mode = encoder_str(output->encoder, "file_path_mode", "file");
+            sink_cfg.file_prefix = encoder_str(output->encoder, "file_prefix", "stream");
+            sink_cfg.file_container = encoder_str(output->encoder, "file_container", "ts");
 
             int rc = sbs_encoder_manager_add_sink(server->encoder_mgr, &sink_cfg);
             if (rc != SBS_OK) {
@@ -377,6 +417,9 @@ int sbs_api_handle_output_update(sbs_api_server_t *server, sbs_api_client_t *cli
             cfg.rtmp_uri = encoder_str(output->encoder, "rtmp_uri", NULL);
             cfg.rtmp_passcode = encoder_str(output->encoder, "rtmp_passcode", NULL);
             cfg.file_path = encoder_str(output->encoder, "file_path", NULL);
+            cfg.file_path_mode = encoder_str(output->encoder, "file_path_mode", "file");
+            cfg.file_prefix = encoder_str(output->encoder, "file_prefix", "stream");
+            cfg.file_container = encoder_str(output->encoder, "file_container", "ts");
             cfg.gop_size = encoder_num(output->encoder, "gop_size", cfg.framerate_num);
 
             int rc = sbs_output_supervisor_start_output(server->output_sup, &cfg);

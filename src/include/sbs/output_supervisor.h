@@ -47,8 +47,11 @@ typedef struct sbs_output_start_config {
     const char *srt_uri;         /* SRT URI (e.g. "srt://:8888") */
     uint32_t    srt_latency_ms;  /* SRT latency (default: 600) */
     const char *rtmp_uri;        /* RTMP URI (e.g. "rtmp://server/live/key") */
-    const char *rtmp_passcode;   /* Optional RTMP stream key/passcode */
+    const char *rtmp_passcode;   /* Optional RTMP stream key */
     const char *file_path;       /* File output path (e.g. "/tmp/stream.ts") */
+    const char *file_path_mode;  /* "file" or "directory" */
+    const char *file_prefix;     /* Directory mode filename prefix */
+    const char *file_container;  /* "ts", "mkv", "flv", or "mp4" */
 } sbs_output_start_config_t;
 
 typedef struct sbs_output_supervisor_metrics {

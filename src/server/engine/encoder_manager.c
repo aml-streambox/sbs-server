@@ -21,6 +21,7 @@
 #include "sbs/log.h"
 
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <gst/gst.h>
@@ -79,6 +80,9 @@ typedef struct sink_branch {
     char       *rtmp_uri;
     char       *rtmp_passcode;
     char       *file_path;
+    char       *file_path_mode;
+    char       *file_prefix;
+    char       *file_container;
 } sink_branch_t;
 
 #define SBS_ENCODER_PACER_DELAY_NS (100ULL * GST_MSECOND)
@@ -1225,6 +1229,9 @@ static void sink_branch_free(gpointer data)
     g_free(branch->rtmp_uri);
     g_free(branch->rtmp_passcode);
     g_free(branch->file_path);
+    g_free(branch->file_path_mode);
+    g_free(branch->file_prefix);
+    g_free(branch->file_container);
     if (branch->srt_callers)
         g_hash_table_destroy(branch->srt_callers);
 
@@ -1250,15 +1257,92 @@ static char *build_rtmp_location(const char *rtmp_uri, const char *rtmp_passcode
     return g_strconcat(rtmp_uri, sep, rtmp_passcode, NULL);
 }
 
+static const char *normalized_file_container(const char *container)
+{
+    if (container && (strcmp(container, "mkv") == 0 ||
+                      strcmp(container, "flv") == 0 ||
+                      strcmp(container, "mp4") == 0 ||
+                      strcmp(container, "ts") == 0)) {
+        return container;
+    }
+    return "ts";
+}
+
+static char *sanitize_file_prefix(const char *prefix)
+{
+    char *safe = g_strdup((prefix && *prefix) ? prefix : "stream");
+    for (char *p = safe; *p; p++) {
+        if (*p == '/' || *p == '\\' || (unsigned char)*p < 0x20) {
+            *p = '_';
+        }
+    }
+    return safe;
+}
+
+static char *resolve_file_location(const sbs_sink_branch_config_t *config)
+{
+    const char *container = normalized_file_container(config->file_container);
+    const char *mode = config->file_path_mode ? config->file_path_mode : "file";
+    const char *path = config->file_path;
+
+    if (!path || !*path)
+        return NULL;
+
+    if (strcmp(mode, "directory") != 0)
+        return g_strdup(path);
+
+    if (g_mkdir_with_parents(path, 0755) != 0) {
+        LOG_W("failed to create file output directory '%s'", path);
+    }
+
+    time_t now = time(NULL);
+    struct tm tm_now;
+    char timestamp[32];
+    char *prefix = sanitize_file_prefix(config->file_prefix);
+    if (!localtime_r(&now, &tm_now) ||
+        strftime(timestamp, sizeof(timestamp), "%Y%m%d-%H%M%S", &tm_now) == 0) {
+        g_strlcpy(timestamp, "unknown-time", sizeof(timestamp));
+    }
+    char *filename = g_strdup_printf("%s-%s.%s", prefix, timestamp, container);
+    char *location = g_build_filename(path, filename, NULL);
+    g_free(prefix);
+    g_free(filename);
+    return location;
+}
+
 static GstElement *create_muxer(const char *codec, const char *sink_type,
+                                 const char *file_container,
                                  const char **out_format)
 {
     bool is_rtmp = (sink_type && strcmp(sink_type, "rtmp") == 0);
+    bool is_file = (sink_type && strcmp(sink_type, "file") == 0);
     bool is_h264 = (codec && strcmp(codec, "h264") == 0);
 
     *out_format = "mpegts";
     GstElement *muxer;
-    if (is_rtmp && is_h264) {
+    if (is_file) {
+        const char *container = normalized_file_container(file_container);
+        if (strcmp(container, "mkv") == 0) {
+            muxer = gst_element_factory_make("matroskamux", NULL);
+            *out_format = "mkv";
+        } else if (strcmp(container, "flv") == 0) {
+            muxer = gst_element_factory_make("flvmux", NULL);
+            if (muxer) g_object_set(muxer, "streamable", TRUE, NULL);
+            *out_format = "flv";
+        } else if (strcmp(container, "mp4") == 0) {
+            muxer = gst_element_factory_make("mp4mux", NULL);
+            *out_format = "mp4";
+        } else {
+            muxer = gst_element_factory_make("mpegtsmux", NULL);
+            if (muxer) {
+                g_object_set(muxer,
+                    "alignment", (gint)7,
+                    "latency",   (guint64)100000000,
+                    NULL);
+            }
+            *out_format = "mpegts";
+        }
+    } else if (is_rtmp && is_h264) {
         muxer = gst_element_factory_make("flvmux", NULL);
         if (muxer) g_object_set(muxer, "streamable", TRUE, NULL);
         *out_format = "flv";
@@ -1322,22 +1406,24 @@ static GstElement *create_sink(const sbs_sink_branch_config_t *config,
             if (sink) {
                 g_object_set(sink, "location", location ? location : config->rtmp_uri, "sync", FALSE, NULL);
                 LOG_I("RTMP sink: %s%s", config->rtmp_uri,
-                      config->rtmp_passcode && *config->rtmp_passcode ? " (passcode set)" : "");
+                      config->rtmp_passcode && *config->rtmp_passcode ? " (stream key set)" : "");
             }
             g_free(location);
         } else {
             LOG_E("RTMP sink requested without rtmp_uri");
         }
     } else if (strcmp(sink_type, "file") == 0) {
-        if (config->file_path && strlen(config->file_path) > 0) {
+        char *location = resolve_file_location(config);
+        if (location && strlen(location) > 0) {
             sink = gst_element_factory_make("filesink", NULL);
             if (sink) {
-                g_object_set(sink, "location", config->file_path, "sync", FALSE, NULL);
-                LOG_I("File sink: %s", config->file_path);
+                g_object_set(sink, "location", location, "sync", FALSE, NULL);
+                LOG_I("File sink: %s", location);
             }
         } else {
             LOG_E("file sink requested without file_path");
         }
+        g_free(location);
     } else {
         LOG_E("unsupported sink_type='%s'", sink_type);
     }
@@ -1389,7 +1475,7 @@ static int start_srt_session(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
         audio_encoder = gst_element_factory_make("avenc_mp2fixed", NULL);
     audio_parser = gst_element_factory_make("mpegaudioparse", NULL);
     audio_capsfilter = gst_element_factory_make("capsfilter", NULL);
-    muxer = create_muxer(mgr->codec, "srt", &muxer_format);
+    muxer = create_muxer(mgr->codec, "srt", NULL, &muxer_format);
 
     sbs_sink_branch_config_t cfg = {
         .output_id = branch->output_id,
@@ -1592,7 +1678,7 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
     GstElement *vpacer = gst_element_factory_make("identity", NULL);
     GstElement *aqueue = gst_element_factory_make("queue", NULL);
     const char *muxer_format = NULL;
-    GstElement *muxer  = create_muxer(mgr->codec, branch->sink_type, &muxer_format);
+    GstElement *muxer  = create_muxer(mgr->codec, branch->sink_type, branch->file_container, &muxer_format);
     GstElement *acapsfilter = NULL;
     GstElement *branch_audio_src = NULL;
     GstElement *branch_audio_convert = NULL;
@@ -1609,6 +1695,9 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
         .rtmp_uri     = branch->rtmp_uri,
         .rtmp_passcode = branch->rtmp_passcode,
         .file_path    = branch->file_path,
+        .file_path_mode = branch->file_path_mode,
+        .file_prefix  = branch->file_prefix,
+        .file_container = branch->file_container,
     };
     GstElement *sink = create_sink(&cfg, muxer_format);
 
@@ -2195,6 +2284,9 @@ int sbs_encoder_manager_update_config(sbs_encoder_manager_t *mgr,
         copy->rtmp_uri     = g_strdup(branch->rtmp_uri);
         copy->rtmp_passcode = g_strdup(branch->rtmp_passcode);
         copy->file_path    = g_strdup(branch->file_path);
+        copy->file_path_mode = g_strdup(branch->file_path_mode);
+        copy->file_prefix  = g_strdup(branch->file_prefix);
+        copy->file_container = g_strdup(branch->file_container);
         g_ptr_array_add(saved_configs, copy);
 
         /* Unlink before teardown */
@@ -2250,6 +2342,9 @@ int sbs_encoder_manager_update_config(sbs_encoder_manager_t *mgr,
             .rtmp_uri     = saved->rtmp_uri,
             .rtmp_passcode = saved->rtmp_passcode,
             .file_path    = saved->file_path,
+            .file_path_mode = saved->file_path_mode,
+            .file_prefix  = saved->file_prefix,
+            .file_container = saved->file_container,
         };
         int add_rc = sbs_encoder_manager_add_sink(mgr, &cfg);
         if (add_rc != SBS_OK) {
@@ -2507,6 +2602,9 @@ int sbs_encoder_manager_add_sink(sbs_encoder_manager_t *mgr,
     branch->rtmp_uri     = g_strdup(config->rtmp_uri);
     branch->rtmp_passcode = g_strdup(config->rtmp_passcode);
     branch->file_path    = g_strdup(config->file_path);
+    branch->file_path_mode = g_strdup(config->file_path_mode ? config->file_path_mode : "file");
+    branch->file_prefix  = g_strdup(config->file_prefix ? config->file_prefix : "stream");
+    branch->file_container = g_strdup(normalized_file_container(config->file_container));
 
     if (branch->sink_type && strcmp(branch->sink_type, "srt") == 0)
         rc = start_srt_session(mgr, branch);

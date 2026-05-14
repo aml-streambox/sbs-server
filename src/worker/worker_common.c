@@ -136,6 +136,9 @@ static int parse_output_config(const cJSON *root, sbs_worker_config_t *config)
     out->rtmp_uri      = json_get_string(root, "rtmp_uri");
     out->rtmp_passcode = json_get_string(root, "rtmp_passcode");
     out->file_path     = json_get_string(root, "file_path");
+    out->file_path_mode = json_get_string(root, "file_path_mode");
+    out->file_prefix   = json_get_string(root, "file_prefix");
+    out->file_container = json_get_string(root, "file_container");
     out->bitrate       = json_get_uint32(root, "bitrate_kbps", 5000);
     out->gop_size      = json_get_uint32(root, "gop_size", 60);
 
@@ -223,6 +226,9 @@ void sbs_worker_config_free(sbs_worker_config_t *config)
     free(config->output.rtmp_uri);
     free(config->output.rtmp_passcode);
     free(config->output.file_path);
+    free(config->output.file_path_mode);
+    free(config->output.file_prefix);
+    free(config->output.file_container);
 
     if (config->_root) {
         cJSON_Delete(config->_root);

@@ -343,9 +343,15 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
             const char *rtmp_uri  = enc ? g_hash_table_lookup(enc, "rtmp_uri")  : NULL;
             const char *rtmp_passcode = enc ? g_hash_table_lookup(enc, "rtmp_passcode") : NULL;
             const char *file_path = enc ? g_hash_table_lookup(enc, "file_path") : NULL;
+            const char *file_path_mode = enc ? g_hash_table_lookup(enc, "file_path_mode") : NULL;
+            const char *file_prefix = enc ? g_hash_table_lookup(enc, "file_prefix") : NULL;
+            const char *file_container = enc ? g_hash_table_lookup(enc, "file_container") : NULL;
             uint32_t srt_latency  = lat_str ? (uint32_t)strtoul(lat_str, NULL, 10) : 600;
             if (!sink_type) sink_type = "srt";
             if (!srt_uri)   srt_uri   = "srt://:8888";
+            if (!file_path_mode) file_path_mode = "file";
+            if (!file_prefix) file_prefix = "stream";
+            if (!file_container) file_container = "ts";
 
             if (server->encoder_mgr) {
                 sbs_sink_branch_config_t sink_cfg = {0};
@@ -357,6 +363,9 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
                 sink_cfg.rtmp_uri       = rtmp_uri;
                 sink_cfg.rtmp_passcode  = rtmp_passcode;
                 sink_cfg.file_path      = file_path;
+                sink_cfg.file_path_mode = file_path_mode;
+                sink_cfg.file_prefix    = file_prefix;
+                sink_cfg.file_container = file_container;
                 rc = sbs_encoder_manager_add_sink(server->encoder_mgr, &sink_cfg);
                 if (rc != SBS_OK) {
                     LOG_E("failed to restore output '%s': %d", output->id, rc);
@@ -387,6 +396,9 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
                 cfg.rtmp_uri      = rtmp_uri;
                 cfg.rtmp_passcode = rtmp_passcode;
                 cfg.file_path     = file_path;
+                cfg.file_path_mode = file_path_mode;
+                cfg.file_prefix   = file_prefix;
+                cfg.file_container = file_container;
                 cfg.gop_size      = gop_str ? (uint32_t)strtoul(gop_str, NULL, 10) : fps_num;
                 int rc = sbs_output_supervisor_start_output(server->output_sup, &cfg);
                 if (rc != SBS_OK) {

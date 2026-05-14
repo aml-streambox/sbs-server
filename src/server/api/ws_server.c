@@ -370,31 +370,11 @@ static gboolean serve_preview_file(GSocketConnection *connection, const char *me
         full_path = g_strdup_printf("/tmp/sbs-snapshots/%s", suffix);
         mime = "image/jpeg";
     } else {
-        /* Serve WebUI static files */
-        if (strcmp(path, "/") == 0) {
-            full_path = g_strdup("/usr/share/sbs/webui/index.html");
-        } else {
-            if (strstr(path, "..")) {
-                g_free(path);
-                return FALSE;
-            }
-            full_path = g_strdup_printf("/usr/share/sbs/webui%s", path);
-        }
-        if (g_str_has_suffix(full_path, ".html")) {
-            mime = "text/html";
-        } else if (g_str_has_suffix(full_path, ".js")) {
-            mime = "application/javascript";
-        } else if (g_str_has_suffix(full_path, ".css")) {
-            mime = "text/css";
-        } else if (g_str_has_suffix(full_path, ".json")) {
-            mime = "application/json";
-        } else if (g_str_has_suffix(full_path, ".png")) {
-            mime = "image/png";
-        } else if (g_str_has_suffix(full_path, ".svg")) {
-            mime = "image/svg+xml";
-        } else if (g_str_has_suffix(full_path, ".woff2")) {
-            mime = "font/woff2";
-        }
+        g_snprintf(header, sizeof(header),
+                   "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
+        g_output_stream_write_all(out, header, strlen(header), NULL, NULL, NULL);
+        g_free(path);
+        return TRUE;
     }
 
     if (!g_file_get_contents(full_path, &contents, &length, NULL)) {

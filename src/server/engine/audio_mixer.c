@@ -134,7 +134,7 @@ sbs_audio_buffer_t *sbs_audio_mixer_take_latest_buffer(sbs_audio_mixer_t *audio)
 
 #else
 
-#define SBS_AUDIO_PENDING_MAX 8u
+#define SBS_AUDIO_PENDING_MAX 256u
 
 static void ensure_gstreamer_audio_ready(void)
 {
@@ -651,7 +651,7 @@ int sbs_audio_mixer_start(sbs_audio_mixer_t *audio)
         "max-size-buffers", 0,
         "max-size-bytes", 0,
         "max-size-time", (guint64)(2 * GST_SECOND),
-        "leaky", 2,
+        "leaky", 0,
         NULL);
 
     g_object_set(audio->master_volume, "volume", audio->master_volume_value, "mute", audio->master_mute, NULL);
@@ -664,8 +664,8 @@ int sbs_audio_mixer_start(sbs_audio_mixer_t *audio)
     g_object_set(audio->appsink,
         "emit-signals", TRUE,
         "sync", FALSE,
-        "max-buffers", 8,
-        "drop", TRUE,
+        "max-buffers", 256,
+        "drop", FALSE,
         NULL);
     g_signal_connect(audio->appsink, "new-sample", G_CALLBACK(on_audio_sample), audio);
 

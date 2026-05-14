@@ -212,6 +212,8 @@ struct sbs_direct_venc {
     int next_submit_id;
     uint64_t output_counter;
     uint64_t frame_duration_ns;
+    bool output_dts_origin_valid;
+    uint64_t output_dts_origin_ns;
     GQueue *pending_frames;
 };
 
@@ -283,7 +285,7 @@ static uint32_t gop_pattern_delay_frames(int32_t gop_pattern)
     case 1:
         return 4;
     case 2:
-        return 2;
+        return 3;
     case 3:
         return 3;
     case 6:
@@ -320,13 +322,23 @@ static uint64_t bframe_delay_ns(const sbs_direct_venc_t *enc)
 static uint64_t calculate_packet_dts(sbs_direct_venc_t *enc,
                                      const sbs_pending_frame_t *pending)
 {
+    uint64_t origin;
+
     if (!enc || !pending)
         return UINT64_MAX;
 
     if (!enc->bframe_enabled || enc->frame_duration_ns == 0)
         return pending->dts_ns;
 
-    return enc->output_counter * enc->frame_duration_ns;
+    if (!enc->output_dts_origin_valid) {
+        enc->output_dts_origin_ns = pending->pts_ns != UINT64_MAX
+            ? pending->pts_ns
+            : (uint64_t)pending->id * enc->frame_duration_ns;
+        enc->output_dts_origin_valid = true;
+    }
+
+    origin = enc->output_dts_origin_ns;
+    return origin + enc->output_counter * enc->frame_duration_ns;
 }
 
 static void pending_frame_free(gpointer data)
@@ -565,9 +577,14 @@ static int submit_common(sbs_direct_venc_t *enc,
     if (pending) {
         uint64_t delay_ns = bframe_delay_ns(enc);
         packet->pts_ns = enc->bframe_enabled
-            ? ((uint64_t)pending->id * enc->frame_duration_ns) + delay_ns
+            ? (pending->pts_ns != UINT64_MAX
+                ? pending->pts_ns + delay_ns
+                : ((uint64_t)pending->id * enc->frame_duration_ns) + delay_ns)
             : pending->pts_ns;
         packet->dts_ns = calculate_packet_dts(enc, pending);
+        if (enc->bframe_enabled && packet->dts_ns != UINT64_MAX &&
+            packet->pts_ns != UINT64_MAX && packet->dts_ns > packet->pts_ns)
+            packet->dts_ns = packet->pts_ns;
         packet->duration_ns = pending->duration_ns;
         packet->is_keyframe = pending->requested_idr;
         pending_frame_free(pending);
@@ -639,6 +656,11 @@ void sbs_direct_venc_free(sbs_direct_venc_t *enc)
     if (enc->libvpcodec)
         dlclose(enc->libvpcodec);
     g_free(enc);
+}
+
+uint64_t sbs_direct_venc_reorder_delay_ns(const sbs_direct_venc_t *enc)
+{
+    return bframe_delay_ns(enc);
 }
 
 int sbs_direct_venc_submit_ptr(sbs_direct_venc_t *enc,

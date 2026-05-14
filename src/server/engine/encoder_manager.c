@@ -29,6 +29,11 @@
 
 /* ── Sink Branch State ────────────────────────────────────────── */
 
+typedef struct direct_audio_push_req {
+    GstElement *appsrc;
+    GstClockTime pts_ns;
+} direct_audio_push_req_t;
+
 typedef struct sink_branch {
     char       *output_id;
     sbs_encoder_manager_t *manager;
@@ -66,7 +71,9 @@ typedef struct sink_branch {
     GHashTable *srt_callers;
     bool        srt_video_base_valid;
     uint64_t    srt_video_base_pts_ns;
+    uint64_t    srt_video_base_dts_ns;
     uint64_t    srt_video_running_origin_ns;
+    uint64_t    srt_video_max_pts_ns;
     uint64_t    srt_video_buffers_pushed;
     uint64_t    srt_video_push_failures;
     bool        srt_stats_bytes_valid;
@@ -86,6 +93,8 @@ typedef struct sink_branch {
 } sink_branch_t;
 
 #define SBS_ENCODER_PACER_DELAY_NS (100ULL * GST_MSECOND)
+#define SBS_SRT_AUDIO_BUFFER_NS (5ULL * GST_SECOND)
+#define SBS_SRT_AUDIO_APP_MAX_BYTES (48000u * 2u * 2u * 5u)
 
 static void set_appsrc_queue_limits(GstElement *appsrc,
                                     guint64 max_bytes,
@@ -181,6 +190,16 @@ static void unlink_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch
 static int  start_srt_session(sbs_encoder_manager_t *mgr, sink_branch_t *branch);
 static void stop_srt_session(sbs_encoder_manager_t *mgr, sink_branch_t *branch);
 static void flush_srt_session(sink_branch_t *branch);
+
+static void direct_audio_push_req_free(gpointer data)
+{
+    direct_audio_push_req_t *req = data;
+    if (!req)
+        return;
+    if (req->appsrc)
+        gst_object_unref(req->appsrc);
+    g_free(req);
+}
 
 static void on_srt_caller_added(GstElement *sink,
                                 gint caller_id,
@@ -498,6 +517,7 @@ static void flush_srt_session(sink_branch_t *branch)
     branch->srt_video_base_valid = false;
     branch->srt_video_base_pts_ns = 0;
     branch->srt_video_running_origin_ns = 0;
+    branch->srt_video_max_pts_ns = 0;
     branch->srt_stats_bytes_valid = false;
     branch->srt_last_bytes_sent_total = 0;
     branch->srt_last_bytes_change_video_count = 0;
@@ -550,15 +570,10 @@ static bool update_srt_sink_stats(sink_branch_t *branch)
         ? branch->srt_video_buffers_pushed - branch->srt_last_bytes_change_video_count
         : 0;
     if (stale_frames > 180) {
-        LOG_W("SRT session '%s' caller stale: no bytes sent for %lu video frames; expiring caller gate",
+        LOG_W("SRT session '%s' caller stats stale: no bytes sent for %lu video frames; keeping caller active",
               branch->output_id ? branch->output_id : "<unknown>",
               (unsigned long)stale_frames);
-        if (branch->srt_callers)
-            g_hash_table_remove_all(branch->srt_callers);
-        g_atomic_int_set(&branch->srt_caller_count, 0);
-        g_atomic_int_set(&branch->drop_until_keyframe, TRUE);
-        flush_srt_session(branch);
-        return false;
+        branch->srt_last_bytes_change_video_count = branch->srt_video_buffers_pushed;
     }
 
     return true;
@@ -619,19 +634,24 @@ static GstClockTime normalize_audio_time(sbs_encoder_manager_t *mgr,
                                           uint64_t timestamp_ns)
 {
     uint64_t rel;
+    uint64_t reorder_delay_ns = mgr && mgr->video_encoder
+        ? sbs_direct_venc_reorder_delay_ns(mgr->video_encoder)
+        : 0;
 
     if (timestamp_ns == UINT64_MAX) {
-        return pipeline_running_time(mgr) + SBS_ENCODER_PACER_DELAY_NS;
+        return pipeline_running_time(mgr) + SBS_ENCODER_PACER_DELAY_NS + reorder_delay_ns;
     }
 
     if (!mgr->audio_time_origin_valid) {
         mgr->audio_pts_origin_ns = timestamp_ns;
         mgr->audio_running_origin_ns = pipeline_running_time(mgr) +
-                                       SBS_ENCODER_PACER_DELAY_NS;
+                                       SBS_ENCODER_PACER_DELAY_NS +
+                                       reorder_delay_ns;
         mgr->audio_time_origin_valid = true;
-        LOG_I("encoded audio clock origin: pts=%luns running=%luns",
+        LOG_I("encoded audio clock origin: pts=%luns running=%luns reorder_delay=%luns",
               (unsigned long)mgr->audio_pts_origin_ns,
-              (unsigned long)mgr->audio_running_origin_ns);
+              (unsigned long)mgr->audio_running_origin_ns,
+              (unsigned long)reorder_delay_ns);
     }
 
     rel = timestamp_ns >= mgr->audio_pts_origin_ns
@@ -723,7 +743,9 @@ static void push_srt_session_packet(sbs_encoder_manager_t *mgr,
                                       SBS_ENCODER_PACER_DELAY_NS;
         branch->srt_video_base_valid = true;
         branch->srt_video_base_pts_ns = pts_ns;
+        branch->srt_video_base_dts_ns = GST_CLOCK_TIME_IS_VALID(dts_ns) ? dts_ns : pts_ns;
         branch->srt_video_running_origin_ns = running_origin;
+        branch->srt_video_max_pts_ns = running_origin;
         branch->srt_video_buffers_pushed = 0;
         branch->srt_stats_bytes_valid = false;
         branch->srt_last_bytes_sent_total = 0;
@@ -731,7 +753,10 @@ static void push_srt_session_packet(sbs_encoder_manager_t *mgr,
         pthread_mutex_lock(&mgr->audio_mutex);
         branch->direct_audio_base_valid = true;
         branch->direct_audio_next_valid = false;
-        branch->direct_audio_base_pts_ns = running_origin;
+        branch->direct_audio_base_pts_ns = running_origin +
+            (pts_ns >= branch->srt_video_base_dts_ns
+                ? pts_ns - branch->srt_video_base_dts_ns
+                : 0);
         branch->direct_audio_next_pts_ns = 0;
         branch->direct_audio_buffers_pushed = 0;
         pthread_mutex_unlock(&mgr->audio_mutex);
@@ -748,13 +773,15 @@ static void push_srt_session_packet(sbs_encoder_manager_t *mgr,
     }
 
     rel_pts = branch->srt_video_running_origin_ns +
-        (pts_ns >= branch->srt_video_base_pts_ns
-            ? pts_ns - branch->srt_video_base_pts_ns
+        (pts_ns >= branch->srt_video_base_dts_ns
+            ? pts_ns - branch->srt_video_base_dts_ns
             : 0);
+    if (rel_pts > branch->srt_video_max_pts_ns)
+        branch->srt_video_max_pts_ns = rel_pts;
     rel_dts = GST_CLOCK_TIME_IS_VALID(dts_ns)
         ? branch->srt_video_running_origin_ns +
-            (dts_ns >= branch->srt_video_base_pts_ns
-                ? dts_ns - branch->srt_video_base_pts_ns
+            (dts_ns >= branch->srt_video_base_dts_ns
+                ? dts_ns - branch->srt_video_base_dts_ns
                 : 0)
         : GST_CLOCK_TIME_NONE;
 
@@ -1234,7 +1261,6 @@ static void sink_branch_free(gpointer data)
     g_free(branch->file_container);
     if (branch->srt_callers)
         g_hash_table_destroy(branch->srt_callers);
-
     /* Tee pads and elements are released in unlink_sink_branch() before free */
 
     g_free(branch);
@@ -1532,7 +1558,7 @@ static int start_srt_session(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
         "is-live",      TRUE,
         "do-timestamp", FALSE,
         "block",        FALSE,
-        "max-bytes",    48000 * 2 * 2 / 2,
+        "max-bytes",    SBS_SRT_AUDIO_APP_MAX_BYTES,
         NULL);
     gst_caps_unref(audio_caps);
 
@@ -1551,10 +1577,10 @@ static int start_srt_session(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
         "leaky",            2,
         NULL);
     g_object_set(audio_queue,
-        "max-size-buffers", (guint)20,
-        "max-size-time",    (guint64)(200 * GST_MSECOND),
+        "max-size-buffers", (guint)0,
+        "max-size-time",    (guint64)SBS_SRT_AUDIO_BUFFER_NS,
         "max-size-bytes",   (guint)0,
-        "leaky",            2,
+        "leaky",            0,
         NULL);
     g_object_set(video_pacer,
         "sync", TRUE,
@@ -1617,7 +1643,9 @@ static int start_srt_session(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
         g_hash_table_remove_all(branch->srt_callers);
     branch->srt_video_base_valid = false;
     branch->srt_video_base_pts_ns = 0;
+    branch->srt_video_base_dts_ns = 0;
     branch->srt_video_running_origin_ns = 0;
+    branch->srt_video_max_pts_ns = 0;
     branch->srt_video_buffers_pushed = 0;
     branch->srt_video_push_failures = 0;
     branch->srt_stats_bytes_valid = false;
@@ -1771,7 +1799,7 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
             "is-live",      TRUE,
             "do-timestamp", FALSE,
             "block",        FALSE,
-            "max-bytes",    48000 * 2 * 2 / 2,
+            "max-bytes",    SBS_SRT_AUDIO_APP_MAX_BYTES,
             NULL);
         gst_caps_unref(raw_caps);
         g_object_set(branch_audio_encoder, "bitrate", 192000, NULL);
@@ -1804,10 +1832,10 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
 
     if (direct_audio) {
         g_object_set(aqueue,
-            "max-size-buffers", (guint)20,
-            "max-size-time",    (guint64)(200 * GST_MSECOND),
+            "max-size-buffers", (guint)0,
+            "max-size-time",    (guint64)SBS_SRT_AUDIO_BUFFER_NS,
             "max-size-bytes",   (guint)0,
-            "leaky",            2,
+            "leaky",            0,
             NULL);
     } else {
         g_object_set(aqueue,
@@ -2487,10 +2515,10 @@ void sbs_encoder_manager_consume_audio(sbs_encoder_manager_t *mgr,
                                         const void *audio_data)
 {
     GstElement *audio_appsrc;
+    GPtrArray *direct_pushes;
     uint64_t duration_ns;
     GstClockTime pts_ns;
     GstFlowReturn ret;
-    GPtrArray *direct_appsrcs;
 
     if (!mgr || !msg || !audio_data) return;
 
@@ -2507,22 +2535,21 @@ void sbs_encoder_manager_consume_audio(sbs_encoder_manager_t *mgr,
     }
     audio_appsrc = gst_object_ref(mgr->audio_appsrc);
     pts_ns = next_audio_sample_time(mgr, msg, duration_ns);
-    direct_appsrcs = g_ptr_array_new();
+    direct_pushes = g_ptr_array_new_with_free_func(direct_audio_push_req_free);
     if (mgr->direct_audio_branches) {
         for (guint i = 0; i < mgr->direct_audio_branches->len; i++) {
             sink_branch_t *branch = g_ptr_array_index(mgr->direct_audio_branches, i);
+            direct_audio_push_req_t *req;
             if (!branch->direct_audio || !branch->audio_appsrc)
                 continue;
             if (branch->sink_type && strcmp(branch->sink_type, "srt") == 0 &&
                 (g_atomic_int_get(&branch->srt_caller_count) <= 0 ||
                  g_atomic_int_get(&branch->drop_until_keyframe)))
                 continue;
-            GstClockTime branch_pts = direct_audio_branch_next_pts(branch,
-                                                                   pts_ns,
-                                                                   duration_ns);
-            g_ptr_array_add(direct_appsrcs, gst_object_ref(branch->audio_appsrc));
-            g_ptr_array_add(direct_appsrcs, GUINT_TO_POINTER((guint)(branch_pts >> 32)));
-            g_ptr_array_add(direct_appsrcs, GUINT_TO_POINTER((guint)(branch_pts & 0xffffffffu)));
+            req = g_new0(direct_audio_push_req_t, 1);
+            req->appsrc = gst_object_ref(branch->audio_appsrc);
+            req->pts_ns = direct_audio_branch_next_pts(branch, pts_ns, duration_ns);
+            g_ptr_array_add(direct_pushes, req);
         }
     }
     pthread_mutex_unlock(&mgr->audio_mutex);
@@ -2534,21 +2561,24 @@ void sbs_encoder_manager_consume_audio(sbs_encoder_manager_t *mgr,
         ret = GST_FLOW_ERROR;
     gst_object_unref(audio_appsrc);
 
-    for (guint i = 0; i + 2 < direct_appsrcs->len; i += 3) {
-        GstElement *branch_appsrc = g_ptr_array_index(direct_appsrcs, i);
-        uint64_t hi = (uint64_t)GPOINTER_TO_UINT(g_ptr_array_index(direct_appsrcs, i + 1));
-        uint64_t lo = (uint64_t)GPOINTER_TO_UINT(g_ptr_array_index(direct_appsrcs, i + 2));
-        GstClockTime branch_pts = (GstClockTime)((hi << 32) | lo);
-        GstBuffer *branch_buffer = make_audio_buffer(msg, audio_data, branch_pts, duration_ns);
+    for (guint i = 0; i < direct_pushes->len; i++) {
+        direct_audio_push_req_t *req = g_ptr_array_index(direct_pushes, i);
+        GstBuffer *branch_buffer;
+        GstFlowReturn branch_ret;
+
+        if (!req || !req->appsrc)
+            continue;
+
+        branch_buffer = make_audio_buffer(msg, audio_data, req->pts_ns, duration_ns);
         if (!branch_buffer)
             continue;
-        GstFlowReturn branch_ret = gst_app_src_push_buffer(GST_APP_SRC(branch_appsrc), branch_buffer);
+
+        branch_ret = gst_app_src_push_buffer(GST_APP_SRC(req->appsrc), branch_buffer);
         if (branch_ret != GST_FLOW_OK) {
             LOG_W("direct SRT audio appsrc push failed: %s", gst_flow_get_name(branch_ret));
         }
-        gst_object_unref(branch_appsrc);
     }
-    g_ptr_array_free(direct_appsrcs, TRUE);
+    g_ptr_array_free(direct_pushes, TRUE);
 
     pthread_mutex_lock(&mgr->audio_mutex);
     if (ret == GST_FLOW_OK) {

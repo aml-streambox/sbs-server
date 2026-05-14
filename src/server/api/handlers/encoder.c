@@ -146,14 +146,17 @@ int sbs_api_handle_encoder_update_config(sbs_api_server_t *server,
     if (rc_mode_j && cJSON_IsNumber(rc_mode_j))
         cfg.rc_mode = (int32_t)rc_mode_j->valuedouble;
 
+    char *log_codec = g_strdup(cfg.codec ? cfg.codec : "h265");
     int rc = sbs_encoder_manager_update_config(server->encoder_mgr, &cfg);
     if (rc != 0) {
+        g_free(log_codec);
         *error = api_error(-32011, "Failed to update encoder config");
         return rc;
     }
 
     LOG_I("encoder config updated: codec=%s bitrate=%u gop=%u gop_pattern=%d rc_mode=%d",
-          cfg.codec ? cfg.codec : "h265", cfg.bitrate_kbps, cfg.gop_size, cfg.gop_pattern, cfg.rc_mode);
+          log_codec, cfg.bitrate_kbps, cfg.gop_size, cfg.gop_pattern, cfg.rc_mode);
+    g_free(log_codec);
 
     /* Return new config */
     return sbs_api_handle_encoder_get_config(server, client, params, result, error);

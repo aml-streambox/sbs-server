@@ -34,6 +34,7 @@ typedef struct sbs_direct_venc_packet {
 
 sbs_direct_venc_t *sbs_direct_venc_new(const sbs_direct_venc_config_t *config);
 void sbs_direct_venc_free(sbs_direct_venc_t *enc);
+uint64_t sbs_direct_venc_reorder_delay_ns(const sbs_direct_venc_t *enc);
 
 int sbs_direct_venc_submit_ptr(sbs_direct_venc_t *enc,
                                const sbs_video_frame_msg_t *msg,

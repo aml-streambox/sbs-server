@@ -67,6 +67,12 @@ if systemd_dep.found()
     server_deps += [systemd_dep]
 endif
 
+if srt_dep.found()
+    server_deps += [srt_dep]
+else
+    error('libsrt dependency is required for SRT outputs')
+endif
+
 if not get_option('tests')
     executable('sbs-server',
         server_sources + engine_sources + supervisor_sources + config_sources + api_sources,

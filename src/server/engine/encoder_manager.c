@@ -20,19 +20,29 @@
 #include "sbs/direct_venc.h"
 #include "sbs/log.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <pthread.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
+#include <gst/app/gstappsink.h>
+#include <srt/srt.h>
 
 /* ── Sink Branch State ────────────────────────────────────────── */
 
-typedef struct direct_audio_push_req {
-    GstElement *appsrc;
-    GstClockTime pts_ns;
-} direct_audio_push_req_t;
+typedef struct mux_feed_buffer {
+    GstBuffer *buffer;
+    bool is_video;
+    GstClockTime sort_time;
+    GstClockTime pts_time;
+} mux_feed_buffer_t;
+
+#define SBS_SRT_MUX_AUDIO_WAIT_NS (40ULL * GST_MSECOND)
+#define SBS_SRT_MUX_AUDIO_TOLERANCE_NS (32ULL * GST_MSECOND)
 
 typedef struct sink_branch {
     char       *output_id;
@@ -80,6 +90,32 @@ typedef struct sink_branch {
     uint64_t    srt_last_bytes_sent_total;
     uint64_t    srt_last_bytes_change_video_count;
 
+    pthread_mutex_t srt_sender_mutex;
+    pthread_t       srt_accept_thread;
+    bool            srt_sender_initialized;
+    bool            srt_sender_running;
+    bool            srt_accept_started;
+    SRTSOCKET       srt_listener;
+    GArray         *srt_clients;
+    GByteArray    *srt_ts_input;
+    GByteArray    *srt_video_ts_backlog;
+    GByteArray    *srt_send_payload;
+    uint16_t        srt_listen_port;
+    uint64_t        srt_sender_bytes_sent;
+    uint64_t        srt_sender_send_failures;
+
+    pthread_mutex_t mux_feed_mutex;
+    pthread_cond_t  mux_feed_cond;
+    pthread_t       mux_feed_thread;
+    bool            mux_feed_initialized;
+    bool            mux_feed_running;
+    bool            mux_feed_started;
+    bool            mux_audio_coverage_valid;
+    GstClockTime    mux_audio_pushed_until_ns;
+    uint64_t        mux_audio_wait_warnings;
+    GQueue         *mux_video_queue;
+    GQueue         *mux_audio_queue;
+
     /* Deep-copied config for potential restart */
     char       *sink_type;
     char       *srt_uri;
@@ -95,6 +131,11 @@ typedef struct sink_branch {
 #define SBS_ENCODER_PACER_DELAY_NS (100ULL * GST_MSECOND)
 #define SBS_SRT_AUDIO_BUFFER_NS (5ULL * GST_SECOND)
 #define SBS_SRT_AUDIO_APP_MAX_BYTES (48000u * 2u * 2u * 5u)
+#define SBS_TS_PACKET_SIZE 188u
+#define SBS_TS_VIDEO_PID 0x100u
+#define SBS_TS_AUDIO_PID 0x101u
+#define SBS_SRT_VIDEO_BACKLOG_MAX_PACKETS 65536u
+#define SBS_SRT_VIDEO_DRAIN_AFTER_AUDIO_PACKETS 98u
 
 static void set_appsrc_queue_limits(GstElement *appsrc,
                                     guint64 max_bytes,
@@ -190,15 +231,311 @@ static void unlink_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch
 static int  start_srt_session(sbs_encoder_manager_t *mgr, sink_branch_t *branch);
 static void stop_srt_session(sbs_encoder_manager_t *mgr, sink_branch_t *branch);
 static void flush_srt_session(sink_branch_t *branch);
+static bool update_srt_sink_stats(sink_branch_t *branch);
+static GstClockTime element_running_time(GstElement *pipeline);
+static GstFlowReturn on_srt_ts_sample(GstAppSink *appsink, gpointer user_data);
+static int  start_custom_srt_sender(sink_branch_t *branch);
+static void stop_custom_srt_sender(sink_branch_t *branch);
 
-static void direct_audio_push_req_free(gpointer data)
+static bool srt_gop_pattern_has_bframes(int32_t gop_pattern)
 {
-    direct_audio_push_req_t *req = data;
-    if (!req)
+    switch (gop_pattern) {
+    case 1:
+    case 2:
+    case 3:
+    case 6:
+    case 7:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool schedule_srt_late_join_keyframe(sink_branch_t *branch,
+                                            int32_t *gop_pattern_out,
+                                            uint64_t *frames_pushed_out)
+{
+    sbs_encoder_manager_t *mgr = branch ? branch->manager : NULL;
+    int32_t gop_pattern = -1;
+    uint64_t frames_pushed = 0;
+    bool force_idr = false;
+
+    if (!mgr)
+        return false;
+
+    g_atomic_int_set(&branch->drop_until_keyframe, TRUE);
+
+    pthread_mutex_lock(&mgr->pipeline_mutex);
+    gop_pattern = mgr->gop_pattern;
+    frames_pushed = mgr->frames_pushed;
+    force_idr = !srt_gop_pattern_has_bframes(gop_pattern) || frames_pushed == 0;
+    if (force_idr)
+        mgr->force_next_idr = true;
+    pthread_mutex_unlock(&mgr->pipeline_mutex);
+
+    if (gop_pattern_out)
+        *gop_pattern_out = gop_pattern;
+    if (frames_pushed_out)
+        *frames_pushed_out = frames_pushed;
+
+    return force_idr;
+}
+
+static void mux_feed_buffer_free(gpointer data)
+{
+    mux_feed_buffer_t *item = data;
+    if (!item)
         return;
-    if (req->appsrc)
-        gst_object_unref(req->appsrc);
-    g_free(req);
+    if (item->buffer)
+        gst_buffer_unref(item->buffer);
+    g_free(item);
+}
+
+static void mux_feed_clear_queue(GQueue *queue)
+{
+    if (!queue)
+        return;
+    while (!g_queue_is_empty(queue))
+        mux_feed_buffer_free(g_queue_pop_head(queue));
+}
+
+static GstClockTime mux_feed_sort_time(GstBuffer *buffer, bool is_video)
+{
+    GstClockTime time;
+
+    if (!buffer)
+        return 0;
+
+    if (is_video) {
+        time = GST_BUFFER_DTS(buffer);
+        if (GST_CLOCK_TIME_IS_VALID(time))
+            return time;
+    }
+
+    time = GST_BUFFER_PTS(buffer);
+    return GST_CLOCK_TIME_IS_VALID(time) ? time : 0;
+}
+
+static GstClockTime mux_feed_pts_time(GstBuffer *buffer)
+{
+    GstClockTime time;
+
+    if (!buffer)
+        return 0;
+
+    time = GST_BUFFER_PTS(buffer);
+    return GST_CLOCK_TIME_IS_VALID(time) ? time : 0;
+}
+
+static void mux_feed_wait_until(sink_branch_t *branch, GstClockTime target_time)
+{
+    if (!branch || !branch->srt_pipeline || !GST_CLOCK_TIME_IS_VALID(target_time))
+        return;
+
+    GstClockTime now = element_running_time(branch->srt_pipeline);
+    if (!GST_CLOCK_TIME_IS_VALID(now) || target_time <= now)
+        return;
+
+    GstClockTime wait_ns = target_time - now;
+    if (wait_ns > 100 * GST_MSECOND)
+        wait_ns = 100 * GST_MSECOND;
+    g_usleep((gulong)(wait_ns / 1000));
+}
+
+static void mux_feed_timedwait_ns(sink_branch_t *branch, uint64_t wait_ns)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += (time_t)(wait_ns / GST_SECOND);
+    ts.tv_nsec += (long)(wait_ns % GST_SECOND);
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000L;
+    }
+
+    pthread_cond_timedwait(&branch->mux_feed_cond, &branch->mux_feed_mutex, &ts);
+}
+
+static void mux_feed_reset_locked(sink_branch_t *branch)
+{
+    if (!branch)
+        return;
+    mux_feed_clear_queue(branch->mux_video_queue);
+    mux_feed_clear_queue(branch->mux_audio_queue);
+    branch->mux_audio_coverage_valid = false;
+    branch->mux_audio_pushed_until_ns = 0;
+    branch->mux_audio_wait_warnings = 0;
+}
+
+static void mux_feed_enqueue_buffer(sink_branch_t *branch,
+                                    GstBuffer *buffer,
+                                    bool is_video)
+{
+    mux_feed_buffer_t *item;
+
+    if (!branch || !buffer || !branch->mux_feed_initialized) {
+        if (buffer)
+            gst_buffer_unref(buffer);
+        return;
+    }
+
+    item = g_new0(mux_feed_buffer_t, 1);
+    item->buffer = buffer;
+    item->is_video = is_video;
+    item->sort_time = mux_feed_sort_time(buffer, is_video);
+    item->pts_time = mux_feed_pts_time(buffer);
+
+    pthread_mutex_lock(&branch->mux_feed_mutex);
+    if (!branch->mux_feed_running) {
+        pthread_mutex_unlock(&branch->mux_feed_mutex);
+        mux_feed_buffer_free(item);
+        return;
+    }
+
+    g_queue_push_tail(is_video ? branch->mux_video_queue : branch->mux_audio_queue, item);
+    pthread_cond_signal(&branch->mux_feed_cond);
+    pthread_mutex_unlock(&branch->mux_feed_mutex);
+}
+
+static void *mux_feed_thread_main(void *data)
+{
+    sink_branch_t *branch = data;
+
+    for (;;) {
+        mux_feed_buffer_t *item = NULL;
+        mux_feed_buffer_t *video;
+        mux_feed_buffer_t *audio;
+
+        pthread_mutex_lock(&branch->mux_feed_mutex);
+        while (branch->mux_feed_running &&
+               g_queue_is_empty(branch->mux_video_queue) &&
+               g_queue_is_empty(branch->mux_audio_queue)) {
+            pthread_cond_wait(&branch->mux_feed_cond, &branch->mux_feed_mutex);
+        }
+
+        if (!branch->mux_feed_running) {
+            pthread_mutex_unlock(&branch->mux_feed_mutex);
+            break;
+        }
+
+        video = g_queue_peek_head(branch->mux_video_queue);
+        audio = g_queue_peek_head(branch->mux_audio_queue);
+        if (audio && (!video || audio->sort_time <= video->pts_time)) {
+            item = g_queue_pop_head(branch->mux_audio_queue);
+        } else if (video) {
+            bool audio_covers_video = branch->mux_audio_coverage_valid &&
+                branch->mux_audio_pushed_until_ns + SBS_SRT_MUX_AUDIO_TOLERANCE_NS >= video->pts_time;
+            if (!audio_covers_video && !audio) {
+                mux_feed_timedwait_ns(branch, SBS_SRT_MUX_AUDIO_WAIT_NS);
+                pthread_mutex_unlock(&branch->mux_feed_mutex);
+                continue;
+            } else if (!audio_covers_video && audio && audio->sort_time > video->pts_time) {
+                branch->mux_audio_wait_warnings++;
+                if (branch->mux_audio_wait_warnings <= 5 ||
+                    branch->mux_audio_wait_warnings % 120 == 0) {
+                    LOG_W("SRT session '%s' feeding video ahead of audio discontinuity #%lu video_time=%luns audio_next=%luns audio_until=%luns",
+                          branch->output_id ? branch->output_id : "<unknown>",
+                          (unsigned long)branch->mux_audio_wait_warnings,
+                          (unsigned long)video->pts_time,
+                          (unsigned long)audio->sort_time,
+                          (unsigned long)(branch->mux_audio_coverage_valid
+                              ? branch->mux_audio_pushed_until_ns : 0));
+                }
+            }
+
+            if (!item)
+                item = g_queue_pop_head(branch->mux_video_queue);
+        }
+        pthread_mutex_unlock(&branch->mux_feed_mutex);
+
+        if (!item)
+            continue;
+
+        GstElement *appsrc = item->is_video
+            ? branch->srt_video_appsrc
+            : branch->srt_audio_appsrc;
+        GstClockTime pts = item->buffer ? GST_BUFFER_PTS(item->buffer) : GST_CLOCK_TIME_NONE;
+        GstClockTime duration = item->buffer ? GST_BUFFER_DURATION(item->buffer) : GST_CLOCK_TIME_NONE;
+        size_t size = item->buffer ? gst_buffer_get_size(item->buffer) : 0;
+        GstFlowReturn ret;
+
+        if (item->is_video)
+            mux_feed_wait_until(branch, item->sort_time);
+
+        if (appsrc) {
+            ret = gst_app_src_push_buffer(GST_APP_SRC(appsrc), item->buffer);
+            item->buffer = NULL; /* appsrc takes ownership, even on flow errors. */
+        } else {
+            ret = GST_FLOW_ERROR;
+        }
+
+        if (item->is_video) {
+            if (ret == GST_FLOW_OK) {
+                branch->srt_video_buffers_pushed++;
+                if (branch->srt_video_buffers_pushed <= 3 ||
+                    branch->srt_video_buffers_pushed % 120 == 0) {
+                    if (!update_srt_sink_stats(branch)) {
+                        mux_feed_buffer_free(item);
+                        continue;
+                    }
+                }
+                if (branch->srt_video_buffers_pushed <= 3 ||
+                    branch->srt_video_buffers_pushed % 600 == 0) {
+                    LOG_I("SRT session '%s' video pushed #%lu pts=%luns size=%zu",
+                          branch->output_id,
+                          (unsigned long)branch->srt_video_buffers_pushed,
+                          (unsigned long)pts,
+                          size);
+                }
+            } else {
+                branch->srt_video_push_failures++;
+                if (branch->srt_video_push_failures <= 5 ||
+                    branch->srt_video_push_failures % 100 == 0) {
+                    LOG_W("SRT session '%s' video appsrc push failed #%lu: %s",
+                          branch->output_id,
+                          (unsigned long)branch->srt_video_push_failures,
+                          gst_flow_get_name(ret));
+                }
+            }
+        } else {
+            if (ret == GST_FLOW_OK) {
+                GstClockTime end = GST_CLOCK_TIME_IS_VALID(pts) ? pts : item->sort_time;
+                if (GST_CLOCK_TIME_IS_VALID(duration))
+                    end += duration;
+
+                pthread_mutex_lock(&branch->mux_feed_mutex);
+                if (!branch->mux_audio_coverage_valid || end > branch->mux_audio_pushed_until_ns) {
+                    branch->mux_audio_coverage_valid = true;
+                    branch->mux_audio_pushed_until_ns = end;
+                }
+                pthread_mutex_unlock(&branch->mux_feed_mutex);
+
+                branch->direct_audio_buffers_pushed++;
+                if (branch->direct_audio_buffers_pushed <= 3 ||
+                    branch->direct_audio_buffers_pushed % 600 == 0) {
+                    LOG_I("SRT session '%s' audio pushed #%lu pts=%luns size=%zu",
+                          branch->output_id,
+                          (unsigned long)branch->direct_audio_buffers_pushed,
+                          (unsigned long)pts,
+                          size);
+                }
+            } else {
+                branch->direct_audio_push_failures++;
+                if (branch->direct_audio_push_failures <= 5 ||
+                    branch->direct_audio_push_failures % 100 == 0) {
+                    LOG_W("SRT session '%s' audio appsrc push failed #%lu: %s",
+                          branch->output_id,
+                          (unsigned long)branch->direct_audio_push_failures,
+                          gst_flow_get_name(ret));
+                }
+            }
+        }
+
+        mux_feed_buffer_free(item);
+    }
+
+    return NULL;
 }
 
 static void on_srt_caller_added(GstElement *sink,
@@ -221,15 +558,14 @@ static void on_srt_caller_added(GstElement *sink,
     } else {
         g_atomic_int_set(&branch->srt_caller_count, 1);
     }
-    g_atomic_int_set(&branch->drop_until_keyframe, TRUE);
+    int32_t gop_pattern = -1;
+    uint64_t frames_pushed = 0;
+    bool forced_idr = schedule_srt_late_join_keyframe(branch, &gop_pattern, &frames_pushed);
 
-    pthread_mutex_lock(&mgr->pipeline_mutex);
-    g_atomic_int_set(&branch->drop_until_keyframe, TRUE);
-    mgr->force_next_idr = true;
-    pthread_mutex_unlock(&mgr->pipeline_mutex);
-
-    LOG_I("SRT caller %d connected; callers=%d scheduled IDR",
-          caller_id, g_atomic_int_get(&branch->srt_caller_count));
+    LOG_I("SRT caller %d connected; callers=%d %s (gop_pattern=%d frames_pushed=%lu)",
+          caller_id, g_atomic_int_get(&branch->srt_caller_count),
+          forced_idr ? "scheduled IDR" : "waiting for natural B-frame keyframe",
+          gop_pattern, (unsigned long)frames_pushed);
 }
 
 static void on_srt_caller_removed(GstElement *sink,
@@ -274,16 +610,460 @@ static gboolean on_srt_caller_connecting(GstElement *sink,
     if (!mgr)
         return TRUE;
 
-    g_atomic_int_set(&branch->drop_until_keyframe, TRUE);
     if (g_atomic_int_get(&branch->srt_caller_count) <= 0)
         flush_srt_session(branch);
 
-    pthread_mutex_lock(&mgr->pipeline_mutex);
-    mgr->force_next_idr = true;
-    pthread_mutex_unlock(&mgr->pipeline_mutex);
+    int32_t gop_pattern = -1;
+    uint64_t frames_pushed = 0;
+    bool forced_idr = schedule_srt_late_join_keyframe(branch, &gop_pattern, &frames_pushed);
 
-    LOG_I("SRT caller connecting; scheduled IDR");
+    LOG_I("SRT caller connecting; %s (gop_pattern=%d frames_pushed=%lu)",
+          forced_idr ? "scheduled IDR" : "waiting for natural B-frame keyframe",
+          gop_pattern, (unsigned long)frames_pushed);
     return TRUE;
+}
+
+static void ensure_srt_ready(void)
+{
+    static gsize initialized = 0;
+    if (g_once_init_enter(&initialized)) {
+        srt_startup();
+        g_once_init_leave(&initialized, 1);
+    }
+}
+
+static uint16_t parse_srt_listen_port(const char *uri)
+{
+    const char *colon;
+    char *end = NULL;
+    long port;
+
+    if (!uri || !*uri)
+        return 0;
+
+    colon = strrchr(uri, ':');
+    if (!colon || !colon[1])
+        return 0;
+
+    port = strtol(colon + 1, &end, 10);
+    if (port <= 0 || port > 65535)
+        return 0;
+    if (end && *end && *end != '/' && *end != '?')
+        return 0;
+
+    return (uint16_t)port;
+}
+
+static bool set_srt_sockopt(SRTSOCKET sock, SRT_SOCKOPT opt,
+                            const void *value, int size,
+                            const char *name)
+{
+    if (srt_setsockopt(sock, 0, opt, value, size) == 0)
+        return true;
+
+    LOG_W("custom SRT: failed to set %s: %s", name, srt_getlasterror_str());
+    return false;
+}
+
+static void configure_srt_sender_socket(SRTSOCKET sock, uint32_t latency_ms)
+{
+    SRT_TRANSTYPE transtype = SRTT_LIVE;
+    int yes = 1;
+    int payload = SRT_LIVE_DEF_PLSIZE;
+    int timeout_ms = 20;
+    int latency = latency_ms > 0 ? (int)latency_ms : 600;
+
+    set_srt_sockopt(sock, SRTO_TRANSTYPE, &transtype, sizeof(transtype), "SRTO_TRANSTYPE");
+    set_srt_sockopt(sock, SRTO_REUSEADDR, &yes, sizeof(yes), "SRTO_REUSEADDR");
+    set_srt_sockopt(sock, SRTO_SENDER, &yes, sizeof(yes), "SRTO_SENDER");
+    set_srt_sockopt(sock, SRTO_TSBPDMODE, &yes, sizeof(yes), "SRTO_TSBPDMODE");
+    set_srt_sockopt(sock, SRTO_PAYLOADSIZE, &payload, sizeof(payload), "SRTO_PAYLOADSIZE");
+    set_srt_sockopt(sock, SRTO_LATENCY, &latency, sizeof(latency), "SRTO_LATENCY");
+    set_srt_sockopt(sock, SRTO_SNDTIMEO, &timeout_ms, sizeof(timeout_ms), "SRTO_SNDTIMEO");
+}
+
+static bool custom_srt_schedule_keyframe(sink_branch_t *branch,
+                                         int32_t *gop_pattern_out,
+                                         uint64_t *frames_pushed_out)
+{
+    return schedule_srt_late_join_keyframe(branch, gop_pattern_out, frames_pushed_out);
+}
+
+static void custom_srt_client_connected(sink_branch_t *branch,
+                                        SRTSOCKET client,
+                                        guint caller_count)
+{
+    if (!branch)
+        return;
+
+    g_atomic_int_set(&branch->srt_caller_count, (gint)caller_count);
+    int32_t gop_pattern = -1;
+    uint64_t frames_pushed = 0;
+    bool forced_idr = custom_srt_schedule_keyframe(branch, &gop_pattern, &frames_pushed);
+    LOG_I("custom SRT caller %d connected; callers=%u %s (gop_pattern=%d frames_pushed=%lu)",
+          (int)client, caller_count,
+          forced_idr ? "scheduled IDR" : "waiting for natural B-frame keyframe",
+          gop_pattern, (unsigned long)frames_pushed);
+}
+
+static void custom_srt_clients_removed(sink_branch_t *branch,
+                                       guint removed,
+                                       guint caller_count)
+{
+    if (!branch || removed == 0)
+        return;
+
+    g_atomic_int_set(&branch->srt_caller_count, (gint)caller_count);
+    if (caller_count == 0) {
+        g_atomic_int_set(&branch->drop_until_keyframe, TRUE);
+        pthread_mutex_lock(&branch->srt_sender_mutex);
+        if (branch->srt_video_ts_backlog)
+            g_byte_array_set_size(branch->srt_video_ts_backlog, 0);
+        if (branch->srt_ts_input)
+            g_byte_array_set_size(branch->srt_ts_input, 0);
+        if (branch->srt_send_payload)
+            g_byte_array_set_size(branch->srt_send_payload, 0);
+        pthread_mutex_unlock(&branch->srt_sender_mutex);
+        flush_srt_session(branch);
+    }
+    LOG_I("custom SRT callers removed=%u callers=%u", removed, caller_count);
+}
+
+static void *custom_srt_accept_thread_main(void *data)
+{
+    sink_branch_t *branch = data;
+
+    while (branch) {
+        SRTSOCKET listener;
+        SRTSOCKET client;
+        SRTSOCKET added_client = SRT_INVALID_SOCK;
+        struct sockaddr_storage addr;
+        int addrlen = sizeof(addr);
+        guint caller_count = 0;
+        bool running;
+
+        pthread_mutex_lock(&branch->srt_sender_mutex);
+        running = branch->srt_sender_running;
+        listener = branch->srt_listener;
+        pthread_mutex_unlock(&branch->srt_sender_mutex);
+        if (!running || listener == SRT_INVALID_SOCK)
+            break;
+
+        client = srt_accept(listener, (struct sockaddr *)&addr, &addrlen);
+        if (client == SRT_INVALID_SOCK) {
+            pthread_mutex_lock(&branch->srt_sender_mutex);
+            running = branch->srt_sender_running;
+            pthread_mutex_unlock(&branch->srt_sender_mutex);
+            if (!running)
+                break;
+            g_usleep(10000);
+            continue;
+        }
+
+        pthread_mutex_lock(&branch->srt_sender_mutex);
+        if (branch->srt_sender_running && branch->srt_clients) {
+            g_array_append_val(branch->srt_clients, client);
+            caller_count = branch->srt_clients->len;
+            added_client = client;
+            client = SRT_INVALID_SOCK;
+        }
+        pthread_mutex_unlock(&branch->srt_sender_mutex);
+
+        if (client != SRT_INVALID_SOCK) {
+            srt_close(client);
+        } else {
+            custom_srt_client_connected(branch, added_client, caller_count);
+        }
+    }
+
+    return NULL;
+}
+
+static int start_custom_srt_sender(sink_branch_t *branch)
+{
+    struct sockaddr_in sa;
+    SRTSOCKET listener;
+    uint16_t port;
+
+    if (!branch)
+        return SBS_ERR_INVAL;
+
+    ensure_srt_ready();
+    port = parse_srt_listen_port(branch->srt_uri);
+    if (port == 0) {
+        LOG_E("custom SRT: invalid listen URI '%s'", branch->srt_uri ? branch->srt_uri : "<null>");
+        return SBS_ERR_INVAL;
+    }
+
+    if (!branch->srt_sender_initialized) {
+        pthread_mutex_init(&branch->srt_sender_mutex, NULL);
+        branch->srt_clients = g_array_new(FALSE, FALSE, sizeof(SRTSOCKET));
+        branch->srt_ts_input = g_byte_array_new();
+        branch->srt_video_ts_backlog = g_byte_array_new();
+        branch->srt_send_payload = g_byte_array_new();
+        branch->srt_sender_initialized = true;
+    }
+
+    listener = srt_create_socket();
+    if (listener == SRT_INVALID_SOCK) {
+        LOG_E("custom SRT: create socket failed: %s", srt_getlasterror_str());
+        return SBS_ERR_IO;
+    }
+    configure_srt_sender_socket(listener, branch->srt_latency_ms);
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (srt_bind(listener, (struct sockaddr *)&sa, sizeof(sa)) == SRT_ERROR) {
+        LOG_E("custom SRT: bind port %u failed: %s", port, srt_getlasterror_str());
+        srt_close(listener);
+        return SBS_ERR_IO;
+    }
+    if (srt_listen(listener, 8) == SRT_ERROR) {
+        LOG_E("custom SRT: listen port %u failed: %s", port, srt_getlasterror_str());
+        srt_close(listener);
+        return SBS_ERR_IO;
+    }
+
+    pthread_mutex_lock(&branch->srt_sender_mutex);
+    g_array_set_size(branch->srt_clients, 0);
+    if (branch->srt_video_ts_backlog)
+        g_byte_array_set_size(branch->srt_video_ts_backlog, 0);
+    if (branch->srt_ts_input)
+        g_byte_array_set_size(branch->srt_ts_input, 0);
+    if (branch->srt_send_payload)
+        g_byte_array_set_size(branch->srt_send_payload, 0);
+    branch->srt_listener = listener;
+    branch->srt_listen_port = port;
+    branch->srt_sender_running = true;
+    branch->srt_accept_started = false;
+    branch->srt_sender_bytes_sent = 0;
+    branch->srt_sender_send_failures = 0;
+    pthread_mutex_unlock(&branch->srt_sender_mutex);
+
+    if (pthread_create(&branch->srt_accept_thread, NULL,
+                       custom_srt_accept_thread_main, branch) != 0) {
+        LOG_E("custom SRT: failed to start accept thread");
+        stop_custom_srt_sender(branch);
+        return SBS_ERR_IO;
+    }
+    branch->srt_accept_started = true;
+    LOG_I("custom SRT sender listening on port %u latency=%ums", port,
+          branch->srt_latency_ms > 0 ? branch->srt_latency_ms : 600);
+    return SBS_OK;
+}
+
+static void stop_custom_srt_sender(sink_branch_t *branch)
+{
+    SRTSOCKET listener = SRT_INVALID_SOCK;
+
+    if (!branch || !branch->srt_sender_initialized)
+        return;
+
+    pthread_mutex_lock(&branch->srt_sender_mutex);
+    branch->srt_sender_running = false;
+    listener = branch->srt_listener;
+    branch->srt_listener = SRT_INVALID_SOCK;
+    if (branch->srt_clients) {
+        for (guint i = 0; i < branch->srt_clients->len; i++) {
+            SRTSOCKET client = g_array_index(branch->srt_clients, SRTSOCKET, i);
+            if (client != SRT_INVALID_SOCK)
+                srt_close(client);
+        }
+        g_array_set_size(branch->srt_clients, 0);
+    }
+    if (branch->srt_video_ts_backlog)
+        g_byte_array_set_size(branch->srt_video_ts_backlog, 0);
+    if (branch->srt_ts_input)
+        g_byte_array_set_size(branch->srt_ts_input, 0);
+    if (branch->srt_send_payload)
+        g_byte_array_set_size(branch->srt_send_payload, 0);
+    pthread_mutex_unlock(&branch->srt_sender_mutex);
+
+    if (listener != SRT_INVALID_SOCK)
+        srt_close(listener);
+    if (branch->srt_accept_started) {
+        pthread_join(branch->srt_accept_thread, NULL);
+        branch->srt_accept_started = false;
+    }
+    g_atomic_int_set(&branch->srt_caller_count, 0);
+}
+
+static guint ts_packet_pid(const uint8_t *packet)
+{
+    return ((guint)(packet[1] & 0x1f) << 8) | (guint)packet[2];
+}
+
+static void custom_srt_send_message_locked(sink_branch_t *branch,
+                                           const uint8_t *data,
+                                           gsize size,
+                                           guint *removed)
+{
+    if (!branch || !data || size == 0 || !branch->srt_clients)
+        return;
+
+    for (gint i = (gint)branch->srt_clients->len - 1; i >= 0; i--) {
+        SRTSOCKET client = g_array_index(branch->srt_clients, SRTSOCKET, (guint)i);
+        int len = (int)size;
+        int rc = srt_sendmsg(client, (const char *)data, len, -1, 0);
+        if (rc == SRT_ERROR || rc != len) {
+            branch->srt_sender_send_failures++;
+            srt_close(client);
+            g_array_remove_index_fast(branch->srt_clients, (guint)i);
+            if (removed)
+                (*removed)++;
+        } else {
+            branch->srt_sender_bytes_sent += size;
+        }
+    }
+}
+
+static void custom_srt_flush_payload_locked(sink_branch_t *branch,
+                                            guint *removed,
+                                            bool force)
+{
+    if (!branch || !branch->srt_send_payload)
+        return;
+
+    while (branch->srt_send_payload->len >= (guint)SRT_LIVE_DEF_PLSIZE ||
+           (force && branch->srt_send_payload->len > 0)) {
+        guint bytes = MIN((guint)SRT_LIVE_DEF_PLSIZE, branch->srt_send_payload->len);
+        custom_srt_send_message_locked(branch, branch->srt_send_payload->data, bytes, removed);
+        g_byte_array_remove_range(branch->srt_send_payload, 0, bytes);
+        if (!branch->srt_clients || branch->srt_clients->len == 0)
+            break;
+    }
+}
+
+static void custom_srt_send_bytes_locked(sink_branch_t *branch,
+                                         const uint8_t *data,
+                                         gsize size,
+                                         guint *removed)
+{
+    if (!branch || !data || size == 0 || !branch->srt_clients || branch->srt_clients->len == 0)
+        return;
+
+    if (!branch->srt_send_payload)
+        branch->srt_send_payload = g_byte_array_new();
+
+    g_byte_array_append(branch->srt_send_payload, data, size);
+    custom_srt_flush_payload_locked(branch, removed, false);
+}
+
+static void custom_srt_send_video_backlog_locked(sink_branch_t *branch,
+                                                 guint max_packets,
+                                                 guint *removed)
+{
+    guint packets;
+    guint bytes;
+
+    if (!branch || !branch->srt_video_ts_backlog || branch->srt_video_ts_backlog->len == 0)
+        return;
+
+    packets = branch->srt_video_ts_backlog->len / SBS_TS_PACKET_SIZE;
+    if (max_packets > 0 && packets > max_packets)
+        packets = max_packets;
+    bytes = packets * SBS_TS_PACKET_SIZE;
+    if (bytes == 0)
+        return;
+
+    custom_srt_send_bytes_locked(branch, branch->srt_video_ts_backlog->data, bytes, removed);
+    g_byte_array_remove_range(branch->srt_video_ts_backlog, 0, bytes);
+}
+
+static void custom_srt_send_interleaved_locked(sink_branch_t *branch,
+                                               const uint8_t *data,
+                                               gsize size,
+                                               guint *removed)
+{
+    if (!branch || !data || size == 0 || !branch->srt_clients || branch->srt_clients->len == 0)
+        return;
+
+    if (!branch->srt_video_ts_backlog)
+        branch->srt_video_ts_backlog = g_byte_array_new();
+    if (!branch->srt_ts_input)
+        branch->srt_ts_input = g_byte_array_new();
+
+    g_byte_array_append(branch->srt_ts_input, data, size);
+
+    while (branch->srt_ts_input->len >= SBS_TS_PACKET_SIZE) {
+        const uint8_t *packet = branch->srt_ts_input->data;
+        guint pid;
+
+        if (packet[0] != 0x47) {
+            guint sync = 1;
+            while (sync < branch->srt_ts_input->len && branch->srt_ts_input->data[sync] != 0x47)
+                sync++;
+            if (sync >= branch->srt_ts_input->len) {
+                g_byte_array_set_size(branch->srt_ts_input, 0);
+                return;
+            }
+            g_byte_array_remove_range(branch->srt_ts_input, 0, sync);
+            continue;
+        }
+
+        pid = ts_packet_pid(packet);
+        if (pid == SBS_TS_VIDEO_PID) {
+            g_byte_array_append(branch->srt_video_ts_backlog, packet, SBS_TS_PACKET_SIZE);
+            while (branch->srt_video_ts_backlog->len / SBS_TS_PACKET_SIZE >
+                   SBS_SRT_VIDEO_BACKLOG_MAX_PACKETS) {
+                custom_srt_send_video_backlog_locked(branch, 7, removed);
+            }
+        } else if (pid == SBS_TS_AUDIO_PID) {
+            custom_srt_send_bytes_locked(branch, packet, SBS_TS_PACKET_SIZE, removed);
+            custom_srt_send_video_backlog_locked(branch,
+                                                SBS_SRT_VIDEO_DRAIN_AFTER_AUDIO_PACKETS,
+                                                removed);
+        } else {
+            custom_srt_send_bytes_locked(branch, packet, SBS_TS_PACKET_SIZE, removed);
+        }
+        g_byte_array_remove_range(branch->srt_ts_input, 0, SBS_TS_PACKET_SIZE);
+    }
+}
+
+static GstFlowReturn on_srt_ts_sample(GstAppSink *appsink, gpointer user_data)
+{
+    sink_branch_t *branch = user_data;
+    GstSample *sample;
+    GstBuffer *buffer;
+    GstMapInfo map;
+    guint removed = 0;
+    guint caller_count = 0;
+
+    if (!branch)
+        return GST_FLOW_ERROR;
+
+    sample = gst_app_sink_pull_sample(appsink);
+    if (!sample)
+        return GST_FLOW_OK;
+
+    buffer = gst_sample_get_buffer(sample);
+    if (!buffer || !gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
+
+    pthread_mutex_lock(&branch->srt_sender_mutex);
+    if (branch->srt_sender_running && branch->srt_clients && branch->srt_clients->len > 0) {
+        custom_srt_send_interleaved_locked(branch, map.data, map.size, &removed);
+        caller_count = branch->srt_clients->len;
+    } else if (branch->srt_video_ts_backlog) {
+        g_byte_array_set_size(branch->srt_video_ts_backlog, 0);
+        if (branch->srt_ts_input)
+            g_byte_array_set_size(branch->srt_ts_input, 0);
+        if (branch->srt_send_payload)
+            g_byte_array_set_size(branch->srt_send_payload, 0);
+    }
+    pthread_mutex_unlock(&branch->srt_sender_mutex);
+
+    gst_buffer_unmap(buffer, &map);
+    gst_sample_unref(sample);
+
+    if (removed > 0)
+        custom_srt_clients_removed(branch, removed, caller_count);
+
+    return GST_FLOW_OK;
 }
 
 static GstPadProbeReturn srt_keyframe_gate_probe(GstPad *pad,
@@ -521,6 +1301,12 @@ static void flush_srt_session(sink_branch_t *branch)
     branch->srt_stats_bytes_valid = false;
     branch->srt_last_bytes_sent_total = 0;
     branch->srt_last_bytes_change_video_count = 0;
+    if (branch->mux_feed_initialized) {
+        pthread_mutex_lock(&branch->mux_feed_mutex);
+        mux_feed_reset_locked(branch);
+        pthread_cond_signal(&branch->mux_feed_cond);
+        pthread_mutex_unlock(&branch->mux_feed_mutex);
+    }
     if (mgr) pthread_mutex_lock(&mgr->audio_mutex);
     branch->direct_audio_base_valid = false;
     branch->direct_audio_next_valid = false;
@@ -541,7 +1327,18 @@ static bool update_srt_sink_stats(sink_branch_t *branch)
     uint64_t stale_frames;
     gboolean have_bytes;
 
-    if (!branch || !branch->sink || g_atomic_int_get(&branch->srt_caller_count) <= 0)
+    if (!branch || g_atomic_int_get(&branch->srt_caller_count) <= 0)
+        return false;
+
+    if (branch->srt_sender_initialized) {
+        pthread_mutex_lock(&branch->srt_sender_mutex);
+        bytes_sent_total = branch->srt_sender_bytes_sent;
+        pthread_mutex_unlock(&branch->srt_sender_mutex);
+        have_bytes = TRUE;
+        goto have_total;
+    }
+
+    if (!branch->sink)
         return false;
 
     g_object_get(branch->sink, "stats", &stats, NULL);
@@ -553,6 +1350,7 @@ static bool update_srt_sink_stats(sink_branch_t *branch)
     if (!have_bytes)
         return true;
 
+have_total:
     if (!branch->srt_stats_bytes_valid) {
         branch->srt_stats_bytes_valid = true;
         branch->srt_last_bytes_sent_total = bytes_sent_total;
@@ -724,7 +1522,6 @@ static void push_srt_session_packet(sbs_encoder_manager_t *mgr,
     GstClockTime rel_pts;
     GstClockTime rel_dts;
     GstBuffer *buffer;
-    GstFlowReturn ret;
 
     if (!mgr || !branch || !branch->srt_video_appsrc || !packet ||
         !packet->data || packet->size == 0)
@@ -750,6 +1547,10 @@ static void push_srt_session_packet(sbs_encoder_manager_t *mgr,
         branch->srt_stats_bytes_valid = false;
         branch->srt_last_bytes_sent_total = 0;
         branch->srt_last_bytes_change_video_count = 0;
+        pthread_mutex_lock(&branch->mux_feed_mutex);
+        mux_feed_reset_locked(branch);
+        pthread_cond_signal(&branch->mux_feed_cond);
+        pthread_mutex_unlock(&branch->mux_feed_mutex);
         pthread_mutex_lock(&mgr->audio_mutex);
         branch->direct_audio_base_valid = true;
         branch->direct_audio_next_valid = false;
@@ -798,29 +1599,7 @@ static void push_srt_session_packet(sbs_encoder_manager_t *mgr,
     else
         GST_BUFFER_FLAG_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT);
 
-    ret = gst_app_src_push_buffer(GST_APP_SRC(branch->srt_video_appsrc), buffer);
-    if (ret == GST_FLOW_OK) {
-        branch->srt_video_buffers_pushed++;
-        if (branch->srt_video_buffers_pushed <= 3 || branch->srt_video_buffers_pushed % 120 == 0) {
-            if (!update_srt_sink_stats(branch))
-                return;
-        }
-        if (branch->srt_video_buffers_pushed <= 3 || branch->srt_video_buffers_pushed % 600 == 0) {
-            LOG_I("SRT session '%s' video pushed #%lu pts=%luns size=%zu",
-                  branch->output_id,
-                  (unsigned long)branch->srt_video_buffers_pushed,
-                  (unsigned long)rel_pts,
-                  packet->size);
-        }
-    } else {
-        branch->srt_video_push_failures++;
-        if (branch->srt_video_push_failures <= 5 || branch->srt_video_push_failures % 100 == 0) {
-            LOG_W("SRT session '%s' video appsrc push failed #%lu: %s",
-                  branch->output_id,
-                  (unsigned long)branch->srt_video_push_failures,
-                  gst_flow_get_name(ret));
-        }
-    }
+    mux_feed_enqueue_buffer(branch, buffer, true);
 }
 
 static void direct_audio_branch_remove(sbs_encoder_manager_t *mgr,
@@ -1261,6 +2040,32 @@ static void sink_branch_free(gpointer data)
     g_free(branch->file_container);
     if (branch->srt_callers)
         g_hash_table_destroy(branch->srt_callers);
+    stop_custom_srt_sender(branch);
+    if (branch->srt_sender_initialized) {
+        if (branch->srt_clients)
+            g_array_free(branch->srt_clients, TRUE);
+        if (branch->srt_video_ts_backlog)
+            g_byte_array_free(branch->srt_video_ts_backlog, TRUE);
+        if (branch->srt_ts_input)
+            g_byte_array_free(branch->srt_ts_input, TRUE);
+        if (branch->srt_send_payload)
+            g_byte_array_free(branch->srt_send_payload, TRUE);
+        pthread_mutex_destroy(&branch->srt_sender_mutex);
+    }
+    if (branch->mux_feed_initialized) {
+        pthread_mutex_lock(&branch->mux_feed_mutex);
+        branch->mux_feed_running = false;
+        pthread_cond_signal(&branch->mux_feed_cond);
+        pthread_mutex_unlock(&branch->mux_feed_mutex);
+        if (branch->mux_feed_started)
+            pthread_join(branch->mux_feed_thread, NULL);
+        mux_feed_clear_queue(branch->mux_video_queue);
+        mux_feed_clear_queue(branch->mux_audio_queue);
+        g_queue_free(branch->mux_video_queue);
+        g_queue_free(branch->mux_audio_queue);
+        pthread_cond_destroy(&branch->mux_feed_cond);
+        pthread_mutex_destroy(&branch->mux_feed_mutex);
+    }
     /* Tee pads and elements are released in unlink_sink_branch() before free */
 
     g_free(branch);
@@ -1503,13 +2308,7 @@ static int start_srt_session(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
     audio_capsfilter = gst_element_factory_make("capsfilter", NULL);
     muxer = create_muxer(mgr->codec, "srt", NULL, &muxer_format);
 
-    sbs_sink_branch_config_t cfg = {
-        .output_id = branch->output_id,
-        .sink_type = branch->sink_type,
-        .srt_uri = branch->srt_uri,
-        .srt_latency_ms = branch->srt_latency_ms,
-    };
-    sink = create_sink(&cfg, muxer_format);
+    sink = gst_element_factory_make("appsink", NULL);
 
     if (!pipeline || !video_src || !video_queue || !parser || !video_pacer || !audio_src ||
         !audio_queue || !audio_convert || !audio_resample || !audio_encoder ||
@@ -1583,19 +2382,26 @@ static int start_srt_session(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
         "leaky",            0,
         NULL);
     g_object_set(video_pacer,
-        "sync", TRUE,
+        "sync", FALSE,
         NULL);
     g_object_set(audio_encoder, "bitrate", 192000, NULL);
     g_object_set(parser,
         "config-interval",    (gint)-1,
         "disable-passthrough", TRUE,
         NULL);
-    g_signal_connect(sink, "caller-connecting",
-                     G_CALLBACK(on_srt_caller_connecting), branch);
-    g_signal_connect(sink, "caller-added",
-                     G_CALLBACK(on_srt_caller_added), branch);
-    g_signal_connect(sink, "caller-removed",
-                     G_CALLBACK(on_srt_caller_removed), branch);
+    g_object_set(sink,
+        "emit-signals", TRUE,
+        "sync",         FALSE,
+        "async",        FALSE,
+        "max-buffers",  (guint)256,
+        "drop",         TRUE,
+        NULL);
+
+    branch->manager = mgr;
+    branch->drop_until_keyframe = TRUE;
+    branch->srt_caller_count = 0;
+    g_signal_connect(sink, "new-sample",
+                     G_CALLBACK(on_srt_ts_sample), branch);
 
     gst_bin_add_many(GST_BIN(pipeline),
         video_src, video_queue, parser, video_pacer,
@@ -1617,17 +2423,28 @@ static int start_srt_session(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
     gst_bus_add_watch(bus, on_srt_session_bus_message, branch);
     gst_object_unref(bus);
 
+    int srt_rc = start_custom_srt_sender(branch);
+    if (srt_rc != SBS_OK) {
+        LOG_E("SRT session '%s' failed to start custom sender", branch->output_id);
+        bus = gst_element_get_bus(pipeline);
+        gst_bus_remove_watch(bus);
+        gst_object_unref(bus);
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(pipeline);
+        return srt_rc;
+    }
+
     GstStateChangeReturn ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
         LOG_E("SRT session '%s' failed to enter PLAYING", branch->output_id);
         bus = gst_element_get_bus(pipeline);
         gst_bus_remove_watch(bus);
         gst_object_unref(bus);
+        stop_custom_srt_sender(branch);
         gst_object_unref(pipeline);
         return SBS_ERR_IO;
     }
 
-    branch->manager = mgr;
     branch->srt_pipeline = pipeline;
     branch->srt_video_appsrc = gst_object_ref(video_src);
     branch->srt_audio_appsrc = gst_object_ref(audio_src);
@@ -1635,8 +2452,6 @@ static int start_srt_session(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
     branch->muxer = muxer;
     branch->sink = sink;
     branch->direct_audio = true;
-    branch->drop_until_keyframe = TRUE;
-    branch->srt_caller_count = 0;
     if (!branch->srt_callers)
         branch->srt_callers = g_hash_table_new(g_direct_hash, g_direct_equal);
     else
@@ -1651,6 +2466,28 @@ static int start_srt_session(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
     branch->srt_stats_bytes_valid = false;
     branch->srt_last_bytes_sent_total = 0;
     branch->srt_last_bytes_change_video_count = 0;
+
+    if (!branch->mux_feed_initialized) {
+        pthread_mutex_init(&branch->mux_feed_mutex, NULL);
+        pthread_cond_init(&branch->mux_feed_cond, NULL);
+        branch->mux_video_queue = g_queue_new();
+        branch->mux_audio_queue = g_queue_new();
+        branch->mux_feed_initialized = true;
+    }
+    pthread_mutex_lock(&branch->mux_feed_mutex);
+    mux_feed_reset_locked(branch);
+    branch->mux_feed_running = true;
+    branch->mux_feed_started = false;
+    pthread_mutex_unlock(&branch->mux_feed_mutex);
+    if (pthread_create(&branch->mux_feed_thread, NULL, mux_feed_thread_main, branch) != 0) {
+        LOG_E("failed to start SRT mux feeder for '%s'", branch->output_id);
+        pthread_mutex_lock(&branch->mux_feed_mutex);
+        branch->mux_feed_running = false;
+        pthread_mutex_unlock(&branch->mux_feed_mutex);
+        stop_srt_session(mgr, branch);
+        return SBS_ERR_IO;
+    }
+    branch->mux_feed_started = true;
 
     LOG_I("SRT session '%s' started", branch->output_id);
     return SBS_OK;
@@ -1669,6 +2506,22 @@ static void stop_srt_session(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
 
     pipeline = branch->srt_pipeline;
     video_appsrc = branch->srt_video_appsrc;
+
+    if (branch->mux_feed_initialized) {
+        pthread_mutex_lock(&branch->mux_feed_mutex);
+        branch->mux_feed_running = false;
+        pthread_cond_signal(&branch->mux_feed_cond);
+        pthread_mutex_unlock(&branch->mux_feed_mutex);
+        if (branch->mux_feed_started) {
+            pthread_join(branch->mux_feed_thread, NULL);
+            branch->mux_feed_started = false;
+        }
+        pthread_mutex_lock(&branch->mux_feed_mutex);
+        mux_feed_reset_locked(branch);
+        pthread_mutex_unlock(&branch->mux_feed_mutex);
+    }
+
+    stop_custom_srt_sender(branch);
 
     pthread_mutex_lock(&mgr->audio_mutex);
     audio_appsrc = branch->srt_audio_appsrc;
@@ -2515,7 +3368,6 @@ void sbs_encoder_manager_consume_audio(sbs_encoder_manager_t *mgr,
                                         const void *audio_data)
 {
     GstElement *audio_appsrc;
-    GPtrArray *direct_pushes;
     uint64_t duration_ns;
     GstClockTime pts_ns;
     GstFlowReturn ret;
@@ -2535,21 +3387,22 @@ void sbs_encoder_manager_consume_audio(sbs_encoder_manager_t *mgr,
     }
     audio_appsrc = gst_object_ref(mgr->audio_appsrc);
     pts_ns = next_audio_sample_time(mgr, msg, duration_ns);
-    direct_pushes = g_ptr_array_new_with_free_func(direct_audio_push_req_free);
     if (mgr->direct_audio_branches) {
         for (guint i = 0; i < mgr->direct_audio_branches->len; i++) {
             sink_branch_t *branch = g_ptr_array_index(mgr->direct_audio_branches, i);
-            direct_audio_push_req_t *req;
+            GstClockTime branch_pts;
+            GstBuffer *branch_buffer;
+
             if (!branch->direct_audio || !branch->audio_appsrc)
                 continue;
             if (branch->sink_type && strcmp(branch->sink_type, "srt") == 0 &&
                 (g_atomic_int_get(&branch->srt_caller_count) <= 0 ||
                  g_atomic_int_get(&branch->drop_until_keyframe)))
                 continue;
-            req = g_new0(direct_audio_push_req_t, 1);
-            req->appsrc = gst_object_ref(branch->audio_appsrc);
-            req->pts_ns = direct_audio_branch_next_pts(branch, pts_ns, duration_ns);
-            g_ptr_array_add(direct_pushes, req);
+            branch_pts = direct_audio_branch_next_pts(branch, pts_ns, duration_ns);
+            branch_buffer = make_audio_buffer(msg, audio_data, branch_pts, duration_ns);
+            if (branch_buffer)
+                mux_feed_enqueue_buffer(branch, branch_buffer, false);
         }
     }
     pthread_mutex_unlock(&mgr->audio_mutex);
@@ -2560,25 +3413,6 @@ void sbs_encoder_manager_consume_audio(sbs_encoder_manager_t *mgr,
     else
         ret = GST_FLOW_ERROR;
     gst_object_unref(audio_appsrc);
-
-    for (guint i = 0; i < direct_pushes->len; i++) {
-        direct_audio_push_req_t *req = g_ptr_array_index(direct_pushes, i);
-        GstBuffer *branch_buffer;
-        GstFlowReturn branch_ret;
-
-        if (!req || !req->appsrc)
-            continue;
-
-        branch_buffer = make_audio_buffer(msg, audio_data, req->pts_ns, duration_ns);
-        if (!branch_buffer)
-            continue;
-
-        branch_ret = gst_app_src_push_buffer(GST_APP_SRC(req->appsrc), branch_buffer);
-        if (branch_ret != GST_FLOW_OK) {
-            LOG_W("direct SRT audio appsrc push failed: %s", gst_flow_get_name(branch_ret));
-        }
-    }
-    g_ptr_array_free(direct_pushes, TRUE);
 
     pthread_mutex_lock(&mgr->audio_mutex);
     if (ret == GST_FLOW_OK) {

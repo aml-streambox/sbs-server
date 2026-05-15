@@ -212,8 +212,11 @@ struct sbs_direct_venc {
     int next_submit_id;
     uint64_t output_counter;
     uint64_t frame_duration_ns;
-    bool output_dts_origin_valid;
-    uint64_t output_dts_origin_ns;
+    bool last_packet_dts_valid;
+    uint64_t last_packet_dts_ns;
+    bool input_frame_num_origin_valid;
+    int input_frame_num_origin;
+    int submit_id_origin;
     GQueue *pending_frames;
 };
 
@@ -320,9 +323,12 @@ static uint64_t bframe_delay_ns(const sbs_direct_venc_t *enc)
 }
 
 static uint64_t calculate_packet_dts(sbs_direct_venc_t *enc,
-                                     const sbs_pending_frame_t *pending)
+                                     const sbs_pending_frame_t *pending,
+                                     uint64_t packet_pts_ns)
 {
-    uint64_t origin;
+    uint64_t delay_ns;
+    uint64_t dts_ns;
+    uint64_t min_next_ns;
 
     if (!enc || !pending)
         return UINT64_MAX;
@@ -330,15 +336,23 @@ static uint64_t calculate_packet_dts(sbs_direct_venc_t *enc,
     if (!enc->bframe_enabled || enc->frame_duration_ns == 0)
         return pending->dts_ns;
 
-    if (!enc->output_dts_origin_valid) {
-        enc->output_dts_origin_ns = pending->pts_ns != UINT64_MAX
+    if (packet_pts_ns == UINT64_MAX)
+        packet_pts_ns = pending->pts_ns != UINT64_MAX
             ? pending->pts_ns
             : (uint64_t)pending->id * enc->frame_duration_ns;
-        enc->output_dts_origin_valid = true;
+
+    delay_ns = bframe_delay_ns(enc);
+    dts_ns = packet_pts_ns >= delay_ns ? packet_pts_ns - delay_ns : packet_pts_ns;
+
+    if (enc->last_packet_dts_valid) {
+        min_next_ns = enc->last_packet_dts_ns + enc->frame_duration_ns;
+        if (dts_ns < min_next_ns)
+            dts_ns = min_next_ns;
     }
 
-    origin = enc->output_dts_origin_ns;
-    return origin + enc->output_counter * enc->frame_duration_ns;
+    enc->last_packet_dts_ns = dts_ns;
+    enc->last_packet_dts_valid = true;
+    return dts_ns;
 }
 
 static void pending_frame_free(gpointer data)
@@ -355,9 +369,21 @@ static sbs_pending_frame_t *pending_frame_take_match(sbs_direct_venc_t *enc, int
     if (!enc || !enc->pending_frames)
         return NULL;
     if (input_frame_num >= 0) {
+        int match_id = input_frame_num;
+        if (enc->bframe_enabled) {
+            sbs_pending_frame_t *head = g_queue_peek_head(enc->pending_frames);
+            if (!enc->input_frame_num_origin_valid && head) {
+                enc->input_frame_num_origin = input_frame_num;
+                enc->submit_id_origin = head->id;
+                enc->input_frame_num_origin_valid = true;
+            }
+            if (enc->input_frame_num_origin_valid)
+                match_id = enc->submit_id_origin +
+                           (input_frame_num - enc->input_frame_num_origin);
+        }
         for (GList *it = enc->pending_frames->head; it; it = it->next) {
             sbs_pending_frame_t *pending = it->data;
-            if (pending && pending->id == input_frame_num) {
+            if (pending && pending->id == match_id) {
                 g_queue_delete_link(enc->pending_frames, it);
                 return pending;
             }
@@ -386,12 +412,25 @@ static void pending_frame_push(sbs_direct_venc_t *enc,
 static void pending_frame_prune(sbs_direct_venc_t *enc)
 {
     uint32_t keep;
+    guint length;
+    guint idx = 0;
 
     if (!enc || !enc->pending_frames)
         return;
 
     keep = enc->bframe_enabled ? gop_pattern_delay_frames(enc->gop_pattern) + 4u : 2u;
-    while (g_queue_get_length(enc->pending_frames) > keep) {
+    length = g_queue_get_length(enc->pending_frames);
+    for (GList *it = enc->pending_frames->head; it; it = it->next, idx++) {
+        sbs_pending_frame_t *pending = it->data;
+        if (!pending)
+            continue;
+        if (idx + keep < length && pending->owned_input) {
+            g_free(pending->owned_input);
+            pending->owned_input = NULL;
+            pending->owned_input_size = 0;
+        }
+    }
+    while (g_queue_get_length(enc->pending_frames) > 4096u) {
         sbs_pending_frame_t *old = g_queue_pop_head(enc->pending_frames);
         pending_frame_free(old);
     }
@@ -553,6 +592,11 @@ static int submit_common(sbs_direct_venc_t *enc,
     sync_dmabuf_read(sync_fd, false);
 
     if (!meta.is_valid) {
+        if (enc->bframe_enabled && meta.err_cod == -ENOSYS && meta.input_frame_num < 0) {
+            pending_frame_prune(enc);
+            return SBS_OK;
+        }
+
         sbs_pending_frame_t *pending = g_queue_pop_tail(enc->pending_frames);
         pending_frame_free(pending);
         LOG_E("vl_multi_encoder_encode failed: err=%d input_frame_num=%d", meta.err_cod, meta.input_frame_num);
@@ -581,10 +625,7 @@ static int submit_common(sbs_direct_venc_t *enc,
                 ? pending->pts_ns + delay_ns
                 : ((uint64_t)pending->id * enc->frame_duration_ns) + delay_ns)
             : pending->pts_ns;
-        packet->dts_ns = calculate_packet_dts(enc, pending);
-        if (enc->bframe_enabled && packet->dts_ns != UINT64_MAX &&
-            packet->pts_ns != UINT64_MAX && packet->dts_ns > packet->pts_ns)
-            packet->dts_ns = packet->pts_ns;
+        packet->dts_ns = calculate_packet_dts(enc, pending, packet->pts_ns);
         packet->duration_ns = pending->duration_ns;
         packet->is_keyframe = pending->requested_idr;
         pending_frame_free(pending);

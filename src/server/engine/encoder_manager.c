@@ -1271,22 +1271,6 @@ static gboolean on_srt_session_bus_message(GstBus *bus, GstMessage *msg, gpointe
     return TRUE;
 }
 
-static void flush_appsrc_downstream(GstElement *appsrc)
-{
-    GstPad *src_pad;
-
-    if (!appsrc)
-        return;
-
-    src_pad = gst_element_get_static_pad(appsrc, "src");
-    if (!src_pad)
-        return;
-
-    gst_pad_push_event(src_pad, gst_event_new_flush_start());
-    gst_pad_push_event(src_pad, gst_event_new_flush_stop(FALSE));
-    gst_object_unref(src_pad);
-}
-
 static void flush_srt_session(sink_branch_t *branch)
 {
     sbs_encoder_manager_t *mgr = branch ? branch->manager : NULL;
@@ -1315,8 +1299,6 @@ static void flush_srt_session(sink_branch_t *branch)
     branch->direct_audio_buffers_pushed = 0;
     if (mgr) pthread_mutex_unlock(&mgr->audio_mutex);
 
-    flush_appsrc_downstream(branch->srt_video_appsrc);
-    flush_appsrc_downstream(branch->srt_audio_appsrc);
     LOG_I("SRT session '%s' flushed", branch->output_id);
 }
 

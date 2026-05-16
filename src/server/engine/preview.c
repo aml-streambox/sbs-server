@@ -51,6 +51,7 @@ typedef struct preview_runtime {
     GMutex ice_mutex;
     GPtrArray *ice_candidates; /* pending ICE candidates as cJSON strings */
     bool webrtc_ready;
+    bool webrtc_offer_requested;
     bool reference_color;
     sbs_preview_color_mode_t active_color_mode;
     GMutex ready_mutex;
@@ -551,6 +552,7 @@ static void on_offer_created(GstPromise *promise, gpointer user_data)
     gst_structure_get(reply, "offer", GST_TYPE_WEBRTC_SESSION_DESCRIPTION, &offer, NULL);
     if (!offer) {
         LOG_E("WebRTC: failed to get offer from promise");
+        runtime->webrtc_offer_requested = false;
         gst_promise_unref(promise);
         return;
     }
@@ -617,23 +619,57 @@ static void on_offer_created(GstPromise *promise, gpointer user_data)
     gst_promise_unref(promise);
 }
 
+static void request_webrtc_offer(preview_runtime_t *runtime, const char *reason)
+{
+    GstPromise *promise;
+
+    if (!runtime || !runtime->webrtcbin || runtime->webrtc_ready ||
+        runtime->webrtc_offer_requested) {
+        return;
+    }
+
+    runtime->webrtc_offer_requested = true;
+    LOG_I("WebRTC: creating offer (%s)", reason ? reason : "requested");
+    promise = gst_promise_new_with_change_func(on_offer_created, runtime, NULL);
+    g_signal_emit_by_name(runtime->webrtcbin, "create-offer", NULL, promise);
+}
+
+static gboolean request_webrtc_offer_after_media(gpointer user_data)
+{
+    preview_runtime_t *runtime = user_data;
+
+    if (runtime) {
+        runtime->webrtc_offer_requested = false;
+    }
+    request_webrtc_offer(runtime, "media-ready");
+    return G_SOURCE_REMOVE;
+}
+
+static void schedule_webrtc_offer_after_media(preview_runtime_t *runtime)
+{
+    GSource *source;
+
+    if (!runtime || !runtime->context || runtime->webrtc_ready ||
+        runtime->webrtc_offer_requested) {
+        return;
+    }
+
+    runtime->webrtc_offer_requested = true;
+    source = g_timeout_source_new(100);
+    g_source_set_callback(source, request_webrtc_offer_after_media, runtime, NULL);
+    g_source_attach(source, runtime->context);
+    g_source_unref(source);
+}
+
 static void on_negotiation_needed(GstElement *webrtcbin, gpointer user_data)
 {
     preview_runtime_t *runtime = user_data;
-    GstPromise *promise;
     (void)webrtcbin;
 
     /* Only create the offer once; subsequent negotiation-needed signals
      * (e.g. after setting the remote answer) must be ignored to avoid
      * disrupting the already-established session. */
-    if (runtime->webrtc_ready) {
-        LOG_D("WebRTC: ignoring negotiation-needed (offer already created)");
-        return;
-    }
-
-    LOG_I("WebRTC: negotiation needed, creating offer");
-    promise = gst_promise_new_with_change_func(on_offer_created, runtime, NULL);
-    g_signal_emit_by_name(runtime->webrtcbin, "create-offer", NULL, promise);
+    request_webrtc_offer(runtime, "negotiation-needed");
 }
 
 static gboolean on_pipeline_bus_message(GstBus *bus, GstMessage *msg, gpointer user_data)
@@ -1347,6 +1383,7 @@ void sbs_preview_engine_consume_frame_ptr(sbs_preview_engine_t *engine,
         }
 
         runtime->frames_pushed++;
+        schedule_webrtc_offer_after_media(runtime);
         if (runtime->frames_pushed <= 3 || packet.is_keyframe ||
             runtime->frames_pushed % 300 == 0) {
             LOG_I("preview encoded frame pushed #%lu (%zu bytes key=%d)",
@@ -1391,6 +1428,7 @@ void sbs_preview_engine_consume_frame_ptr(sbs_preview_engine_t *engine,
         goto done;
     }
     runtime->frames_pushed++;
+    schedule_webrtc_offer_after_media(runtime);
     if (runtime->frames_pushed <= 3 || runtime->frames_pushed % 300 == 0) {
         LOG_I("preview frame pushed (ptr) #%lu (%ux%u)",
               (unsigned long)runtime->frames_pushed,
@@ -1551,6 +1589,7 @@ void sbs_preview_engine_consume_frame_dmabuf(sbs_preview_engine_t *engine,
         }
 
         runtime->frames_pushed++;
+        schedule_webrtc_offer_after_media(runtime);
         if (runtime->frames_pushed <= 3 || packet.is_keyframe ||
             runtime->frames_pushed % 300 == 0) {
             LOG_I("preview encoded dmabuf frame pushed #%lu (%zu bytes key=%d)",
@@ -1603,6 +1642,7 @@ void sbs_preview_engine_consume_frame_dmabuf(sbs_preview_engine_t *engine,
         goto done;
     }
     runtime->frames_pushed++;
+    schedule_webrtc_offer_after_media(runtime);
 done:
     g_mutex_unlock(&engine->lock);
     if (close_fd)

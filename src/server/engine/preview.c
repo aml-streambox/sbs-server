@@ -372,8 +372,8 @@ void sbs_preview_engine_set_source_format(sbs_preview_engine_t *engine,
     if (!engine)
         return;
     g_mutex_lock(&engine->lock);
-    old_default_fps = engine->src_fps && engine->src_fps < 30 ? engine->src_fps : 30;
-    new_default_fps = fps && fps < 30 ? fps : 30;
+    old_default_fps = engine->src_fps ? engine->src_fps : 30;
+    new_default_fps = fps ? fps : 30;
 
     engine->src_width = width;
     engine->src_height = height;
@@ -1926,11 +1926,6 @@ int sbs_preview_engine_update_profile_config(sbs_preview_engine_t *engine,
         profile->height = height;
     }
     if (framerate > 0) {
-        if (profile->requires_additional_encode && framerate > 30) {
-            LOG_I("preview profile %s capped at 30fps to protect 4K program output",
-                  profile_id);
-            framerate = 30;
-        }
         changed = changed || profile->framerate != framerate;
         profile->framerate = framerate;
     }

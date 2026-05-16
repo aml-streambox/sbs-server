@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #ifndef DRM_FORMAT_NV21
@@ -781,9 +782,8 @@ int sbs_direct_venc_submit_dmabuf(sbs_direct_venc_t *enc,
                                    bool force_idr,
                                    sbs_direct_venc_packet_t *packet)
 {
-    vl_buffer_info_t inbuf;
-
-    (void)size;
+    void *mapped;
+    int rc;
 
     if (!enc || !msg || dmabuf_fd < 0)
         return SBS_ERR_INVAL;
@@ -797,18 +797,20 @@ int sbs_direct_venc_submit_dmabuf(sbs_direct_venc_t *enc,
         }
     }
 
-    memset(&inbuf, 0, sizeof(inbuf));
-    inbuf.buf_type = DMA_TYPE;
-    inbuf.buf_fmt = enc->hdr10 ? IMG_FMT_P010 : IMG_FMT_NV21;
-    inbuf.buf_stride = (int)(msg->plane_stride[0] > 0 ? msg->plane_stride[0] : (enc->hdr10 ? msg->width * 2 : msg->width));
-    inbuf.buf_info.dma_info.shared_fd[0] = dmabuf_fd;
-    /* Native SDR/HDR export uses one contiguous codecmm DMA-BUF with Y
-     * followed by interleaved UV. libvpcodec's DMA path accepts this as a
-     * single-plane YUV buffer and resolves chroma addresses from stride/format. */
-    inbuf.buf_info.dma_info.shared_fd[1] = -1;
-    inbuf.buf_info.dma_info.shared_fd[2] = -1;
-    inbuf.buf_info.dma_info.num_planes = 1u;
+    /* libvpcodec only accepts DMA_TYPE for RGB/RGBA input on this platform.
+     * Native exports are NV21/P010, so map the single contiguous DMA-BUF and
+     * submit through the VMALLOC path to avoid the broken YUV DMA path. */
+    sync_dmabuf_write_end(dmabuf_fd);
+    sync_dmabuf_read(dmabuf_fd, true);
+    mapped = mmap(NULL, size, PROT_READ, MAP_SHARED, dmabuf_fd, 0);
+    if (mapped == MAP_FAILED) {
+        sync_dmabuf_read(dmabuf_fd, false);
+        LOG_E("dmabuf mmap for VMALLOC submit failed: %s", strerror(errno));
+        return SBS_ERR_IO;
+    }
 
-    return submit_common(enc, msg, &inbuf, dmabuf_fd, NULL, 0,
-                         force_idr, packet);
+    rc = sbs_direct_venc_submit_ptr(enc, msg, mapped, size, force_idr, packet);
+    munmap(mapped, size);
+    sync_dmabuf_read(dmabuf_fd, false);
+    return rc;
 }

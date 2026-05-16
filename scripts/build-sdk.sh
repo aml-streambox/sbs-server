@@ -19,6 +19,16 @@ source "$ROOT_DIR/scripts/sdk-env.sh"
 
 mkdir -p "$BUILD_DIR" "$ARTIFACT_DIR" "$GENERATED_CROSS_DIR"
 
+MESON_OPTIONS=(
+    --cross-file "$GENERATED_CROSS_FILE"
+    --prefix /usr
+    --sysconfdir /etc
+    --localstatedir /var
+    -Dplatform=amlogic
+    -Dshader_compile=true
+    -Dtests=false
+)
+
 python3 - <<'PY' > "$GENERATED_CROSS_FILE"
 import os, shlex
 
@@ -45,16 +55,9 @@ print("endian = 'little'")
 PY
 
 if [ ! -f "$BUILD_DIR/build.ninja" ]; then
-    meson setup "$BUILD_DIR" \
-        --cross-file "$GENERATED_CROSS_FILE" \
-        --prefix /usr \
-        --sysconfdir /etc \
-        --localstatedir /var \
-        -Dplatform=amlogic \
-        -Dshader_compile=true \
-        -Dtests=false
+    meson setup "$BUILD_DIR" "${MESON_OPTIONS[@]}"
 else
-    meson setup "$BUILD_DIR" --reconfigure --cross-file "$GENERATED_CROSS_FILE" --prefix /usr --sysconfdir /etc --localstatedir /var -Dshader_compile=true
+    meson setup "$BUILD_DIR" --reconfigure "${MESON_OPTIONS[@]}"
 fi
 
 meson compile -C "$BUILD_DIR"
@@ -69,10 +72,10 @@ install -d "$ARTIFACT_DIR/rootfs/etc/tmpfiles.d"
 install -m 0644 "$ROOT_DIR/data/sbs-tmpfiles.conf" "$ARTIFACT_DIR/rootfs/etc/tmpfiles.d/sbs.conf"
 
 cat > "$ARTIFACT_DIR/manifest.txt" <<EOF
-SDK_ROOT=$SBS_SDK_ROOT
-SDK_ENV_SCRIPT=$SBS_SDK_ENV_SCRIPT
-BUILD_DIR=$BUILD_DIR
-ROOTFS_DIR=$ARTIFACT_DIR/rootfs
+platform=amlogic
+shader_compile=true
+tests=false
+package=sbs-sdk-package.tar.gz
 EOF
 
 tar -C "$ARTIFACT_DIR/rootfs" -czf "$ARTIFACT_DIR/sbs-sdk-package.tar.gz" .

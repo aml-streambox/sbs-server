@@ -679,14 +679,16 @@ static void *native_preview_thread_func(void *arg)
                         hdr_copy_size = lease.backing_size;
                     }
                 }
-                if (!submitted && !sdr_reference && hdr_copy && hdr_copy_size >= lease.backing_size) {
-                    memcpy(hdr_copy, mapped, lease.backing_size);
-                    sbs_preview_engine_consume_frame_ptr(preview, &msg,
-                                                         hdr_copy, lease.backing_size);
-                    submitted = true;
-                } else {
-                    LOG_W("native preview copy allocation failed (%zu bytes)",
-                          lease.backing_size);
+                if (!submitted && !sdr_reference) {
+                    if (hdr_copy && hdr_copy_size >= lease.backing_size) {
+                        memcpy(hdr_copy, mapped, lease.backing_size);
+                        sbs_preview_engine_consume_frame_ptr(preview, &msg,
+                                                             hdr_copy, lease.backing_size);
+                        submitted = true;
+                    } else {
+                        LOG_W("native preview copy allocation failed (%zu bytes)",
+                              lease.backing_size);
+                    }
                 }
                 munmap(mapped, lease.backing_size);
             } else {

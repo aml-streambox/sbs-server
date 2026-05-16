@@ -23,6 +23,8 @@ if [ ! -d "$TARGET_SYSROOT" ]; then
     exit 1
 fi
 
+# Some Amlogic SDK exports include libvulkan but omit headers/pkg-config
+# metadata, so patch only the missing pieces needed by Meson discovery.
 if [ -n "$SRC_HEADERS" ] && [ -d "$SRC_HEADERS" ] && [ ! -d "$TARGET_SYSROOT/usr/include/vulkan" ]; then
     mkdir -p "$TARGET_SYSROOT/usr/include"
     cp -a "$SRC_HEADERS" "$TARGET_SYSROOT/usr/include/"

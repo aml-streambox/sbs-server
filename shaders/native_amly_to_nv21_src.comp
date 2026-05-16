@@ -48,6 +48,9 @@ uint bswap32(uint val) {
            ((val & 0xFF000000u) >> 24);
 }
 
+/* AMLY stores each 2-pixel 10-bit YUV422 pair in 5 bytes. The source words
+ * arrive as swapped 32-bit pairs, so all pair decoding must go through this
+ * correction before extracting Y0/U/Y1/V bits. */
 uint corrected_word(uint word_idx) {
     uint base = word_idx & ~1u;
     uint lo = src.data[base];
@@ -165,6 +168,10 @@ void main() {
     uint local_pair = gl_GlobalInvocationID.x;
     uint local_y = gl_GlobalInvocationID.y;
 
+    /* src_h == 0 is the compositor's sentinel dispatch for filling uncovered
+     * canvas rows with the background color. Normal source-driven dispatches
+     * set src_h to the captured frame height and write only visible source
+     * pairs, which keeps the over-wide AMLY base layer path under 16.7ms. */
     if (pc.src_h == 0u) {
         if (local_pair >= pc.src_pair_count)
             return;

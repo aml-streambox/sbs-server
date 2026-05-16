@@ -5,9 +5,8 @@
  * Each export destination (preview, output) has its own resolution,
  * color mode, and ring of export slots. The compositor renders the
  * composed scene once, then each destination's export pass samples
- * the composed RGBA and produces NV21 at the destination's native
- * resolution via a fused GPU pipeline (resize + tonemap + color
- * convert + chroma subsample).
+ * the composed RGBA and produces the destination's encoder format at native
+ * resolution: NV21 for SDR or P010 for HDR10.
  *
  * Export slots follow an explicit lifecycle:
  *   FREE → SUBMITTED → READY → IN_USE → FREE
@@ -46,7 +45,7 @@ typedef enum sbs_export_dest_type {
 /** Color mode for export conversion. */
 typedef enum sbs_export_color_mode {
     SBS_EXPORT_COLOR_SDR    = 0,   /**< BT.601/709 SDR (NV21 output) */
-    SBS_EXPORT_COLOR_HDR10  = 1,   /**< PQ HDR10 → SDR tone-mapped output */
+    SBS_EXPORT_COLOR_HDR10  = 1,   /**< PQ HDR10 output (P010) */
 } sbs_export_color_mode_t;
 
 /** Export slot lifecycle state. */
@@ -63,7 +62,7 @@ typedef enum sbs_export_slot_state {
  *
  *  Each slot owns GPU resources for one frame export:
  *  - A render target image (at destination resolution) for the export pass
- *  - A HOST_VISIBLE NV21 buffer for consumer readback
+ *  - A DMA-BUF-backed output buffer (NV21 for SDR, P010 for HDR10)
  *  - A fence for tracking GPU completion
  *  - A command buffer for the export pass
  */
@@ -74,10 +73,10 @@ typedef struct sbs_export_slot {
     VkImageView     render_view;
     VkFramebuffer   framebuffer;      /**< Framebuffer for export render pass */
 
-    VkBuffer        nv21_buffer;      /**< HOST_VISIBLE NV21 output buffer */
+    VkBuffer        nv21_buffer;      /**< Output buffer; legacy name, stores NV21 or P010 */
     VkDeviceMemory  nv21_memory;
     void           *nv21_mapped;      /**< Persistently mapped pointer */
-    VkDeviceSize    nv21_size;        /**< Size of NV21 data (w * h * 3/2) */
+    VkDeviceSize    nv21_size;        /**< Output byte size for NV21 or P010 */
     int             nv21_dmabuf_fd;   /**< Exported DMABUF fd for GstMemory ingest */
 
     VkFence         fence;            /**< Signaled when export GPU work completes */

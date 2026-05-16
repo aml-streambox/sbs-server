@@ -32,8 +32,9 @@ if [ ! -f "$SDK_SRC" ]; then
     exit 1
 fi
 
+installer_name=$(basename "$SDK_SRC")
 cp "$SDK_SRC" "$SDK_INSTALLERS_DIR/"
-sh "$SDK_INSTALLERS_DIR/$SDK_NAME" -y -d "$SDK_INSTALL_ROOT"
+sh "$SDK_INSTALLERS_DIR/$installer_name" -y -d "$SDK_INSTALL_ROOT"
 
 "$ROOT_DIR/scripts/sdk-patch.sh" "$SDK_INSTALL_ROOT"
 

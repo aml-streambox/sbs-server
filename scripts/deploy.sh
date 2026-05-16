@@ -34,9 +34,12 @@ scp "${ARTIFACT_DIR}${REMOTE_BINDIR}/sbs-cli" "${TARGET}:${REMOTE_BINDIR}/"
 
 msg "Deploying shaders to ${TARGET}..."
 ssh "${TARGET}" "mkdir -p ${REMOTE_SHADIR}"
-if ls "${ARTIFACT_DIR}${REMOTE_SHADIR}"/*.spv 2>/dev/null; then
-    scp "${ARTIFACT_DIR}${REMOTE_SHADIR}"/*.spv "${TARGET}:${REMOTE_SHADIR}/"
+shopt -s nullglob
+shader_files=("${ARTIFACT_DIR}${REMOTE_SHADIR}"/*.spv)
+if [ ${#shader_files[@]} -gt 0 ]; then
+    scp "${shader_files[@]}" "${TARGET}:${REMOTE_SHADIR}/"
 fi
+shopt -u nullglob
 
 msg "Deploying systemd unit..."
 scp "${ARTIFACT_DIR}${REMOTE_UNITDIR}/sbs-server.service" "${TARGET}:${REMOTE_UNITDIR}/"

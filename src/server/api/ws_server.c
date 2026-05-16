@@ -42,6 +42,7 @@ static double read_cpu_usage_pubsub(void)
 #include <unistd.h>
 
 #define WS_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+#define WS_MAX_TEXT_PAYLOAD ((guint64)192u * 1024u * 1024u)
 
 typedef struct {
     sbs_api_server_t *server;
@@ -54,7 +55,7 @@ typedef struct {
 
 static gpointer preview_http_thread_main(gpointer data);
 
-static char *build_ws_frame(const char *payload)
+static char *build_ws_frame(const char *payload, gsize *out_len)
 {
     gsize len = payload ? strlen(payload) : 0;
     GByteArray *buf = g_byte_array_sized_new(len + 10);
@@ -64,14 +65,22 @@ static char *build_ws_frame(const char *payload)
     hdr[hdr_len++] = 0x81;
     if (len < 126) {
         hdr[hdr_len++] = (guint8)len;
-    } else {
+    } else if (len <= 0xffffu) {
         hdr[hdr_len++] = 126;
         hdr[hdr_len++] = (guint8)((len >> 8) & 0xff);
         hdr[hdr_len++] = (guint8)(len & 0xff);
+    } else {
+        hdr[hdr_len++] = 127;
+        for (int shift = 56; shift >= 0; shift -= 8) {
+            hdr[hdr_len++] = (guint8)(((guint64)len >> shift) & 0xff);
+        }
     }
     g_byte_array_append(buf, hdr, hdr_len);
     if (len > 0) {
         g_byte_array_append(buf, (const guint8 *)payload, len);
+    }
+    if (out_len) {
+        *out_len = buf->len;
     }
     return (char *)g_byte_array_free(buf, FALSE);
 }
@@ -164,60 +173,129 @@ static gboolean recv_exact(int fd, void *buf, size_t len)
     return TRUE;
 }
 
+static gboolean send_exact(int fd, const void *buf, size_t len)
+{
+    const guint8 *p = buf;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = send(fd, p + off, len - off, 0);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                g_usleep(1000);
+                continue;
+            }
+            return FALSE;
+        }
+        if (n == 0) {
+            return FALSE;
+        }
+        off += (size_t)n;
+    }
+    return TRUE;
+}
+
 static char *read_ws_text_frame(int fd)
 {
-    guint8 hdr[2];
-    guint8 mask[4];
-    guint64 payload_len;
-    guint8 *payload;
-    guint64 i;
-    guint8 opcode;
+    GByteArray *message = NULL;
+    gboolean started = FALSE;
 
-    if (!recv_exact(fd, hdr, 2)) {
-        return NULL;
-    }
-    opcode = hdr[0] & 0x0f;
-    if (opcode == 0x8) {
-        return NULL;
-    }
-    if (opcode != 0x1) {
-        return NULL;
-    }
-    payload_len = hdr[1] & 0x7f;
-    if (payload_len == 126) {
-        guint8 ext[2];
-        if (!recv_exact(fd, ext, 2)) {
+    while (TRUE) {
+        guint8 hdr[2];
+        guint8 mask[4];
+        guint64 payload_len;
+        guint8 *payload;
+        guint64 i;
+        guint8 opcode;
+        gboolean fin;
+
+        if (!recv_exact(fd, hdr, 2)) {
+            if (message) g_byte_array_free(message, TRUE);
             return NULL;
         }
-        payload_len = ((guint64)ext[0] << 8) | ext[1];
-    }
-    if (!(hdr[1] & 0x80)) {
-        return NULL;
-    }
-    if (!recv_exact(fd, mask, 4)) {
-        return NULL;
-    }
-    payload = g_malloc(payload_len + 1);
-    if (!recv_exact(fd, payload, (size_t)payload_len)) {
+
+        fin = (hdr[0] & 0x80) != 0;
+        opcode = hdr[0] & 0x0f;
+        if (opcode == 0x8) {
+            if (message) g_byte_array_free(message, TRUE);
+            return NULL;
+        }
+        if (opcode != 0x1 && opcode != 0x0) {
+            if (message) g_byte_array_free(message, TRUE);
+            return NULL;
+        }
+        if ((opcode == 0x1 && started) || (opcode == 0x0 && !started)) {
+            if (message) g_byte_array_free(message, TRUE);
+            return NULL;
+        }
+        if (opcode == 0x1) {
+            started = TRUE;
+            message = g_byte_array_new();
+        }
+
+        payload_len = hdr[1] & 0x7f;
+        if (payload_len == 126) {
+            guint8 ext[2];
+            if (!recv_exact(fd, ext, 2)) {
+                if (message) g_byte_array_free(message, TRUE);
+                return NULL;
+            }
+            payload_len = ((guint64)ext[0] << 8) | ext[1];
+        } else if (payload_len == 127) {
+            guint8 ext[8];
+            payload_len = 0;
+            if (!recv_exact(fd, ext, 8)) {
+                if (message) g_byte_array_free(message, TRUE);
+                return NULL;
+            }
+            for (guint j = 0; j < sizeof(ext); j++) {
+                payload_len = (payload_len << 8) | ext[j];
+            }
+        }
+        if (!message || payload_len > WS_MAX_TEXT_PAYLOAD ||
+            message->len > WS_MAX_TEXT_PAYLOAD - payload_len ||
+            payload_len > (guint64)G_MAXSIZE) {
+            LOG_W("websocket text frame too large: %" G_GUINT64_FORMAT " bytes", payload_len);
+            if (message) g_byte_array_free(message, TRUE);
+            return NULL;
+        }
+        if (!(hdr[1] & 0x80)) {
+            g_byte_array_free(message, TRUE);
+            return NULL;
+        }
+        if (!recv_exact(fd, mask, 4)) {
+            g_byte_array_free(message, TRUE);
+            return NULL;
+        }
+        payload = payload_len > 0 ? g_malloc((gsize)payload_len) : NULL;
+        if (payload_len > 0) {
+            if (!recv_exact(fd, payload, (size_t)payload_len)) {
+                g_free(payload);
+                g_byte_array_free(message, TRUE);
+                return NULL;
+            }
+            for (i = 0; i < payload_len; i++) {
+                payload[i] ^= mask[i % 4];
+            }
+            g_byte_array_append(message, payload, (guint)payload_len);
+        }
         g_free(payload);
-        return NULL;
+
+        if (fin) {
+            g_byte_array_append(message, (const guint8 *)"", 1);
+            return (char *)g_byte_array_free(message, FALSE);
+        }
     }
-    for (i = 0; i < payload_len; i++) {
-        payload[i] ^= mask[i % 4];
-    }
-    payload[payload_len] = '\0';
-    return (char *)payload;
 }
 
 static gboolean send_ws_text(int fd, const char *payload)
 {
-    char *frame = build_ws_frame(payload);
-    gsize len = 2 + strlen(payload ? payload : "");
+    gsize len = 0;
+    char *frame = build_ws_frame(payload, &len);
     gboolean ok;
-    if (strlen(payload ? payload : "") >= 126) {
-        len += 2;
-    }
-    ok = send(fd, frame, len, 0) == (ssize_t)len;
+    ok = send_exact(fd, frame, len);
     g_free(frame);
     return ok;
 }

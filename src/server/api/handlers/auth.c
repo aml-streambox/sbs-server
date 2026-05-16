@@ -10,6 +10,12 @@ static const char *json_str(cJSON *obj, const char *key)
     return cJSON_IsString(item) ? cJSON_GetStringValue(item) : NULL;
 }
 
+static bool json_bool(cJSON *obj, const char *key)
+{
+    if (!cJSON_IsObject(obj)) return false;
+    return cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(obj, key));
+}
+
 static cJSON *api_error(int code, const char *message)
 {
     cJSON *err = cJSON_CreateObject();
@@ -40,10 +46,27 @@ int sbs_api_handle_auth_setup(sbs_api_server_t *server, sbs_api_client_t *client
                               cJSON *params, cJSON **result, cJSON **error)
 {
     char *token = NULL;
-    int rc = sbs_auth_manager_setup(server->auth,
-                                    json_str(params, "username"),
-                                    json_str(params, "password"),
-                                    &token);
+    int rc;
+
+    if (json_bool(params, "passwordless")) {
+        if (!sbs_auth_manager_setup_required(server->auth)) {
+            *error = api_error(-32010, "Invalid setup request");
+            return SBS_ERR_INVAL;
+        }
+        rc = sbs_auth_manager_set_passwordless(server->auth, true);
+        if (rc != SBS_OK) {
+            *error = api_error(-32010, "Invalid setup request");
+            return rc;
+        }
+        if (client) client->authenticated = true;
+        *result = login_result(server, NULL);
+        return SBS_OK;
+    }
+
+    rc = sbs_auth_manager_setup(server->auth,
+                                json_str(params, "username"),
+                                json_str(params, "password"),
+                                &token);
     if (rc != SBS_OK) {
         *error = api_error(-32010, "Invalid setup request");
         return rc;

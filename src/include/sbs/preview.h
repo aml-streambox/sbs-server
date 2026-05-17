@@ -78,14 +78,9 @@ int sbs_preview_engine_ensure_profile(sbs_preview_engine_t *engine,
 int sbs_preview_engine_release_profile(sbs_preview_engine_t *engine,
                                        const char *profile_id,
                                        sbs_preview_profile_t **out_profile);
-/* sbs_preview_engine_consume_frame — REMOVED (was fd-based memfd path) */
-void sbs_preview_engine_consume_frame_ptr(sbs_preview_engine_t *engine,
-                                            const sbs_video_frame_msg_t *msg,
-                                            const void *data,
-                                            size_t size);
 void sbs_preview_engine_consume_frame_dmabuf(sbs_preview_engine_t *engine,
-                                              const sbs_video_frame_msg_t *msg,
-                                              int dmabuf_fd,
+                                             const sbs_video_frame_msg_t *msg,
+                                             int dmabuf_fd,
                                               size_t size);
 void sbs_preview_engine_consume_audio(sbs_preview_engine_t *engine,
                                       const sbs_audio_buffer_msg_t *msg,

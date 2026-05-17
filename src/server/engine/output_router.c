@@ -13,6 +13,7 @@
 #define SBS_LOG_COMP "out-router"
 
 #include "sbs/output_router.h"
+#include "sbs/dmabuf_alloc.h"
 #include "sbs/encoder_manager.h"
 #include "sbs/export_dest.h"
 #include "sbs/ipc.h"
@@ -165,13 +166,13 @@ static void native_dmabuf_sync_read(int fd, bool start)
     }
 }
 
-static bool p010_to_nv21_reference(const sbs_video_frame_msg_t *src_msg,
-                                   const uint8_t *src,
-                                   size_t src_size,
-                                   uint8_t **buffer,
-                                   size_t *buffer_size,
-                                   sbs_video_frame_msg_t *dst_msg,
-                                   size_t *dst_size)
+static bool p010_to_nv21_reference_into(const sbs_video_frame_msg_t *src_msg,
+                                        const uint8_t *src,
+                                        size_t src_size,
+                                        uint8_t *dst,
+                                        size_t dst_capacity,
+                                        sbs_video_frame_msg_t *dst_msg,
+                                        size_t *dst_size)
 {
     uint32_t width;
     uint32_t height;
@@ -180,9 +181,8 @@ static bool p010_to_nv21_reference(const sbs_video_frame_msg_t *src_msg,
     uint32_t uv_offset;
     size_t required;
     size_t out_size;
-    uint8_t *dst;
 
-    if (!src_msg || !src || !buffer || !buffer_size || !dst_msg || !dst_size ||
+    if (!src_msg || !src || !dst || !dst_msg || !dst_size ||
         src_msg->drm_format != DRM_FORMAT_P010)
         return false;
 
@@ -200,15 +200,9 @@ static bool p010_to_nv21_reference(const sbs_video_frame_msg_t *src_msg,
         return false;
 
     out_size = (size_t)width * height * 3u / 2u;
-    if (*buffer_size < out_size) {
-        uint8_t *new_buffer = realloc(*buffer, out_size);
-        if (!new_buffer)
-            return false;
-        *buffer = new_buffer;
-        *buffer_size = out_size;
-    }
+    if (dst_capacity < out_size)
+        return false;
 
-    dst = *buffer;
     for (uint32_t y = 0; y < height; y++) {
         const uint16_t *src_y = (const uint16_t *)(const void *)(
             src + src_msg->plane_offset[0] + (size_t)y * y_stride);
@@ -235,9 +229,73 @@ static bool p010_to_nv21_reference(const sbs_video_frame_msg_t *src_msg,
     dst_msg->plane_offset[1] = width * height;
     dst_msg->plane_stride[0] = width;
     dst_msg->plane_stride[1] = width;
-    dst_msg->buffer_type = SBS_FRAME_BUFFER_MEMFD;
+    dst_msg->buffer_type = SBS_FRAME_BUFFER_DMABUF;
     *dst_size = out_size;
     return true;
+}
+
+static void native_preview_cpu_dmabuf_reset(sbs_dmabuf_buffer_t *buffer,
+                                            void **mapped,
+                                            size_t *mapped_size)
+{
+    if (mapped && *mapped && mapped_size && *mapped_size > 0)
+        munmap(*mapped, *mapped_size);
+    if (buffer && buffer->fd >= 0)
+        close(buffer->fd);
+    if (buffer) {
+        memset(buffer, 0, sizeof(*buffer));
+        buffer->fd = -1;
+    }
+    if (mapped)
+        *mapped = NULL;
+    if (mapped_size)
+        *mapped_size = 0;
+}
+
+static bool native_preview_ensure_cpu_dmabuf(sbs_dmabuf_buffer_t *buffer,
+                                             void **mapped,
+                                             size_t *mapped_size,
+                                             size_t size)
+{
+    const sbs_dmabuf_heap_kind_t heaps[] = {
+        SBS_DMABUF_HEAP_SYSTEM,
+        SBS_DMABUF_HEAP_GFX,
+        SBS_DMABUF_HEAP_LINUX_CMA,
+        SBS_DMABUF_HEAP_CODECMM,
+    };
+    sbs_dmabuf_alloc_t alloc;
+
+    if (!buffer || !mapped || !mapped_size || size == 0)
+        return false;
+    if (buffer->fd >= 0 && *mapped && *mapped_size >= size)
+        return true;
+
+    native_preview_cpu_dmabuf_reset(buffer, mapped, mapped_size);
+    if (sbs_dmabuf_alloc_open(&alloc) != SBS_OK || !alloc.available) {
+        sbs_dmabuf_alloc_close(&alloc);
+        return false;
+    }
+
+    for (size_t i = 0; i < G_N_ELEMENTS(heaps); i++) {
+        if (sbs_dmabuf_alloc_buffer_from_heap(&alloc, heaps[i], size, 0, buffer) != SBS_OK)
+            continue;
+        *mapped = sbs_dmabuf_alloc_map(buffer, PROT_READ | PROT_WRITE, size, 0);
+        if (*mapped != MAP_FAILED) {
+            *mapped_size = size;
+            sbs_dmabuf_alloc_close(&alloc);
+            return true;
+        }
+        LOG_W("native preview CPU DMA-BUF map failed for heap=%d: %s",
+              heaps[i], strerror(errno));
+        close(buffer->fd);
+        memset(buffer, 0, sizeof(*buffer));
+        buffer->fd = -1;
+        *mapped = NULL;
+        *mapped_size = 0;
+    }
+
+    sbs_dmabuf_alloc_close(&alloc);
+    return false;
 }
 
 static void native_encoder_clear_lease(sbs_native_canvas_lease_t *lease)
@@ -614,8 +672,9 @@ static bool native_preview_enqueue_lease(sbs_output_router_t *router,
 static void *native_preview_thread_func(void *arg)
 {
     sbs_output_router_t *router = arg;
-    void *hdr_copy = NULL;
-    size_t hdr_copy_size = 0;
+    sbs_dmabuf_buffer_t hdr_sdr_buffer = { .fd = -1 };
+    void *hdr_sdr_mapped = NULL;
+    size_t hdr_sdr_mapped_size = 0;
 
     LOG_I("native preview handoff thread started");
 
@@ -655,66 +714,70 @@ static void *native_preview_thread_func(void *arg)
             sbs_preview_profile_t *active_preview = sbs_preview_engine_active_fallback(preview);
             bool sdr_reference = active_preview && active_preview->reference_color &&
                 active_preview->active_color_mode == SBS_PREVIEW_COLOR_MODE_SDR;
-            native_dmabuf_sync_read(lease.backing_fd, true);
-            void *mapped = mmap(NULL, lease.backing_size, PROT_READ,
-                                MAP_SHARED, lease.backing_fd, 0);
-            if (mapped != MAP_FAILED) {
-                if (sdr_reference) {
+
+            if (sdr_reference) {
+                native_dmabuf_sync_read(lease.backing_fd, true);
+                void *mapped = mmap(NULL, lease.backing_size, PROT_READ,
+                                    MAP_SHARED, lease.backing_fd, 0);
+                if (mapped != MAP_FAILED) {
                     sbs_video_frame_msg_t nv21_msg;
-                    size_t nv21_size = 0;
-                    if (p010_to_nv21_reference(&msg, mapped, lease.backing_size,
-                                               (uint8_t **)&hdr_copy,
-                                               &hdr_copy_size,
-                                               &nv21_msg, &nv21_size)) {
-                        sbs_preview_engine_consume_frame_ptr(preview, &nv21_msg,
-                                                             hdr_copy, nv21_size);
-                        submitted = true;
+                    size_t nv21_size = (size_t)msg.width * msg.height * 3u / 2u;
+                    if (native_preview_ensure_cpu_dmabuf(&hdr_sdr_buffer,
+                                                         &hdr_sdr_mapped,
+                                                         &hdr_sdr_mapped_size,
+                                                         nv21_size)) {
+                        (void)sbs_dmabuf_alloc_sync(&hdr_sdr_buffer, true,
+                                                    SBS_DMABUF_SYNC_WRITE);
+                        if (p010_to_nv21_reference_into(&msg, mapped, lease.backing_size,
+                                                        hdr_sdr_mapped,
+                                                        hdr_sdr_mapped_size,
+                                                        &nv21_msg, &nv21_size)) {
+                            (void)sbs_dmabuf_alloc_sync(&hdr_sdr_buffer, false,
+                                                        SBS_DMABUF_SYNC_WRITE);
+                            int preview_fd = dup(hdr_sdr_buffer.fd);
+                            if (preview_fd >= 0) {
+                                sbs_preview_engine_consume_frame_dmabuf(preview, &nv21_msg,
+                                                                        preview_fd, nv21_size);
+                                submitted = true;
+                            } else {
+                                LOG_W("native preview dup(HDR->SDR DMA-BUF fd=%d) failed: %s",
+                                      hdr_sdr_buffer.fd, strerror(errno));
+                            }
+                        } else {
+                            (void)sbs_dmabuf_alloc_sync(&hdr_sdr_buffer, false,
+                                                        SBS_DMABUF_SYNC_WRITE);
+                            LOG_W("native preview HDR->SDR reference conversion failed");
+                        }
                     } else {
-                        LOG_W("native preview HDR->SDR reference conversion failed");
+                        LOG_W("native preview HDR->SDR DMA-BUF allocation failed (%zu bytes)",
+                              nv21_size);
                     }
-                } else if (hdr_copy_size < lease.backing_size) {
-                    void *new_copy = realloc(hdr_copy, lease.backing_size);
-                    if (new_copy) {
-                        hdr_copy = new_copy;
-                        hdr_copy_size = lease.backing_size;
-                    }
+                    munmap(mapped, lease.backing_size);
+                } else {
+                    LOG_W("native preview HDR->SDR mmap failed: %s", strerror(errno));
                 }
-                if (!submitted && !sdr_reference) {
-                    if (hdr_copy && hdr_copy_size >= lease.backing_size) {
-                        memcpy(hdr_copy, mapped, lease.backing_size);
-                        sbs_preview_engine_consume_frame_ptr(preview, &msg,
-                                                             hdr_copy, lease.backing_size);
-                        submitted = true;
-                    } else {
-                        LOG_W("native preview copy allocation failed (%zu bytes)",
-                              lease.backing_size);
-                    }
-                }
-                munmap(mapped, lease.backing_size);
+                native_dmabuf_sync_read(lease.backing_fd, false);
             } else {
-                LOG_W("native preview mmap failed: %s", strerror(errno));
+                int preview_fd = dup(lease.backing_fd);
+                if (preview_fd >= 0) {
+                    sbs_preview_engine_consume_frame_dmabuf(preview, &msg,
+                                                            preview_fd, lease.backing_size);
+                    submitted = true;
+                } else {
+                    LOG_W("native preview dup(fd=%d) failed: %s",
+                          lease.backing_fd, strerror(errno));
+                }
             }
-            native_dmabuf_sync_read(lease.backing_fd, false);
-        } else if (lease.host_mapped && lease.host_size >= lease.backing_size) {
-            native_dmabuf_sync_read(lease.backing_fd, true);
-            sbs_preview_engine_consume_frame_ptr(preview, &msg,
-                                                 lease.host_mapped,
-                                                 lease.host_size);
-            native_dmabuf_sync_read(lease.backing_fd, false);
-            submitted = true;
         } else {
-            native_dmabuf_sync_read(lease.backing_fd, true);
-            void *mapped = mmap(NULL, lease.backing_size, PROT_READ,
-                                MAP_SHARED, lease.backing_fd, 0);
-            if (mapped != MAP_FAILED) {
-                sbs_preview_engine_consume_frame_ptr(preview, &msg,
-                                                     mapped, lease.backing_size);
-                munmap(mapped, lease.backing_size);
+            int preview_fd = dup(lease.backing_fd);
+            if (preview_fd >= 0) {
+                sbs_preview_engine_consume_frame_dmabuf(preview, &msg,
+                                                        preview_fd, lease.backing_size);
                 submitted = true;
             } else {
-                LOG_W("native preview mmap failed: %s", strerror(errno));
+                LOG_W("native preview dup(fd=%d) failed: %s",
+                      lease.backing_fd, strerror(errno));
             }
-            native_dmabuf_sync_read(lease.backing_fd, false);
         }
 
         gint64 elapsed = g_get_monotonic_time() - t0;
@@ -739,7 +802,9 @@ static void *native_preview_thread_func(void *arg)
     }
 
     LOG_I("native preview handoff thread stopped");
-    free(hdr_copy);
+    native_preview_cpu_dmabuf_reset(&hdr_sdr_buffer,
+                                    &hdr_sdr_mapped,
+                                    &hdr_sdr_mapped_size);
     return NULL;
 }
 
@@ -1064,7 +1129,7 @@ static void export_thread_process_frame(sbs_output_router_t *router,
                 msg.plane_stride[0] = router->width;
                 msg.plane_stride[1] = router->width;
             }
-            msg.buffer_type = is_p010 ? SBS_FRAME_BUFFER_DMABUF : SBS_FRAME_BUFFER_MEMFD;
+            msg.buffer_type = SBS_FRAME_BUFFER_DMABUF;
             msg.pts_ns = pts_ns;
             msg.dts_ns = UINT64_MAX;
             msg.duration_ns = duration_ns;
@@ -1090,6 +1155,8 @@ static void export_thread_process_frame(sbs_output_router_t *router,
 
             /* Feed to legacy output supervisor */
             if (output_count > 0 || snapshot_needs_frame) {
+                sbs_video_frame_msg_t memfd_msg = msg;
+                memfd_msg.buffer_type = SBS_FRAME_BUFFER_MEMFD;
                 /* Need to create memfd for legacy paths */
                 size_t fsize = slot->nv21_size;
                 int mfd = memfd_create("sbs-frame", MFD_CLOEXEC | MFD_ALLOW_SEALING);
@@ -1101,11 +1168,11 @@ static void export_thread_process_frame(sbs_output_router_t *router,
                         if (snapshot_needs_frame) {
                             int snap_fd = dup(mfd);
                             if (snap_fd >= 0)
-                                sbs_snapshot_engine_consume_frame(router->snapshot, &msg, snap_fd);
+                                sbs_snapshot_engine_consume_frame(router->snapshot, &memfd_msg, snap_fd);
                         }
                         if (output_count > 0) {
                             pthread_mutex_lock(&router->supervisor_send_lock);
-                            int sent = sbs_output_supervisor_send_frame(router->out_sup, &msg, mfd);
+                            int sent = sbs_output_supervisor_send_frame(router->out_sup, &memfd_msg, mfd);
                             pthread_mutex_unlock(&router->supervisor_send_lock);
                             if (sent > 0) router->frames_distributed++;
                         }
@@ -1136,22 +1203,21 @@ static void export_thread_process_frame(sbs_output_router_t *router,
             pmsg.plane_offset[1] = router->dest_preview_width * router->dest_preview_height;
             pmsg.plane_stride[0] = router->dest_preview_width;
             pmsg.plane_stride[1] = router->dest_preview_width;
-            pmsg.buffer_type = SBS_FRAME_BUFFER_MEMFD;
+            pmsg.buffer_type = SBS_FRAME_BUFFER_DMABUF;
             pmsg.pts_ns = pts_ns;
             pmsg.dts_ns = UINT64_MAX;
             pmsg.duration_ns = duration_ns;
             pmsg.sequence = router->sequence;
 
             gint64 t0 = g_get_monotonic_time();
-            if (slot->nv21_mapped) {
-                sbs_preview_engine_consume_frame_ptr(preview, &pmsg,
-                                                      slot->nv21_mapped, slot->nv21_size);
-            } else if (slot->nv21_dmabuf_fd >= 0) {
+            if (slot->nv21_dmabuf_fd >= 0) {
                 int dup_fd = dup(slot->nv21_dmabuf_fd);
                 if (dup_fd >= 0) {
                     sbs_preview_engine_consume_frame_dmabuf(preview, &pmsg,
                                                             dup_fd, slot->nv21_size);
                 }
+            } else {
+                LOG_W("preview export slot has no DMA-BUF fd; dropping frame to avoid VMALLOC encoder input");
             }
             t_preview_consume = g_get_monotonic_time() - t0;
 

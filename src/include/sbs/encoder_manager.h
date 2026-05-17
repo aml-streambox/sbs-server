@@ -103,16 +103,6 @@ void sbs_encoder_manager_free(sbs_encoder_manager_t *mgr);
 int sbs_encoder_manager_update_config(sbs_encoder_manager_t *mgr,
                                        const sbs_encoder_config_t *enc_config);
 
-/* sbs_encoder_manager_consume_frame: REMOVED (was fd-based memfd path) */
-
-/**
- * Push a raw NV21 frame to the shared direct encoder from a CPU pointer.
- */
-void sbs_encoder_manager_consume_frame_ptr(sbs_encoder_manager_t *mgr,
-                                             const sbs_video_frame_msg_t *msg,
-                                             const void *data,
-                                             size_t size);
-
 void sbs_encoder_manager_consume_frame_dmabuf(sbs_encoder_manager_t *mgr,
                                               const sbs_video_frame_msg_t *msg,
                                               int dmabuf_fd,

@@ -3135,12 +3135,12 @@ int sbs_compositor_export_target_preview_fd(sbs_compositor_t *comp,
                                             uint32_t height,
                                             int *fd)
 {
-    /* REMOVED — legacy CPU staging + blit + memfd path.
-     * Preview uses dest-export (sampler compute) + consume_frame_ptr now. */
+    /* REMOVED - legacy CPU staging + blit + memfd path.
+     * Preview uses dest-export (sampler compute) + DMA-BUF handoff now. */
     (void)comp; (void)target_idx; (void)width; (void)height;
     if (fd) *fd = -1;
-    LOG_E("FATAL: preview fd export called — this path is removed. "
-          "Use dest-export + consume_frame_ptr instead.");
+    LOG_E("FATAL: preview fd export called - this path is removed. "
+          "Use dest-export + DMA-BUF handoff instead.");
     return -1;
 }
 

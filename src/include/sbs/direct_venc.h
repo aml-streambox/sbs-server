@@ -36,13 +36,6 @@ sbs_direct_venc_t *sbs_direct_venc_new(const sbs_direct_venc_config_t *config);
 void sbs_direct_venc_free(sbs_direct_venc_t *enc);
 uint64_t sbs_direct_venc_reorder_delay_ns(const sbs_direct_venc_t *enc);
 
-int sbs_direct_venc_submit_ptr(sbs_direct_venc_t *enc,
-                               const sbs_video_frame_msg_t *msg,
-                               const void *data,
-                               size_t size,
-                               bool force_idr,
-                               sbs_direct_venc_packet_t *packet);
-
 int sbs_direct_venc_submit_dmabuf(sbs_direct_venc_t *enc,
                                   const sbs_video_frame_msg_t *msg,
                                   int dmabuf_fd,

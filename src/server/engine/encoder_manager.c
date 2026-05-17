@@ -3271,55 +3271,6 @@ int sbs_encoder_manager_reconfigure_video(sbs_encoder_manager_t *mgr,
     return SBS_OK;
 }
 
-/* sbs_encoder_manager_consume_frame — REMOVED (was fd-based memfd path) */
-
-void sbs_encoder_manager_consume_frame_ptr(sbs_encoder_manager_t *mgr,
-                                              const sbs_video_frame_msg_t *msg,
-                                              const void *data,
-                                              size_t size)
-{
-    if (!mgr || !msg || !data || size == 0)
-        return;
-
-    pthread_mutex_lock(&mgr->pipeline_mutex);
-
-    if (!mgr->pipeline_active) {
-        pthread_mutex_unlock(&mgr->pipeline_mutex);
-        return;
-    }
-
-    sbs_direct_venc_packet_t packet = {0};
-    int rc = sbs_direct_venc_submit_ptr(mgr->video_encoder, msg, data, size,
-                                        mgr->force_next_idr, &packet);
-    if (rc == SBS_OK || rc == SBS_ERR_WOULD_BLOCK)
-        mgr->force_next_idr = false;
-    if (rc == SBS_ERR_WOULD_BLOCK) {
-        pthread_mutex_unlock(&mgr->pipeline_mutex);
-        return;
-    }
-    if (rc != SBS_OK) {
-        mgr->frames_dropped++;
-        pthread_mutex_unlock(&mgr->pipeline_mutex);
-        return;
-    }
-    if (!packet.data || packet.size == 0) {
-        pthread_mutex_unlock(&mgr->pipeline_mutex);
-        return;
-    }
-
-    push_encoded_packet(mgr, &packet);
-    mgr->encoded_bytes += packet.size;
-
-    mgr->frames_pushed++;
-    if (mgr->frames_pushed <= 3 || mgr->frames_pushed % 600 == 0) {
-        LOG_I("encoder frame encoded (ptr) #%lu (%ux%u, %u branches)",
-              (unsigned long)mgr->frames_pushed,
-              msg->width, msg->height,
-              g_hash_table_size(mgr->branches));
-    }
-    pthread_mutex_unlock(&mgr->pipeline_mutex);
-}
-
 void sbs_encoder_manager_consume_frame_dmabuf(sbs_encoder_manager_t *mgr,
                                               const sbs_video_frame_msg_t *msg,
                                               int dmabuf_fd,

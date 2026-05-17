@@ -31,18 +31,29 @@ layout(push_constant) uniform PushConstants {
     float bg_v;
     uint filter_flags;
     float hdr_to_sdr_amount;
-    uint pad0;
-    uint pad1;
+    float hdr_saturation;
+    float hdr_brightness;
+    float hdr_hue_cos;
+    float hdr_hue_sin;
+    float filter_params[4];
+    uint src_offset_x;
+    uint src_offset_y;
 } pc;
 
 const uint FLAG_FULL_CANVAS = 1u;
 const uint FLAG_DST_IN_BOUNDS = 8u;
 const uint FLAG_SRC_OFFSET = 16u;
+const uint FLAG_ROTATION_SHIFT = 8u;
+const uint FLAG_FLIP_HORIZONTAL = 1u << 10u;
+const uint FLAG_FLIP_VERTICAL = 1u << 11u;
 const uint FILTER_HDR_TO_SDR = 32u;
 
 bool dst_in_bounds() { return (pc.flags & FLAG_DST_IN_BOUNDS) != 0u; }
 bool filter_hdr_to_sdr() { return (pc.filter_flags & FILTER_HDR_TO_SDR) != 0u; }
 bool src_offset_enabled() { return (pc.flags & FLAG_SRC_OFFSET) != 0u; }
+uint rotation_quadrant() { return (pc.flags >> FLAG_ROTATION_SHIFT) & 3u; }
+bool flip_horizontal() { return (pc.flags & FLAG_FLIP_HORIZONTAL) != 0u; }
+bool flip_vertical() { return (pc.flags & FLAG_FLIP_VERTICAL) != 0u; }
 
 uint src_local_x(uint x) {
     return src_offset_enabled() && pc.dst_x > 0 ? x + uint(pc.dst_x) : x;
@@ -99,6 +110,70 @@ uint scale_nearest(uint pos, uint src_extent, float scale) {
     return min(v, src_extent - 1u);
 }
 
+uint rotated_local_x(uint local_x, uint local_y) {
+    uint rot = rotation_quadrant();
+    if (rot == 1u) return local_y;
+    if (rot == 2u) return pc.dst_w > 0u ? pc.dst_w - 1u - min(local_x, pc.dst_w - 1u) : 0u;
+    if (rot == 3u) return pc.dst_h > 0u ? pc.dst_h - 1u - min(local_y, pc.dst_h - 1u) : 0u;
+    return local_x;
+}
+
+uint rotated_local_y(uint local_x, uint local_y) {
+    uint rot = rotation_quadrant();
+    if (rot == 1u) return pc.dst_w > 0u ? pc.dst_w - 1u - min(local_x, pc.dst_w - 1u) : 0u;
+    if (rot == 2u) return pc.dst_h > 0u ? pc.dst_h - 1u - min(local_y, pc.dst_h - 1u) : 0u;
+    if (rot == 3u) return local_x;
+    return local_y;
+}
+
+uint source_extent_x() {
+    return (rotation_quadrant() & 1u) != 0u ? pc.dst_h : pc.dst_w;
+}
+
+uint source_extent_y() {
+    return (rotation_quadrant() & 1u) != 0u ? pc.dst_w : pc.dst_h;
+}
+
+float source_scale_x() {
+    return float(pc.src_w) / float(max(source_extent_x(), 1u));
+}
+
+float source_scale_y() {
+    return float(pc.src_h) / float(max(source_extent_y(), 1u));
+}
+
+uint flipped_source_x(uint x) {
+    uint extent = max(source_extent_x(), 1u);
+    x = min(x, extent - 1u);
+    return flip_horizontal() ? extent - 1u - x : x;
+}
+
+uint flipped_source_y(uint y) {
+    uint extent = max(source_extent_y(), 1u);
+    y = min(y, extent - 1u);
+    return flip_vertical() ? extent - 1u - y : y;
+}
+
+uint source_x(uint local_x, uint local_y) {
+    return pc.src_offset_x + scale_nearest(src_local_x(flipped_source_x(rotated_local_x(local_x, local_y))), pc.src_w, source_scale_x());
+}
+
+uint source_y(uint local_x, uint local_y) {
+    return pc.src_offset_y + scale_nearest(src_local_y(flipped_source_y(rotated_local_y(local_x, local_y))), pc.src_h, source_scale_y());
+}
+
+uint source_uv_x(uint local_uv_x, uint local_uv_y) {
+    uint local_x = min(local_uv_x * 2u + 1u, pc.dst_w - 1u);
+    uint local_y = min(local_uv_y * 2u + 1u, pc.dst_h - 1u);
+    return source_x(local_x, local_y) >> 1;
+}
+
+uint source_uv_y(uint local_uv_x, uint local_uv_y) {
+    uint local_x = min(local_uv_x * 2u + 1u, pc.dst_w - 1u);
+    uint local_y = min(local_uv_y * 2u + 1u, pc.dst_h - 1u);
+    return source_y(local_x, local_y) >> 1;
+}
+
 void main() {
     bool full_canvas = (pc.flags & FLAG_FULL_CANVAS) != 0u;
     uvec2 base = gl_GlobalInvocationID.xy * 2u;
@@ -110,7 +185,7 @@ void main() {
         ? ivec2(int(base.x), int(base.y))
         : ivec2(pc.dst_x + int(base.x), pc.dst_y + int(base.y));
 
-    if (full_canvas && pc.opacity >= 0.999 &&
+    if (rotation_quadrant() == 0u && full_canvas && pc.opacity >= 0.999 &&
         dst_base.x >= pc.dst_x && dst_base.y >= pc.dst_y &&
         dst_base.x + 1 < pc.dst_x + int(pc.dst_w) &&
         dst_base.y + 1 < pc.dst_y + int(pc.dst_h)) {
@@ -118,10 +193,10 @@ void main() {
         uint local_y0 = uint(dst_base.y - pc.dst_y);
         uint local_x1 = local_x0 + 1u;
         uint local_y1 = local_y0 + 1u;
-        uint src_x0 = scale_nearest(local_x0, pc.src_w, pc.y_scale_x);
-        uint src_x1 = scale_nearest(local_x1, pc.src_w, pc.y_scale_x);
-        uint src_y0 = scale_nearest(local_y0, pc.src_h, pc.y_scale_y);
-        uint src_y1 = scale_nearest(local_y1, pc.src_h, pc.y_scale_y);
+        uint src_x0 = source_x(local_x0, local_y0);
+        uint src_x1 = source_x(local_x1, local_y0);
+        uint src_y0 = source_y(local_x0, local_y0);
+        uint src_y1 = source_y(local_x0, local_y1);
 
         imageStore(y_img, dst_base,
                    vec4(filter_y_word(read_u16(src_y0 * pc.y_stride + src_x0 * 2u)),
@@ -136,12 +211,10 @@ void main() {
                    vec4(filter_y_word(read_u16(src_y1 * pc.y_stride + src_x1 * 2u)),
                         0.0, 0.0, 1.0));
 
-        uint src_uv_w = max((pc.src_w + 1u) >> 1, 1u);
-        uint src_uv_h = max((pc.src_h + 1u) >> 1, 1u);
         uint local_uv_x = uint(dst_base.x + 1 - pc.dst_x) >> 1;
         uint local_uv_y = uint(dst_base.y + 1 - pc.dst_y) >> 1;
-        uint src_uv_x = scale_nearest(local_uv_x, src_uv_w, pc.uv_scale_x);
-        uint src_uv_y = scale_nearest(local_uv_y, src_uv_h, pc.uv_scale_y);
+        uint src_uv_x = source_uv_x(local_uv_x, local_uv_y);
+        uint src_uv_y = source_uv_y(local_uv_x, local_uv_y);
         uint uv_addr = pc.uv_offset + src_uv_y * pc.uv_stride + src_uv_x * 4u;
         imageStore(uv_img, dst_base >> 1,
                    vec4(filter_uv_words(read_u16(uv_addr), read_u16(uv_addr + 2u)),
@@ -149,13 +222,13 @@ void main() {
         return;
     }
 
-    if (!full_canvas && pc.opacity >= 0.999 && dst_in_bounds()) {
+    if (rotation_quadrant() == 0u && !full_canvas && pc.opacity >= 0.999 && dst_in_bounds()) {
         uint x1 = min(base.x + 1u, limit_w - 1u);
         uint y1 = min(base.y + 1u, limit_h - 1u);
-        uint src_x0 = scale_nearest(src_local_x(base.x), pc.src_w, pc.y_scale_x);
-        uint src_x1 = scale_nearest(src_local_x(x1), pc.src_w, pc.y_scale_x);
-        uint src_y0 = scale_nearest(src_local_y(base.y), pc.src_h, pc.y_scale_y);
-        uint src_y1 = scale_nearest(src_local_y(y1), pc.src_h, pc.y_scale_y);
+        uint src_x0 = source_x(base.x, base.y);
+        uint src_x1 = source_x(x1, base.y);
+        uint src_y0 = source_y(base.x, base.y);
+        uint src_y1 = source_y(base.x, y1);
 
         imageStore(y_img, dst_base,
                    vec4(filter_y_word(read_u16(src_y0 * pc.y_stride + src_x0 * 2u)),
@@ -176,10 +249,8 @@ void main() {
             }
         }
 
-        uint src_uv_w = max((pc.src_w + 1u) >> 1, 1u);
-        uint src_uv_h = max((pc.src_h + 1u) >> 1, 1u);
-        uint src_uv_x = scale_nearest(src_local_uv_x(base.x >> 1), src_uv_w, pc.uv_scale_x);
-        uint src_uv_y = scale_nearest(src_local_uv_y(base.y >> 1), src_uv_h, pc.uv_scale_y);
+        uint src_uv_x = source_uv_x(base.x >> 1, base.y >> 1);
+        uint src_uv_y = source_uv_y(base.x >> 1, base.y >> 1);
         uint uv_addr = pc.uv_offset + src_uv_y * pc.uv_stride + src_uv_x * 4u;
         imageStore(uv_img, dst_base >> 1,
                    vec4(filter_uv_words(read_u16(uv_addr), read_u16(uv_addr + 2u)),
@@ -216,8 +287,8 @@ void main() {
 
             float y = pc.bg_y;
             if (inside) {
-                uint src_x = scale_nearest(src_local_x(local_x), pc.src_w, pc.y_scale_x);
-                uint src_y = scale_nearest(src_local_y(local_y), pc.src_h, pc.y_scale_y);
+                uint src_x = source_x(local_x, local_y);
+                uint src_y = source_y(local_x, local_y);
                 uint y_addr = src_y * pc.y_stride + src_x * 2u;
                 y = filter_y_word(read_u16(y_addr));
             }
@@ -238,8 +309,6 @@ void main() {
         uv_dst.y < int(pc.canvas_height >> 1) &&
         (full_canvas || (dst_base.x >= 0 && dst_base.y >= 0 &&
          dst_base.x < int(pc.canvas_width) && dst_base.y < int(pc.canvas_height)))) {
-        uint src_uv_w = max((pc.src_w + 1u) >> 1, 1u);
-        uint src_uv_h = max((pc.src_h + 1u) >> 1, 1u);
         bool uv_inside = true;
         uint local_uv_x = base.x >> 1;
         uint local_uv_y = base.y >> 1;
@@ -256,8 +325,8 @@ void main() {
 
         vec2 uv = vec2(pc.bg_u, pc.bg_v);
         if (uv_inside) {
-        uint src_uv_x = scale_nearest(src_local_uv_x(local_uv_x), src_uv_w, pc.uv_scale_x);
-        uint src_uv_y = scale_nearest(src_local_uv_y(local_uv_y), src_uv_h, pc.uv_scale_y);
+            uint src_uv_x = source_uv_x(local_uv_x, local_uv_y);
+            uint src_uv_y = source_uv_y(local_uv_x, local_uv_y);
             uint uv_addr = pc.uv_offset + src_uv_y * pc.uv_stride + src_uv_x * 4u;
             uv = filter_uv_words(read_u16(uv_addr), read_u16(uv_addr + 2u));
         }

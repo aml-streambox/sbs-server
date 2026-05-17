@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <glib.h>
+#include <limits.h>
 #include <linux/videodev2.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -24,6 +25,27 @@ static bool video_node_name(const char *name)
             return false;
     }
     return true;
+}
+
+static bool video_node_is_uvc(const char *name)
+{
+    char path[PATH_MAX];
+    char link_target[PATH_MAX];
+    ssize_t len;
+    const char *base;
+
+    if (!video_node_name(name))
+        return false;
+
+    g_snprintf(path, sizeof(path), "/sys/class/video4linux/%s/device/driver", name);
+    len = readlink(path, link_target, sizeof(link_target) - 1);
+    if (len <= 0)
+        return false;
+    link_target[len] = '\0';
+
+    base = strrchr(link_target, '/');
+    base = base ? base + 1 : link_target;
+    return strcmp(base, "uvcvideo") == 0;
 }
 
 static char *v4l2_field_string(const uint8_t *field, size_t max_len)
@@ -332,6 +354,8 @@ cJSON *sbs_v4l2_discovery_list_devices(void)
 
     while ((name = g_dir_read_name(dir)) != NULL) {
         if (!video_node_name(name))
+            continue;
+        if (!video_node_is_uvc(name))
             continue;
 
         char *path = g_build_filename("/dev", name, NULL);

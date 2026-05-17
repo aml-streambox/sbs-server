@@ -17,6 +17,8 @@ static char *dup_or_null(const char *s)
     return s ? g_strdup(s) : NULL;
 }
 
+static double snap_quarter_rotation(double degrees);
+
 static bool valid_graph_id(const char *id)
 {
     size_t len;
@@ -112,7 +114,7 @@ static void scene_item_transform_copy(sbs_scene_item_transform_t *dst,
     dst->crop_bottom = src->crop_bottom;
     dst->crop_left = src->crop_left;
     dst->crop_right = src->crop_right;
-    dst->rotation_deg = src->rotation_deg;
+    dst->rotation_deg = snap_quarter_rotation(src->rotation_deg);
     dst->flip_horizontal = src->flip_horizontal;
     dst->flip_vertical = src->flip_vertical;
     dst->bounds_type = dup_or_null(src->bounds_type ? src->bounds_type : "stretch");
@@ -256,6 +258,26 @@ static GHashTable *str_map_copy(GHashTable *src)
     g_hash_table_iter_init(&iter, src);
     while (g_hash_table_iter_next(&iter, &key, &value)) {
         str_map_set(dst, key, value);
+    }
+    return dst;
+}
+
+static double snap_quarter_rotation(double degrees)
+{
+    int quarter = (int)lround(degrees / 90.0);
+    quarter = ((quarter % 4) + 4) % 4;
+    return (double)(quarter * 90);
+}
+
+static GHashTable *filter_params_copy(const char *type, GHashTable *src)
+{
+    GHashTable *dst = str_map_copy(src);
+    if (g_strcmp0(type, "rotation") == 0) {
+        const char *value = g_hash_table_lookup(dst, "degrees");
+        double degrees = value ? g_ascii_strtod(value, NULL) : 90.0;
+        char buf[32];
+        g_snprintf(buf, sizeof(buf), "%.0f", snap_quarter_rotation(degrees));
+        str_map_set(dst, "degrees", buf);
     }
     return dst;
 }
@@ -516,7 +538,7 @@ static void apply_filter_to_comp_item(const sbs_filter_state_t *filter,
         out->flip_vertical = !out->flip_vertical;
     } else if (g_strcmp0(filter->type, "rotation") == 0) {
         float deg = filter_float_param(filter, "degrees", 90.0f);
-        out->rotation_deg += CLAMP(deg, -360.0f, 360.0f);
+        out->rotation_deg += (float)snap_quarter_rotation(deg);
     }
 }
 
@@ -634,6 +656,7 @@ static void fill_comp_item(const sbs_canvas_state_t *canvas,
     apply_filters_to_comp_item(filters, out);
     apply_filters_to_comp_item(item->filters, out);
     apply_filters_to_comp_item(scene_filters, out);
+    out->rotation_deg = (float)snap_quarter_rotation(out->rotation_deg);
     render_transform = item->transform;
     render_transform.flip_horizontal = out->flip_horizontal;
     render_transform.flip_vertical = out->flip_vertical;
@@ -1655,7 +1678,7 @@ int sbs_scene_graph_add_filter(sbs_scene_graph_t *graph,
     filter->id = g_strdup(params->id ? params->id : "filter-auto");
     filter->type = g_strdup(params->type);
     filter->enabled = params->enabled;
-    filter->params = str_map_copy(params->params);
+    filter->params = filter_params_copy(params->type, params->params);
     g_ptr_array_add(source->filters, filter);
     graph_bump_version(graph);
     if (out_filter) *out_filter = filter;
@@ -1681,7 +1704,7 @@ int sbs_scene_graph_add_scene_filter(sbs_scene_graph_t *graph,
     filter->id = g_strdup(params->id ? params->id : "filter-auto");
     filter->type = g_strdup(params->type);
     filter->enabled = params->enabled;
-    filter->params = str_map_copy(params->params);
+    filter->params = filter_params_copy(params->type, params->params);
     g_ptr_array_add(scene->filters, filter);
     graph_bump_version(graph);
     if (out_filter) *out_filter = filter;
@@ -1710,7 +1733,7 @@ int sbs_scene_graph_update_filter(sbs_scene_graph_t *graph,
         if (filter->params) {
             g_hash_table_destroy(filter->params);
         }
-        filter->params = str_map_copy(params->params);
+        filter->params = filter_params_copy(filter->type, params->params);
     }
     graph_bump_version(graph);
     if (out_filter) *out_filter = filter;
@@ -1739,7 +1762,7 @@ int sbs_scene_graph_update_scene_filter(sbs_scene_graph_t *graph,
         if (filter->params) {
             g_hash_table_destroy(filter->params);
         }
-        filter->params = str_map_copy(params->params);
+        filter->params = filter_params_copy(filter->type, params->params);
     }
     graph_bump_version(graph);
     if (out_filter) *out_filter = filter;

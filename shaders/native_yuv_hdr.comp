@@ -35,6 +35,52 @@ const uint FILTER_GRAYSCALE = 1u << 0u;
 const uint FILTER_BRIGHTNESS = 1u << 1u;
 const uint FILTER_CONTRAST = 1u << 2u;
 const uint FILTER_LUMA_KEY = 1u << 7u;
+const uint FLAG_ROTATION_SHIFT = 8u;
+const uint FLAG_FLIP_HORIZONTAL = 1u << 10u;
+const uint FLAG_FLIP_VERTICAL = 1u << 11u;
+
+uint rotation_quadrant() { return (pc.flags >> FLAG_ROTATION_SHIFT) & 3u; }
+bool flip_horizontal() { return (pc.flags & FLAG_FLIP_HORIZONTAL) != 0u; }
+bool flip_vertical() { return (pc.flags & FLAG_FLIP_VERTICAL) != 0u; }
+
+uint rotated_extent_x() {
+    return (rotation_quadrant() & 1u) != 0u ? pc.dst_h : pc.dst_w;
+}
+
+uint rotated_extent_y() {
+    return (rotation_quadrant() & 1u) != 0u ? pc.dst_w : pc.dst_h;
+}
+
+uint rotated_local_x(uint lx, uint ly) {
+    uint rot = rotation_quadrant();
+    if (rot == 1u) return ly;
+    if (rot == 2u) return pc.dst_w > 0u ? pc.dst_w - 1u - min(lx, pc.dst_w - 1u) : 0u;
+    if (rot == 3u) return pc.dst_h > 0u ? pc.dst_h - 1u - min(ly, pc.dst_h - 1u) : 0u;
+    return lx;
+}
+
+uint rotated_local_y(uint lx, uint ly) {
+    uint rot = rotation_quadrant();
+    if (rot == 1u) return pc.dst_w > 0u ? pc.dst_w - 1u - min(lx, pc.dst_w - 1u) : 0u;
+    if (rot == 2u) return pc.dst_h > 0u ? pc.dst_h - 1u - min(ly, pc.dst_h - 1u) : 0u;
+    if (rot == 3u) return lx;
+    return ly;
+}
+
+vec2 rotated_source_pos(uint lx, uint ly) {
+    uint extent_x = max(rotated_extent_x(), 1u);
+    uint extent_y = max(rotated_extent_y(), 1u);
+    uint rx = min(rotated_local_x(lx, ly), extent_x - 1u);
+    uint ry = min(rotated_local_y(lx, ly), extent_y - 1u);
+    if (flip_horizontal())
+        rx = extent_x - 1u - rx;
+    if (flip_vertical())
+        ry = extent_y - 1u - ry;
+    return vec2(float(pc.src_x), float(pc.src_y)) +
+        (vec2(float(rx), float(ry)) + 0.5) *
+        (vec2(float(pc.src_rect_w), float(pc.src_rect_h)) /
+         vec2(float(extent_x), float(extent_y)));
+}
 
 float pq_to_nits(float v) {
     const float m1 = 2610.0 / 16384.0;
@@ -160,10 +206,7 @@ vec4 apply_alpha_filters(vec4 color) {
 }
 
 vec4 sample_src(uint lx, uint ly) {
-    vec2 src_pos = vec2(float(pc.src_x), float(pc.src_y)) +
-        (vec2(float(lx), float(ly)) + 0.5) *
-        (vec2(float(pc.src_rect_w), float(pc.src_rect_h)) /
-         vec2(float(pc.dst_w), float(pc.dst_h)));
+    vec2 src_pos = rotated_source_pos(lx, ly);
     vec2 uv = src_pos / vec2(float(pc.src_w), float(pc.src_h));
     vec4 color = texture(src_tex, uv);
     return apply_alpha_filters(vec4(apply_filters(color.rgb), color.a));
@@ -197,10 +240,7 @@ bool fast_luma_only_path() {
 }
 
 vec2 sample_luma_only(uint lx, uint ly) {
-    vec2 src_pos = vec2(float(pc.src_x), float(pc.src_y)) +
-        (vec2(float(lx), float(ly)) + 0.5) *
-        (vec2(float(pc.src_rect_w), float(pc.src_rect_h)) /
-         vec2(float(pc.dst_w), float(pc.dst_h)));
+    vec2 src_pos = rotated_source_pos(lx, ly);
     vec2 uv = src_pos / vec2(float(pc.src_w), float(pc.src_h));
     vec4 tex = texture(src_tex, uv);
     float y = dot(tex.rgb, kRgbToY);

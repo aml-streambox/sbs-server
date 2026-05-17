@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <math.h>
 
 struct sbs_config_manager {
     char *config_dir;
@@ -23,6 +24,13 @@ struct sbs_config_manager {
 static const char *json_str(cJSON *obj, const char *key);
 static bool json_bool(cJSON *obj, const char *key, bool fallback);
 static double json_num(cJSON *obj, const char *key, double fallback);
+
+static double snap_quarter_rotation(double degrees)
+{
+    int quarter = (int)lround(degrees / 90.0);
+    quarter = ((quarter % 4) + 4) % 4;
+    return (double)(quarter * 90);
+}
 
 static void load_audio_binding(cJSON *audio_obj, sbs_audio_binding_t *audio, bool default_enabled)
 {
@@ -575,7 +583,7 @@ static int apply_scene_graph_bundle(sbs_api_server_t *server, cJSON *bundle)
                 ip.transform.crop_bottom = (int)json_num(transform, "crop_bottom", 0);
                 ip.transform.crop_left = (int)json_num(transform, "crop_left", 0);
                 ip.transform.crop_right = (int)json_num(transform, "crop_right", 0);
-                ip.transform.rotation_deg = json_num(transform, "rotation_deg", 0.0);
+                ip.transform.rotation_deg = snap_quarter_rotation(json_num(transform, "rotation_deg", 0.0));
                 ip.transform.flip_horizontal = json_bool(transform, "flip_horizontal", false);
                 ip.transform.flip_vertical = json_bool(transform, "flip_vertical", false);
                 ip.transform.bounds_type = (char *)(json_str(transform, "bounds_type") ? json_str(transform, "bounds_type") : "stretch");

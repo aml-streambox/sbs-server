@@ -44,6 +44,9 @@ const uint FLAG_FULL_CANVAS = 1u;
 const uint FLAG_SOURCE_NV21 = 4u;
 const uint FLAG_DST_IN_BOUNDS = 8u;
 const uint FLAG_SOURCE_DRIVEN = 64u;
+const uint FLAG_ROTATION_SHIFT = 8u;
+const uint FLAG_FLIP_HORIZONTAL = 1u << 10u;
+const uint FLAG_FLIP_VERTICAL = 1u << 11u;
 const uint FILTER_HDR_TO_SDR = 32u;
 const float HDR_Y_OFFSET = 64.0 / 1023.0;
 const float HDR_Y_SCALE = 876.0 / (1023.0 * 255.0);
@@ -54,6 +57,9 @@ bool source_is_nv21() { return (pc.flags & FLAG_SOURCE_NV21) != 0u; }
 bool dst_in_bounds() { return (pc.flags & FLAG_DST_IN_BOUNDS) != 0u; }
 bool filter_hdr_to_sdr() { return (pc.filter_flags & FILTER_HDR_TO_SDR) != 0u; }
 bool source_driven_enabled() { return (pc.flags & FLAG_SOURCE_DRIVEN) != 0u; }
+uint rotation_quadrant() { return (pc.flags >> FLAG_ROTATION_SHIFT) & 3u; }
+bool flip_horizontal() { return (pc.flags & FLAG_FLIP_HORIZONTAL) != 0u; }
+bool flip_vertical() { return (pc.flags & FLAG_FLIP_VERTICAL) != 0u; }
 
 float direct_hdr_amount() {
     return filter_hdr_to_sdr() ? clamp(pc.hdr_to_sdr_amount, 0.0, 1.0) : 0.0;
@@ -86,6 +92,70 @@ uint scale_nearest(uint pos, uint src_extent, float scale) {
     return min(v, src_extent - 1u);
 }
 
+uint rotated_local_x(uint local_x, uint local_y) {
+    uint rot = rotation_quadrant();
+    if (rot == 1u) return local_y;
+    if (rot == 2u) return pc.dst_w > 0u ? pc.dst_w - 1u - min(local_x, pc.dst_w - 1u) : 0u;
+    if (rot == 3u) return pc.dst_h > 0u ? pc.dst_h - 1u - min(local_y, pc.dst_h - 1u) : 0u;
+    return local_x;
+}
+
+uint rotated_local_y(uint local_x, uint local_y) {
+    uint rot = rotation_quadrant();
+    if (rot == 1u) return pc.dst_w > 0u ? pc.dst_w - 1u - min(local_x, pc.dst_w - 1u) : 0u;
+    if (rot == 2u) return pc.dst_h > 0u ? pc.dst_h - 1u - min(local_y, pc.dst_h - 1u) : 0u;
+    if (rot == 3u) return local_x;
+    return local_y;
+}
+
+uint source_extent_x() {
+    return (rotation_quadrant() & 1u) != 0u ? pc.dst_h : pc.dst_w;
+}
+
+uint source_extent_y() {
+    return (rotation_quadrant() & 1u) != 0u ? pc.dst_w : pc.dst_h;
+}
+
+float source_scale_x() {
+    return float(pc.src_w) / float(max(source_extent_x(), 1u));
+}
+
+float source_scale_y() {
+    return float(pc.src_h) / float(max(source_extent_y(), 1u));
+}
+
+uint flipped_source_x(uint x) {
+    uint extent = max(source_extent_x(), 1u);
+    x = min(x, extent - 1u);
+    return flip_horizontal() ? extent - 1u - x : x;
+}
+
+uint flipped_source_y(uint y) {
+    uint extent = max(source_extent_y(), 1u);
+    y = min(y, extent - 1u);
+    return flip_vertical() ? extent - 1u - y : y;
+}
+
+uint source_x(uint local_x, uint local_y) {
+    return pc.src_offset_x + scale_nearest(flipped_source_x(rotated_local_x(local_x, local_y)), pc.src_w, source_scale_x());
+}
+
+uint source_y(uint local_x, uint local_y) {
+    return pc.src_offset_y + scale_nearest(flipped_source_y(rotated_local_y(local_x, local_y)), pc.src_h, source_scale_y());
+}
+
+uint source_uv_x(uint local_uv_x, uint local_uv_y) {
+    uint local_x = min(local_uv_x * 2u + 1u, pc.dst_w - 1u);
+    uint local_y = min(local_uv_y * 2u + 1u, pc.dst_h - 1u);
+    return source_x(local_x, local_y) >> 1;
+}
+
+uint source_uv_y(uint local_uv_x, uint local_uv_y) {
+    uint local_x = min(local_uv_x * 2u + 1u, pc.dst_w - 1u);
+    uint local_y = min(local_uv_y * 2u + 1u, pc.dst_h - 1u);
+    return source_y(local_x, local_y) >> 1;
+}
+
 uint out_begin_for_src(uint s, float inv_scale) {
     return uint(max(ceil(float(s) * inv_scale - 0.5), 0.0));
 }
@@ -96,8 +166,8 @@ uint out_end_for_src(uint s, float inv_scale, uint limit) {
 }
 
 float sample_hdr_y(uint local_x, uint local_y) {
-    uint src_x = scale_nearest(local_x, pc.src_w, pc.y_scale_x);
-    uint src_y = scale_nearest(local_y, pc.src_h, pc.y_scale_y);
+    uint src_x = source_x(local_x, local_y);
+    uint src_y = source_y(local_x, local_y);
     return HDR_Y_OFFSET + tone_map_y8_value(float(read_u8(src_y * pc.y_stride + src_x))) * HDR_Y_SCALE;
 }
 
@@ -107,10 +177,8 @@ float sample_hdr_y_src(uint src_x, uint src_y) {
 
 vec2 sample_hdr_uv(uint local_uv_x, uint local_uv_y) {
     /* Fast overlay path: map 8-bit YUV ranges into P010 without an RGB round-trip. */
-    uint src_uv_w = max((pc.src_w + 1u) >> 1, 1u);
-    uint src_uv_h = max((pc.src_h + 1u) >> 1, 1u);
-    uint src_uv_x = scale_nearest(local_uv_x, src_uv_w, pc.uv_scale_x);
-    uint src_uv_y = scale_nearest(local_uv_y, src_uv_h, pc.uv_scale_y);
+    uint src_uv_x = source_uv_x(local_uv_x, local_uv_y);
+    uint src_uv_y = source_uv_y(local_uv_x, local_uv_y);
     uint uv_addr = pc.uv_offset + src_uv_y * pc.uv_stride + src_uv_x * 2u;
     float a = float(read_u8(uv_addr));
     float b = float(read_u8(uv_addr + 1u));
@@ -217,15 +285,15 @@ void main() {
         ? ivec2(int(base.x), int(base.y))
         : ivec2(pc.dst_x + int(base.x), pc.dst_y + int(base.y));
 
-    if (!full_canvas && pc.opacity >= 0.999 && dst_in_bounds()) {
+    if (rotation_quadrant() == 0u && !full_canvas && pc.opacity >= 0.999 && dst_in_bounds()) {
         uint x0 = base.x;
         uint y0 = base.y;
         uint x1 = min(base.x + 1u, limit_w - 1u);
         uint y1 = min(base.y + 1u, limit_h - 1u);
-        uint src_x0 = scale_nearest(x0, pc.src_w, pc.y_scale_x);
-        uint src_x1 = scale_nearest(x1, pc.src_w, pc.y_scale_x);
-        uint src_y0 = scale_nearest(y0, pc.src_h, pc.y_scale_y);
-        uint src_y1 = scale_nearest(y1, pc.src_h, pc.y_scale_y);
+        uint src_x0 = source_x(x0, y0);
+        uint src_x1 = source_x(x1, y0);
+        uint src_y0 = source_y(x0, y0);
+        uint src_y1 = source_y(x0, y1);
         ivec2 dst = dst_base;
 
         float y00 = HDR_Y_OFFSET +

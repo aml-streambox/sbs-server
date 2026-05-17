@@ -51,6 +51,10 @@ static const VkApplicationInfo app_info = {
 #define SBS_NATIVE_P010_DIRECT_PC_SIZE 128u
 #define SBS_NATIVE_DOWNSCALE_PC_SIZE 20u
 #define SBS_NATIVE_OCCLUSION_MAX_RECTS 32u
+#define SBS_NATIVE_ROTATION_SHIFT 8u
+#define SBS_NATIVE_ROTATION_MASK (3u << SBS_NATIVE_ROTATION_SHIFT)
+#define SBS_NATIVE_FLIP_HORIZONTAL (1u << 10u)
+#define SBS_NATIVE_FLIP_VERTICAL (1u << 11u)
 #ifndef SBS_DRM_FORMAT_AMLY
 #define SBS_DRM_FORMAT_AMLY 0x594c4d41u
 #endif
@@ -7541,6 +7545,73 @@ static float native_clampf01(float v)
     return v;
 }
 
+static bool native_item_has_crop(const sbs_comp_scene_item_t *item)
+{
+    if (!item)
+        return false;
+    return item->crop[0] > 0.000001f || item->crop[1] > 0.000001f ||
+           item->crop[2] > 0.000001f || item->crop[3] > 0.000001f;
+}
+
+static uint32_t native_rotation_quadrant(float degrees)
+{
+    int quadrant = (int)lroundf(degrees / 90.0f);
+    quadrant = ((quadrant % 4) + 4) % 4;
+    return (uint32_t)quadrant;
+}
+
+static uint32_t native_transform_flags(const sbs_comp_scene_item_t *item)
+{
+    uint32_t flags;
+
+    if (!item)
+        return 0;
+    flags = (native_rotation_quadrant(item->rotation_deg) << SBS_NATIVE_ROTATION_SHIFT) &
+        SBS_NATIVE_ROTATION_MASK;
+    if (item->flip_horizontal)
+        flags |= SBS_NATIVE_FLIP_HORIZONTAL;
+    if (item->flip_vertical)
+        flags |= SBS_NATIVE_FLIP_VERTICAL;
+    return flags;
+}
+
+static bool native_apply_item_crop(const sbs_comp_scene_item_t *item,
+                                   uint32_t width,
+                                   uint32_t height,
+                                   uint32_t *src_x,
+                                   uint32_t *src_y,
+                                   uint32_t *src_w,
+                                   uint32_t *src_h)
+{
+    uint32_t left = 0, top = 0, right = 0, bottom = 0;
+
+    if (!src_x || !src_y || !src_w || !src_h || width == 0 || height == 0)
+        return false;
+
+    if (item) {
+        left = (uint32_t)lroundf(native_clampf01(item->crop[0]) * (float)width);
+        top = (uint32_t)lroundf(native_clampf01(item->crop[1]) * (float)height);
+        right = (uint32_t)lroundf(native_clampf01(item->crop[2]) * (float)width);
+        bottom = (uint32_t)lroundf(native_clampf01(item->crop[3]) * (float)height);
+    }
+
+    if (left > width) left = width;
+    if (top > height) top = height;
+    if (right > width) right = width;
+    if (bottom > height) bottom = height;
+
+    if (right > width - left)
+        right = width - left;
+    if (bottom > height - top)
+        bottom = height - top;
+
+    *src_x = left;
+    *src_y = top;
+    *src_w = width - left - right;
+    *src_h = height - top - bottom;
+    return *src_w > 0 && *src_h > 0;
+}
+
 static void rgb_to_bt709_yuv(float r, float g, float b,
                              float *y_out, float *u_out, float *v_out)
 {
@@ -7707,6 +7778,7 @@ static bool native_scene_can_full_canvas_direct_yuv(sbs_compositor_t *comp,
         const sbs_comp_scene_item_t *item = &scene->active_items[i];
         uint32_t slot;
         if (!item->visible || item->opacity < 0.999f ||
+            native_rotation_quadrant(item->rotation_deg) != 0 ||
             item->render_width <= 0 || item->render_height <= 0)
             continue;
 
@@ -7734,6 +7806,8 @@ static bool native_scene_can_full_canvas_direct_yuv(sbs_compositor_t *comp,
 
         bool covers_canvas_height = dst_y + (int32_t)dst_h >= (int32_t)comp->height;
         bool source_driven_amly_with_bg_fill =
+            !native_item_has_crop(item) &&
+            !item->flip_horizontal && !item->flip_vertical &&
             comp->sources[slot].drm_format == SBS_DRM_FORMAT_AMLY &&
             ((entry->color_mode == SBS_EXPORT_COLOR_SDR &&
               comp->native_amly_to_nv21_src_pipeline != VK_NULL_HANDLE) ||
@@ -7771,7 +7845,9 @@ static bool native_scene_can_targeted_bg_fill_yuv(sbs_compositor_t *comp,
         if (!item->visible || item->render_width <= 0 || item->render_height <= 0)
             continue;
         if (item->opacity < 0.999f || item->rotation_deg != 0.0f ||
-            (item->filter_flags & SBS_COMP_FILTER_LUMA_KEY) != 0)
+            item->flip_horizontal || item->flip_vertical ||
+            (item->filter_flags & SBS_COMP_FILTER_LUMA_KEY) != 0 ||
+            native_item_has_crop(item))
             return false;
 
         slot = native_source_texture_slot_for_item(comp, scene->active_items,
@@ -8298,6 +8374,18 @@ static bool native_source_opaque_occluder_rect(sbs_compositor_t *comp,
         oy1 = ((uint64_t)dst_h * (ay + ah) + tex->height - 1u) / tex->height;
         if (ox1 <= ox0 || oy1 <= oy0)
             return false;
+        if (item->flip_horizontal) {
+            uint64_t fx0 = dst_w - ox1;
+            uint64_t fx1 = dst_w - ox0;
+            ox0 = fx0;
+            ox1 = fx1;
+        }
+        if (item->flip_vertical) {
+            uint64_t fy0 = dst_h - oy1;
+            uint64_t fy1 = dst_h - oy0;
+            oy0 = fy0;
+            oy1 = fy1;
+        }
         dst_x += (int32_t)ox0;
         dst_y += (int32_t)oy0;
         dst_x1 = dst_x + (int32_t)(ox1 - ox0);
@@ -8455,14 +8543,21 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
         uint32_t src_y = 0;
         uint32_t src_rect_w = tex->width;
         uint32_t src_rect_h = tex->height;
-        bool direct_yuv = have_direct_pipeline &&
-            p010_direct_set != VK_NULL_HANDLE &&
-            native_source_can_direct_yuv(comp, entry, tex, item);
+        bool item_has_crop = native_item_has_crop(item);
+        bool direct_yuv = false;
 
         if (!item->visible || !tex->allocated || !tex->has_content ||
             !source_texture_matches_item(tex, item) ||
             item->render_width <= 0 || item->render_height <= 0)
             continue;
+
+        if (!native_apply_item_crop(item, tex->width, tex->height,
+                                    &src_x, &src_y, &src_rect_w, &src_rect_h))
+            continue;
+
+        direct_yuv = have_direct_pipeline &&
+            p010_direct_set != VK_NULL_HANDLE &&
+            native_source_can_direct_yuv(comp, entry, tex, item);
         if (!direct_yuv && (!have_rgba_pipeline ||
                             descriptor_set == VK_NULL_HANDLE ||
                             tex->view == VK_NULL_HANDLE))
@@ -8475,7 +8570,8 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
         if (dst_w == 0 || dst_h == 0)
             continue;
 
-        if (!direct_yuv && !native_crop_rgba_layer_to_alpha_bounds(tex,
+        if (!direct_yuv && !item_has_crop &&
+            !native_crop_rgba_layer_to_alpha_bounds(tex,
                 &dst_x, &dst_y, &dst_w, &dst_h,
                 &src_x, &src_y, &src_rect_w, &src_rect_h))
             continue;
@@ -8493,6 +8589,8 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
             bool item_base_direct = !base_layer_used;
             bool item_full_canvas_direct = full_canvas_direct && item_base_direct;
             float layer_opacity = native_clampf01(item->opacity * opacity_scale);
+            uint32_t item_rotation = native_rotation_quadrant(item->rotation_deg);
+            bool item_flipped = item->flip_horizontal || item->flip_vertical;
             uint32_t source_scale_dst_w = dst_w;
             uint32_t source_scale_dst_h = dst_h;
             sbs_native_rect_t visible_rects[SBS_NATIVE_OCCLUSION_MAX_RECTS];
@@ -8527,7 +8625,8 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
             VkPipeline amly_source_pipeline = entry->color_mode == SBS_EXPORT_COLOR_HDR10
                 ? comp->native_amly_to_p010_src_pipeline
                 : comp->native_amly_to_nv21_src_pipeline;
-            if (tex->drm_format == SBS_DRM_FORMAT_AMLY &&
+            if (!item_has_crop && !item_flipped && item_rotation == 0 &&
+                tex->drm_format == SBS_DRM_FORMAT_AMLY &&
                 amly_source_pipeline != VK_NULL_HANDLE &&
                 item_base_direct && layer_opacity >= 0.999f &&
                 (item->filter_flags & ~SBS_COMP_FILTER_HDR_TO_SDR_LUT) == 0 &&
@@ -8538,7 +8637,8 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                 direct_pipeline = amly_source_pipeline;
                 source_driven_amly = true;
             }
-            if ((tex->drm_format == DRM_FORMAT_NV12 || tex->drm_format == DRM_FORMAT_NV21) &&
+            if (!item_has_crop && !item_flipped && item_rotation == 0 &&
+                (tex->drm_format == DRM_FORMAT_NV12 || tex->drm_format == DRM_FORMAT_NV21) &&
                 (direct_pipeline == comp->native_yuv8_to_nv21_pipeline ||
                  direct_pipeline == comp->native_yuv8_to_p010_pipeline) &&
                 layer_opacity >= 0.999f && item->filter_flags == 0 &&
@@ -8550,7 +8650,7 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                 source_driven_yuv8 = src_blocks < dst_blocks;
             }
 
-            if (item_full_canvas_direct && layer_opacity >= 0.999f &&
+            if (item_rotation == 0 && !item_flipped && item_full_canvas_direct && layer_opacity >= 0.999f &&
                 dst_x <= 0 && dst_y <= 0 &&
                 dst_x + (int32_t)dst_w >= (int32_t)canvas_width &&
                 dst_y + (int32_t)dst_h >= (int32_t)canvas_height &&
@@ -8560,7 +8660,7 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                     canvas_width, canvas_height, ref_items, ref_count,
                     visible_rects, &visible_rect_count);
             }
-            if (!split_full_canvas_direct &&
+            if (item_rotation == 0 && !item_flipped && !item_has_crop && !split_full_canvas_direct &&
                 ((item_base_direct && tex->drm_format == SBS_DRM_FORMAT_AMLY &&
                   amly_source_pipeline != VK_NULL_HANDLE) ||
                  (entry->color_mode == SBS_EXPORT_COLOR_SDR &&
@@ -8608,6 +8708,7 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                 flags |= SBS_NATIVE_P010_DIRECT_DST_IN_BOUNDS;
             if (source_driven_yuv8)
                 flags |= SBS_NATIVE_P010_DIRECT_SOURCE_DRIVEN;
+            flags |= native_transform_flags(item);
             if (split_full_canvas_direct)
                 flags = (flags & ~SBS_NATIVE_P010_DIRECT_FULL_CANVAS) |
                     SBS_NATIVE_P010_DIRECT_SRC_OFFSET |
@@ -8624,19 +8725,19 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                 .dst_y = dst_y,
                 .dst_w = dst_w,
                 .dst_h = dst_h,
-                .src_w = tex->width,
-                .src_h = tex->height,
+                .src_w = src_rect_w,
+                .src_h = src_rect_h,
                 .opacity = layer_opacity,
                 .flags = flags,
                 .y_stride = tex->y_stride,
                 .uv_stride = tex->uv_stride,
-                .uv_offset = tex->uv_offset,
-                .y_scale_x = (float)tex->width / (float)source_scale_dst_w,
-                .y_scale_y = (float)tex->height / (float)source_scale_dst_h,
-                .uv_scale_x = (float)((tex->width + 1u) >> 1) /
-                              (float)((source_scale_dst_w + 1u) >> 1),
-                .uv_scale_y = (float)((tex->height + 1u) >> 1) /
-                              (float)((source_scale_dst_h + 1u) >> 1),
+                .uv_offset = tex->drm_format == SBS_DRM_FORMAT_AMLY ? tex->width : tex->uv_offset,
+                .y_scale_x = (float)src_rect_w / (float)source_scale_dst_w,
+                .y_scale_y = (float)src_rect_h / (float)source_scale_dst_h,
+                .uv_scale_x = (float)((src_rect_w + 1u) >> 1) /
+                               (float)((source_scale_dst_w + 1u) >> 1),
+                .uv_scale_y = (float)((src_rect_h + 1u) >> 1) /
+                               (float)((source_scale_dst_h + 1u) >> 1),
                 .bg_y = bg_y,
                 .bg_u = bg_u,
                 .bg_v = bg_v,
@@ -8646,6 +8747,8 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                 .hdr_brightness = hdr_to_sdr_filter ? item->hdr_to_sdr_brightness : item->filter_params[5],
                 .hdr_hue_cos = hdr_to_sdr_filter ? cosf(hdr_hue_rad) : item->filter_params[6],
                 .hdr_hue_sin = hdr_to_sdr_filter ? sinf(hdr_hue_rad) : item->filter_params[7],
+                .src_offset_x = src_x,
+                .src_offset_y = src_y,
             };
             memcpy(pc.filter_params, item->filter_params, sizeof(pc.filter_params));
             if (source_driven_amly) {
@@ -8905,7 +9008,7 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
             .src_rect_w = src_rect_w,
             .src_rect_h = src_rect_h,
             .opacity = native_clampf01(item->opacity * opacity_scale),
-            .flags = 0,
+            .flags = native_transform_flags(item),
             .filter_flags = item->filter_flags,
         };
         memcpy(pc.filter_params_a, item->filter_params, sizeof(float) * 4);
@@ -8913,7 +9016,9 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
 
         sbs_native_rect_t visible_rects[SBS_NATIVE_OCCLUSION_MAX_RECTS];
         uint32_t visible_rect_count = 0;
-        bool split_rgba_layer = native_build_layer_visible_rects(
+        bool split_rgba_layer = native_rotation_quadrant(item->rotation_deg) == 0 &&
+            !item->flip_horizontal && !item->flip_vertical &&
+            native_build_layer_visible_rects(
             comp, entry, items, count, i,
             (sbs_native_rect_t){ dst_x, dst_y,
                                  dst_x + (int32_t)dst_w,

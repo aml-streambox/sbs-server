@@ -2,6 +2,8 @@
 
 #include "sbs/api_server.h"
 
+#include <math.h>
+
 static cJSON *api_error(int code, const char *message)
 {
     cJSON *err = cJSON_CreateObject();
@@ -36,6 +38,13 @@ static bool json_bool(cJSON *obj, const char *key, bool fallback)
     return fallback;
 }
 
+static double snap_quarter_rotation(double degrees)
+{
+    int quarter = (int)lround(degrees / 90.0);
+    quarter = ((quarter % 4) + 4) % 4;
+    return (double)(quarter * 90);
+}
+
 static void parse_transform(cJSON *json, sbs_scene_item_transform_t *transform)
 {
     memset(transform, 0, sizeof(*transform));
@@ -47,7 +56,7 @@ static void parse_transform(cJSON *json, sbs_scene_item_transform_t *transform)
     transform->crop_bottom = json_int(json, "crop_bottom", 0);
     transform->crop_left = json_int(json, "crop_left", 0);
     transform->crop_right = json_int(json, "crop_right", 0);
-    transform->rotation_deg = json_double(json, "rotation_deg", 0.0);
+    transform->rotation_deg = snap_quarter_rotation(json_double(json, "rotation_deg", 0.0));
     transform->flip_horizontal = json_bool(json, "flip_horizontal", false);
     transform->flip_vertical = json_bool(json, "flip_vertical", false);
     transform->bounds_type = (char *)(json_str(json, "bounds_type") ? json_str(json, "bounds_type") : "stretch");

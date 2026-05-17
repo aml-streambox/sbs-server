@@ -208,24 +208,34 @@ int sbs_api_handle_canvas_update(sbs_api_server_t *server, sbs_api_client_t *cli
         return SBS_ERR_INVAL;
     }
 
-    uint32_t new_w = (uint32_t)json_num(canvas_obj, "width", graph->canvas.width);
-    uint32_t new_h = (uint32_t)json_num(canvas_obj, "height", graph->canvas.height);
-    uint32_t new_fps_num = (uint32_t)json_num(canvas_obj, "fps_num", graph->canvas.fps_num);
-    uint32_t new_fps_den = (uint32_t)json_num(canvas_obj, "fps_den", graph->canvas.fps_den);
+    uint32_t base_w = server->pending_canvas_valid ? server->pending_canvas_width : graph->canvas.width;
+    uint32_t base_h = server->pending_canvas_valid ? server->pending_canvas_height : graph->canvas.height;
+    uint32_t base_fps_num = server->pending_canvas_valid ? server->pending_canvas_fps_num : graph->canvas.fps_num;
+    uint32_t base_fps_den = server->pending_canvas_valid ? server->pending_canvas_fps_den : graph->canvas.fps_den;
+    const char *base_cm = server->pending_canvas_valid && server->pending_canvas_color_mode
+        ? server->pending_canvas_color_mode
+        : (graph->canvas.color_mode == SBS_SCENE_COLOR_MODE_HDR10 ? "hdr10" : "sdr");
+    const char *base_bg = server->pending_canvas_valid && server->pending_canvas_background_color
+        ? server->pending_canvas_background_color
+        : graph->canvas.background_color;
+    uint32_t new_w = (uint32_t)json_num(canvas_obj, "width", base_w);
+    uint32_t new_h = (uint32_t)json_num(canvas_obj, "height", base_h);
+    uint32_t new_fps_num = (uint32_t)json_num(canvas_obj, "fps_num", base_fps_num);
+    uint32_t new_fps_den = (uint32_t)json_num(canvas_obj, "fps_den", base_fps_den);
     cJSON *width_item = cJSON_GetObjectItemCaseSensitive(canvas_obj, "width");
     cJSON *height_item = cJSON_GetObjectItemCaseSensitive(canvas_obj, "height");
     const char *new_bg = json_str(canvas_obj, "background_color");
     const char *new_cm = json_str(canvas_obj, "color_mode");
-    const char *resolved_cm = new_cm ? new_cm : (graph->canvas.color_mode == SBS_SCENE_COLOR_MODE_HDR10 ? "hdr10" : "sdr");
-    const char *resolved_bg = new_bg ? new_bg : graph->canvas.background_color;
+    const char *resolved_cm = new_cm ? new_cm : base_cm;
+    const char *resolved_bg = new_bg ? new_bg : base_bg;
     bool resolution_changed = cJSON_IsNumber(width_item) || cJSON_IsNumber(height_item);
 
     if (!new_fps_den) {
         new_fps_den = 1;
     }
     if (resolution_changed &&
-        (new_w == 0 || new_h == 0 || (new_w & 63u) != 0 || (new_h & 63u) != 0)) {
-        *error = api_error(-32602, "Canvas width and height must be positive multiples of 64");
+        (new_w == 0 || new_h == 0 || (new_w & 1u) != 0 || (new_h & 1u) != 0)) {
+        *error = api_error(-32602, "Canvas width and height must be positive even numbers");
         return SBS_ERR_INVAL;
     }
 

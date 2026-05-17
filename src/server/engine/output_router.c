@@ -536,7 +536,7 @@ static void *native_encoder_thread_func(void *arg)
         int enc_fd = dup(lease.backing_fd);
         if (enc_fd >= 0) {
             sbs_encoder_manager_consume_frame_dmabuf(encoder_mgr, &msg,
-                                                      enc_fd, lease.backing_size);
+                                                     enc_fd, lease.backing_size);
             submitted = true;
         } else {
             LOG_W("native encoder dup(fd=%d) failed: %s",
@@ -561,7 +561,7 @@ static void *native_encoder_thread_func(void *arg)
                   (unsigned long)lease.frame_number,
                   elapsed / 1000.0,
                   (unsigned long)submitted_total,
-                   (unsigned long)dropped_total);
+                  (unsigned long)dropped_total);
         }
 
         if (submitted && native_encoder_bframes_enabled(encoder_mgr)) {

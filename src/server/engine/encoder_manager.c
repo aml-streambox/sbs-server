@@ -3291,9 +3291,18 @@ void sbs_encoder_manager_consume_frame_ptr(sbs_encoder_manager_t *mgr,
     sbs_direct_venc_packet_t packet = {0};
     int rc = sbs_direct_venc_submit_ptr(mgr->video_encoder, msg, data, size,
                                         mgr->force_next_idr, &packet);
-    mgr->force_next_idr = false;
+    if (rc == SBS_OK || rc == SBS_ERR_WOULD_BLOCK)
+        mgr->force_next_idr = false;
+    if (rc == SBS_ERR_WOULD_BLOCK) {
+        pthread_mutex_unlock(&mgr->pipeline_mutex);
+        return;
+    }
     if (rc != SBS_OK) {
         mgr->frames_dropped++;
+        pthread_mutex_unlock(&mgr->pipeline_mutex);
+        return;
+    }
+    if (!packet.data || packet.size == 0) {
         pthread_mutex_unlock(&mgr->pipeline_mutex);
         return;
     }
@@ -3331,9 +3340,18 @@ void sbs_encoder_manager_consume_frame_dmabuf(sbs_encoder_manager_t *mgr,
     int rc = sbs_direct_venc_submit_dmabuf(mgr->video_encoder, msg, dmabuf_fd, size,
                                            mgr->force_next_idr, &packet);
     close(dmabuf_fd);
-    mgr->force_next_idr = false;
+    if (rc == SBS_OK || rc == SBS_ERR_WOULD_BLOCK)
+        mgr->force_next_idr = false;
+    if (rc == SBS_ERR_WOULD_BLOCK) {
+        pthread_mutex_unlock(&mgr->pipeline_mutex);
+        return;
+    }
     if (rc != SBS_OK) {
         mgr->frames_dropped++;
+        pthread_mutex_unlock(&mgr->pipeline_mutex);
+        return;
+    }
+    if (!packet.data || packet.size == 0) {
         pthread_mutex_unlock(&mgr->pipeline_mutex);
         return;
     }

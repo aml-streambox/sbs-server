@@ -15,7 +15,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
-#include <sys/mman.h>
 #include <unistd.h>
 
 #ifndef DRM_FORMAT_NV21
@@ -219,6 +218,7 @@ struct sbs_direct_venc {
     int input_frame_num_origin;
     int submit_id_origin;
     GQueue *pending_frames;
+    uint32_t p010_dumps_written;
 };
 
 /* ---- Helpers ---- */
@@ -226,6 +226,66 @@ struct sbs_direct_venc {
 static vl_codec_id_t codec_id_from_string(const char *codec)
 {
     return (codec && strcmp(codec, "h264") == 0) ? CODEC_ID_H264 : CODEC_ID_H265;
+}
+
+static const char *codec_id_name(vl_codec_id_t codec_id)
+{
+    return codec_id == CODEC_ID_H264 ? "h264" : "h265";
+}
+
+static const char *img_format_name(vl_img_format_t fmt)
+{
+    switch (fmt) {
+    case IMG_FMT_NV12: return "NV12";
+    case IMG_FMT_NV21: return "NV21";
+    case IMG_FMT_YUV420P: return "YUV420P";
+    case IMG_FMT_YV12: return "YV12";
+    case IMG_FMT_RGB888: return "RGB888";
+    case IMG_FMT_RGBA8888: return "RGBA8888";
+    case IMG_FMT_P010: return "P010";
+    default: return "unknown";
+    }
+}
+
+static const char *buffer_type_name(vl_buffer_type_t type)
+{
+    switch (type) {
+    case VMALLOC_TYPE: return "VMALLOC";
+    case CANVAS_TYPE: return "CANVAS";
+    case PHYSICAL_TYPE: return "PHYSICAL";
+    case DMA_TYPE: return "DMA";
+    default: return "unknown";
+    }
+}
+
+static const char *drm_format_name(uint32_t drm_format)
+{
+    switch (drm_format) {
+    case DRM_FORMAT_NV21: return "NV21";
+    case DRM_FORMAT_P010: return "P010";
+    case 0: return "unset";
+    default: return "unknown";
+    }
+}
+
+static const char *h265_nal_type_name(uint8_t nal_type)
+{
+    switch (nal_type) {
+    case 19: return "IDR_W_RADL";
+    case 20: return "IDR_N_LP";
+    case 32: return "VPS";
+    case 33: return "SPS";
+    case 34: return "PPS";
+    case 35: return "AUD";
+    case 39: return "PREFIX_SEI";
+    case 40: return "SUFFIX_SEI";
+    default:
+        if (nal_type <= 9)
+            return "TRAIL";
+        if (nal_type >= 16 && nal_type <= 18)
+            return "BLA/CRA";
+        return "NAL";
+    }
 }
 
 static size_t choose_outbuf_size(uint32_t width, uint32_t height)
@@ -310,6 +370,33 @@ static uint64_t calculate_frame_duration_ns(uint32_t fps_num, uint32_t fps_den)
         fps_den = 1;
 
     return (1000000000ull * (uint64_t)fps_den) / (uint64_t)fps_num;
+}
+
+static size_t visible_frame_size_from_msg(const sbs_video_frame_msg_t *msg,
+                                          bool hdr10)
+{
+    uint32_t y_stride;
+    uint32_t uv_stride;
+    uint32_t uv_offset;
+
+    if (!msg || msg->width == 0 || msg->height == 0)
+        return 0;
+
+    if (hdr10) {
+        y_stride = msg->plane_stride[0] ? msg->plane_stride[0]
+                                        : msg->width * 2u;
+        uv_stride = msg->plane_stride[1] ? msg->plane_stride[1]
+                                         : y_stride;
+        uv_offset = msg->plane_offset[1] ? msg->plane_offset[1]
+                                         : y_stride * msg->height;
+        return (size_t)uv_offset + (size_t)uv_stride * (msg->height / 2u);
+    }
+
+    y_stride = msg->plane_stride[0] ? msg->plane_stride[0] : msg->width;
+    uv_stride = msg->plane_stride[1] ? msg->plane_stride[1] : y_stride;
+    uv_offset = msg->plane_offset[1] ? msg->plane_offset[1]
+                                     : y_stride * msg->height;
+    return (size_t)uv_offset + (size_t)uv_stride * (msg->height / 2u);
 }
 
 static uint64_t bframe_delay_ns(const sbs_direct_venc_t *enc)
@@ -459,6 +546,297 @@ static int load_symbols(sbs_direct_venc_t *enc)
     return SBS_OK;
 }
 
+static void p010_pre_byteswap(uint8_t *data, size_t size)
+{
+    size_t even_size = size & ~(size_t)1;
+
+    for (size_t i = 0; i < even_size; i += 2) {
+        uint8_t tmp = data[i];
+        data[i] = data[i + 1];
+        data[i + 1] = tmp;
+    }
+}
+
+static uint16_t p010_debug_unswap(uint16_t value)
+{
+    return (uint16_t)((value >> 8) | (value << 8));
+}
+
+static void p010_debug_log_lr_similarity(const sbs_video_frame_msg_t *msg,
+                                         const void *data)
+{
+    static bool logged = false;
+
+    if (logged || !getenv("SBS_VENC_DEBUG_P010_LR") || !msg || !data ||
+        msg->width < 2 || msg->height == 0)
+        return;
+
+    uint32_t stride = msg->plane_stride[0] ? msg->plane_stride[0]
+                                           : msg->width * 2u;
+    uint32_t half = msg->width / 2u;
+    const uint8_t *base = data;
+    uint64_t samples = 0;
+    uint64_t sum_abs = 0;
+    uint64_t sum_l = 0;
+    uint64_t sum_r = 0;
+
+    for (uint32_t y = 0; y < msg->height; y += 16u) {
+        const uint16_t *row = (const uint16_t *)(const void *)(base +
+            msg->plane_offset[0] + (size_t)y * stride);
+        for (uint32_t x = 0; x < half; x += 16u) {
+            uint16_t l = row[x] >> 6;
+            uint16_t r = row[x + half] >> 6;
+            sum_l += l;
+            sum_r += r;
+            sum_abs += l > r ? (uint64_t)(l - r) : (uint64_t)(r - l);
+            samples++;
+        }
+    }
+
+    if (samples > 0) {
+        LOG_I("P010 input LR debug: samples=%lu mean_l=%lu mean_r=%lu mean_abs_delta=%lu stride=%u",
+              (unsigned long)samples,
+              (unsigned long)(sum_l / samples),
+              (unsigned long)(sum_r / samples),
+              (unsigned long)(sum_abs / samples),
+              stride);
+    }
+    logged = true;
+}
+
+static uint32_t env_u32_or_default(const char *name, uint32_t fallback)
+{
+    const char *value = getenv(name);
+    char *end = NULL;
+    unsigned long parsed;
+
+    if (!value || !*value)
+        return fallback;
+    errno = 0;
+    parsed = strtoul(value, &end, 10);
+    if (errno != 0 || end == value || parsed > UINT32_MAX)
+        return fallback;
+    return (uint32_t)parsed;
+}
+
+static uint64_t fnv1a64(const uint8_t *data, size_t size)
+{
+    uint64_t hash = 1469598103934665603ull;
+
+    for (size_t i = 0; i < size; i++) {
+        hash ^= data[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+static bool find_annexb_start_code(const uint8_t *data,
+                                   size_t size,
+                                   size_t from,
+                                   size_t *prefix_pos,
+                                   size_t *nal_pos)
+{
+    if (!data || !prefix_pos || !nal_pos || from >= size)
+        return false;
+
+    for (size_t i = from; i + 3 < size; i++) {
+        if (data[i] == 0x00 && data[i + 1] == 0x00) {
+            if (data[i + 2] == 0x01) {
+                *prefix_pos = i;
+                *nal_pos = i + 3;
+                return true;
+            }
+            if (i + 4 < size && data[i + 2] == 0x00 && data[i + 3] == 0x01) {
+                *prefix_pos = i;
+                *nal_pos = i + 4;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void log_h265_nal_summary(const uint8_t *data, size_t size)
+{
+    char summary[384];
+    size_t prefix = 0;
+    size_t nal = 0;
+    size_t search = 0;
+    int off = 0;
+    uint32_t count = 0;
+
+    if (!data || size == 0)
+        return;
+
+    summary[0] = '\0';
+    while (count < 12 && find_annexb_start_code(data, size, search, &prefix, &nal)) {
+        size_t next_prefix = size;
+        size_t next_nal = size;
+        size_t nal_size;
+        uint8_t nal_type;
+
+        if (nal + 2 > size)
+            break;
+        if (find_annexb_start_code(data, size, nal + 2, &next_prefix, &next_nal))
+            nal_size = next_prefix > nal ? next_prefix - nal : 0;
+        else
+            nal_size = size - nal;
+
+        nal_type = (data[nal] >> 1) & 0x3f;
+        off += snprintf(summary + off, sizeof(summary) - (size_t)off,
+                        "%s%s(%u):%zu",
+                        count == 0 ? "" : ",",
+                        h265_nal_type_name(nal_type), nal_type, nal_size);
+        if (off >= (int)sizeof(summary)) {
+            summary[sizeof(summary) - 1] = '\0';
+            break;
+        }
+        count++;
+        search = next_prefix;
+        if (search >= size)
+            break;
+    }
+
+    if (count == 0) {
+        LOG_I("VENC OUTPUT NAL: no Annex-B start codes found size=%zu first=%02x %02x %02x %02x",
+              size,
+              size > 0 ? data[0] : 0,
+              size > 1 ? data[1] : 0,
+              size > 2 ? data[2] : 0,
+              size > 3 ? data[3] : 0);
+    } else {
+        LOG_I("VENC OUTPUT NAL: count_first=%u size=%zu %s%s",
+              count, size, summary, count == 12 ? ",..." : "");
+    }
+}
+
+static void log_input_contract(const sbs_direct_venc_t *enc,
+                               const char *path,
+                               const sbs_video_frame_msg_t *msg,
+                               const vl_buffer_info_t *inbuf,
+                               size_t buffer_size)
+{
+    size_t visible_size;
+
+    if (!enc || !msg || !inbuf)
+        return;
+    if (enc->next_submit_id > 2 && !getenv("SBS_VENC_LOG_PARAMS"))
+        return;
+
+    visible_size = visible_frame_size_from_msg(msg, enc->hdr10);
+    LOG_I("VENC INPUT CONTRACT[%s] submit=%d msg={%ux%u drm=%s/0x%08x n_planes=%u offsets=%u,%u strides=%u,%u buffer_type=%u size=%zu visible=%zu pts=%lu dur=%lu seq=%lu} inbuf={type=%s/%d fmt=%s/%d stride=%d ptr0=0x%lx ptr1=0x%lx dma_fd=%d,%d,%d dma_planes=%u}",
+          path ? path : "?", enc->next_submit_id,
+          msg->width, msg->height,
+          drm_format_name(msg->drm_format), (unsigned)msg->drm_format,
+          msg->n_planes,
+          msg->plane_offset[0], msg->plane_offset[1],
+          msg->plane_stride[0], msg->plane_stride[1],
+          msg->buffer_type, buffer_size, visible_size,
+          (unsigned long)msg->pts_ns,
+          (unsigned long)msg->duration_ns,
+          (unsigned long)msg->sequence,
+          buffer_type_name(inbuf->buf_type), inbuf->buf_type,
+          img_format_name(inbuf->buf_fmt), inbuf->buf_fmt,
+          inbuf->buf_stride,
+          inbuf->buf_type == VMALLOC_TYPE ? inbuf->buf_info.in_ptr[0] : 0ul,
+          inbuf->buf_type == VMALLOC_TYPE ? inbuf->buf_info.in_ptr[1] : 0ul,
+          inbuf->buf_type == DMA_TYPE ? inbuf->buf_info.dma_info.shared_fd[0] : -1,
+          inbuf->buf_type == DMA_TYPE ? inbuf->buf_info.dma_info.shared_fd[1] : -1,
+          inbuf->buf_type == DMA_TYPE ? inbuf->buf_info.dma_info.shared_fd[2] : -1,
+          inbuf->buf_type == DMA_TYPE ? inbuf->buf_info.dma_info.num_planes : 0);
+}
+
+static void p010_dump_encoder_input(sbs_direct_venc_t *enc,
+                                    const sbs_video_frame_msg_t *msg,
+                                    const void *data,
+                                    size_t size)
+{
+    const char *dir = getenv("SBS_VENC_DUMP_P010_INPUT_DIR");
+    uint32_t max_dumps;
+    uint32_t interval;
+    uint32_t dump_idx;
+    size_t visible_size;
+    char *path = NULL;
+    char *meta_path = NULL;
+    FILE *fp = NULL;
+    FILE *meta = NULL;
+    uint64_t hash;
+
+    if (!enc || !enc->hdr10 || !msg || !data || !dir || !*dir)
+        return;
+
+    max_dumps = env_u32_or_default("SBS_VENC_DUMP_P010_INPUT_COUNT", 3u);
+    if (max_dumps == 0 || enc->p010_dumps_written >= max_dumps)
+        return;
+    interval = env_u32_or_default("SBS_VENC_DUMP_P010_INPUT_INTERVAL", 1u);
+    if (interval == 0)
+        interval = 1;
+    if (((uint32_t)enc->next_submit_id % interval) != 0)
+        return;
+
+    visible_size = visible_frame_size_from_msg(msg, true);
+    if (msg->width == 0 || msg->height == 0 || size < visible_size) {
+        LOG_W("P010 encoder input dump skipped: size=%zu visible=%zu w=%u h=%u",
+              size, visible_size, msg->width, msg->height);
+        return;
+    }
+
+    if (g_mkdir_with_parents(dir, 0755) != 0) {
+        LOG_W("P010 encoder input dump dir '%s' unavailable: %s", dir, g_strerror(errno));
+        enc->p010_dumps_written = max_dumps;
+        return;
+    }
+
+    dump_idx = enc->p010_dumps_written++;
+    path = g_strdup_printf("%s/encoder-input-p010-%03u-frame-%06d-%ux%u.p010",
+                           dir, dump_idx, enc->next_submit_id,
+                           msg->width, msg->height);
+    meta_path = g_strdup_printf("%s.meta", path);
+    if (!path || !meta_path)
+        goto out;
+
+    fp = fopen(path, "wb");
+    if (!fp) {
+        LOG_W("P010 encoder input dump open failed: %s", g_strerror(errno));
+        goto out;
+    }
+    if (fwrite(data, 1, visible_size, fp) != visible_size) {
+        LOG_W("P010 encoder input dump write failed: %s", g_strerror(errno));
+        goto out;
+    }
+
+    hash = fnv1a64((const uint8_t *)data, visible_size);
+    meta = fopen(meta_path, "w");
+    if (meta) {
+        fprintf(meta, "stage=direct-venc-pre-endian-workaround\n");
+        fprintf(meta, "width=%u\n", msg->width);
+        fprintf(meta, "height=%u\n", msg->height);
+        fprintf(meta, "drm_format=0x%08x\n", (unsigned)msg->drm_format);
+        fprintf(meta, "n_planes=%u\n", msg->n_planes);
+        fprintf(meta, "plane_offset0=%u\n", msg->plane_offset[0]);
+        fprintf(meta, "plane_offset1=%u\n", msg->plane_offset[1]);
+        fprintf(meta, "plane_stride0=%u\n", msg->plane_stride[0]);
+        fprintf(meta, "plane_stride1=%u\n", msg->plane_stride[1]);
+        fprintf(meta, "input_size=%zu\n", size);
+        fprintf(meta, "dump_size=%zu\n", visible_size);
+        fprintf(meta, "fnv1a64=0x%016lx\n", (unsigned long)hash);
+        fprintf(meta, "pts_ns=%lu\n", (unsigned long)msg->pts_ns);
+        fprintf(meta, "sequence=%lu\n", (unsigned long)msg->sequence);
+    }
+    LOG_I("P010 encoder input dump[%u]: %s size=%zu input=%zu hash=0x%016lx n_planes=%u stride=%u/%u offset=%u/%u",
+          dump_idx, path, visible_size, size, (unsigned long)hash,
+          msg->n_planes, msg->plane_stride[0], msg->plane_stride[1],
+          msg->plane_offset[0], msg->plane_offset[1]);
+
+out:
+    if (meta)
+        fclose(meta);
+    if (fp)
+        fclose(fp);
+    g_free(meta_path);
+    g_free(path);
+}
+
 /* ---- Encoder init (matches gstamlvenc_init_encoder) ---- */
 
 static int init_encoder_handle(sbs_direct_venc_t *enc)
@@ -508,13 +886,38 @@ static int init_encoder_handle(sbs_direct_venc_t *enc)
     qp.qp_P_min = 0;
     qp.qp_P_max = 51;
 
+    LOG_I("VENC OPEN REQUEST: codec=%s(%d) size=%dx%d fps=%d bitrate=%d gop=%d img_format=%s(%d) enc_opts=0x%x internal_bit_depth=%d gop_pattern=%d rc_mode=%d bitstream_buf_kb=%d vui={present=%u full_range=%u signal=%u colour_desc=%u prim=%u transfer=%u matrix=%u} qp={min=%d max=%d I=%d/%d-%d P=%d/%d-%d}",
+          codec_id_name(enc->codec_id), enc->codec_id,
+          info.width, info.height, info.frame_rate, info.bit_rate,
+          info.gop, img_format_name(info.img_format), info.img_format,
+          info.enc_feature_opts, info.internal_bit_depth,
+          info.gop_pattern, info.rc_mode, info.bitstream_buf_sz_kb,
+          info.vui_parameters_present_flag,
+          info.video_full_range_flag,
+          info.video_signal_type_present_flag,
+          info.colour_description_present_flag,
+          info.colour_primaries,
+          info.transfer_characteristics,
+          info.matrix_coefficients,
+          qp.qp_min, qp.qp_max,
+          qp.qp_I_base, qp.qp_I_min, qp.qp_I_max,
+          qp.qp_P_base, qp.qp_P_min, qp.qp_P_max);
+
     enc->handle = enc->init_fn(enc->codec_id, info, &qp);
     if (enc->handle == 0) {
         LOG_E("vl_multi_encoder_init failed: codec=%s %ux%u bitrate=%ukbps gop=%u gop_pattern=%d",
-              enc->codec_id == CODEC_ID_H264 ? "h264" : "h265",
+              codec_id_name(enc->codec_id),
               enc->width, enc->height, enc->bitrate_kbps, enc->gop_size, enc->gop_pattern);
         return SBS_ERR_IO;
     }
+
+    LOG_I("VENC OPEN RESULT: handle=0x%lx codec=%s hdr10=%d bframes=%d frame_duration=%luns outbuf=%zuKB",
+          (unsigned long)enc->handle,
+          codec_id_name(enc->codec_id),
+          enc->hdr10,
+          enc->bframe_enabled,
+          (unsigned long)enc->frame_duration_ns,
+          enc->outbuf_size / 1024u);
 
     return SBS_OK;
 }
@@ -564,16 +967,21 @@ static int submit_common(sbs_direct_venc_t *enc,
                 const uint16_t *row100 = p + stride_u16 * 100;
                 const uint16_t *row540 = p + stride_u16 * 540;
                 LOG_I("P010 VMALLOC row0[0..3]=%u %u %u %u row100[0..3]=%u %u %u %u row540[0..3]=%u %u %u %u stride=%d",
-                      p[0], p[1], p[2], p[3],
-                      row100[0], row100[1], row100[2], row100[3],
-                      row540[0], row540[1], row540[2], row540[3],
+                      p010_debug_unswap(p[0]), p010_debug_unswap(p[1]),
+                      p010_debug_unswap(p[2]), p010_debug_unswap(p[3]),
+                      p010_debug_unswap(row100[0]), p010_debug_unswap(row100[1]),
+                      p010_debug_unswap(row100[2]), p010_debug_unswap(row100[3]),
+                      p010_debug_unswap(row540[0]), p010_debug_unswap(row540[1]),
+                      p010_debug_unswap(row540[2]), p010_debug_unswap(row540[3]),
                       inbuf->buf_stride);
                 uint32_t uv_off = msg->plane_offset[1] > 0 ? msg->plane_offset[1] : msg->width * msg->height * 2;
                 const uint16_t *uv = (const uint16_t *)(unsigned long)(inbuf->buf_info.in_ptr[0] + uv_off);
                 const uint16_t *uv270 = uv + stride_u16 * 270;
                 LOG_I("P010 VMALLOC UV row0[0..3]=%u %u %u %u row270[0..3]=%u %u %u %u uv_off=%u",
-                      uv[0], uv[1], uv[2], uv[3],
-                      uv270[0], uv270[1], uv270[2], uv270[3],
+                      p010_debug_unswap(uv[0]), p010_debug_unswap(uv[1]),
+                      p010_debug_unswap(uv[2]), p010_debug_unswap(uv[3]),
+                      p010_debug_unswap(uv270[0]), p010_debug_unswap(uv270[1]),
+                      p010_debug_unswap(uv270[2]), p010_debug_unswap(uv270[3]),
                       uv_off);
             } else {
                 const uint8_t *p = (const uint8_t *)(unsigned long)inbuf->buf_info.in_ptr[0];
@@ -593,9 +1001,9 @@ static int submit_common(sbs_direct_venc_t *enc,
     sync_dmabuf_read(sync_fd, false);
 
     if (!meta.is_valid) {
-        if (enc->bframe_enabled && meta.err_cod == -ENOSYS && meta.input_frame_num < 0) {
+        if (meta.err_cod == -ENOSYS && meta.input_frame_num < 0) {
             pending_frame_prune(enc);
-            return SBS_OK;
+            return SBS_ERR_WOULD_BLOCK;
         }
 
         sbs_pending_frame_t *pending = g_queue_pop_tail(enc->pending_frames);
@@ -643,6 +1051,37 @@ static int submit_common(sbs_direct_venc_t *enc,
                            meta.extra.frame_type == FRAME_TYPE_IDR ||
                            meta.extra.frame_type == FRAME_TYPE_I;
 
+    if (enc->output_counter < 3 || packet->is_keyframe || getenv("SBS_VENC_LOG_PARAMS")) {
+        LOG_I("VENC OUTPUT CONTRACT: output=%lu request_idr=%d request_frame_type=%d meta={len=%d key=%d ts_us=%d input_frame_num=%d extra_type=%d qp=%d intra=%d merged=%d skipped=%d} retbuf={type=%s/%d fmt=%s/%d stride=%d ptr0=0x%lx dma_fd=%d,%d,%d dma_planes=%u} packet={size=%zu key=%d pts=%lu dts=%lu dur=%lu}",
+              (unsigned long)enc->output_counter,
+              request_idr,
+              frame_type,
+              meta.encoded_data_length_in_bytes,
+              meta.is_key_frame,
+              meta.timestamp_us,
+              meta.input_frame_num,
+              meta.extra.frame_type,
+              meta.extra.average_qp_value,
+              meta.extra.intra_blocks,
+              meta.extra.merged_blocks,
+              meta.extra.skipped_blocks,
+              buffer_type_name(retbuf.buf_type), retbuf.buf_type,
+              img_format_name(retbuf.buf_fmt), retbuf.buf_fmt,
+              retbuf.buf_stride,
+              retbuf.buf_type == VMALLOC_TYPE ? retbuf.buf_info.in_ptr[0] : 0ul,
+              retbuf.buf_type == DMA_TYPE ? retbuf.buf_info.dma_info.shared_fd[0] : -1,
+              retbuf.buf_type == DMA_TYPE ? retbuf.buf_info.dma_info.shared_fd[1] : -1,
+              retbuf.buf_type == DMA_TYPE ? retbuf.buf_info.dma_info.shared_fd[2] : -1,
+              retbuf.buf_type == DMA_TYPE ? retbuf.buf_info.dma_info.num_planes : 0,
+              packet->size,
+              packet->is_keyframe,
+              (unsigned long)packet->pts_ns,
+              (unsigned long)packet->dts_ns,
+              (unsigned long)packet->duration_ns);
+        if (enc->codec_id == CODEC_ID_H265)
+            log_h265_nal_summary(packet->data, packet->size);
+    }
+
     enc->output_counter++;
 
     return SBS_OK;
@@ -678,7 +1117,7 @@ sbs_direct_venc_t *sbs_direct_venc_new(const sbs_direct_venc_config_t *config)
     }
 
     LOG_I("direct encoder ready: codec=%s %ux%u bitrate=%ukbps gop=%u gop_pattern=%d rc_mode=%d hdr10=%d outbuf=%zuKB",
-          enc->codec_id == CODEC_ID_H264 ? "h264" : "h265",
+          codec_id_name(enc->codec_id),
           enc->width, enc->height, enc->bitrate_kbps,
           enc->gop_size, enc->gop_pattern, enc->rc_mode, enc->hdr10,
           enc->outbuf_size / 1024u);
@@ -747,11 +1186,23 @@ int sbs_direct_venc_submit_ptr(sbs_direct_venc_t *enc,
     size_t owned_input_size = 0;
     const void *submit_data = data;
 
-    if (enc->bframe_enabled) {
+    if (enc->hdr10)
+        p010_debug_log_lr_similarity(msg, data);
+
+    /* Keep HDR P010 on normal heap memory; libvpcodec's VMALLOC path is not
+     * stable with large DMA-BUF/Vulkan-mapped input pointers. */
+    if (enc->bframe_enabled || enc->hdr10) {
         owned_input = g_malloc(size);
         if (!owned_input)
             return SBS_ERR_NOMEM;
         memcpy(owned_input, data, size);
+        if (enc->hdr10) {
+            p010_dump_encoder_input(enc, msg, owned_input, size);
+            /* libvpcodec's P010 VMALLOC path writes input through a byte-swap
+             * VDI copy before Wave521 reads it. Pre-swapping preserves the
+             * compositor's normal little-endian P010 words in VPU memory. */
+            p010_pre_byteswap(owned_input, size);
+        }
         owned_input_size = size;
         submit_data = owned_input;
     }
@@ -761,15 +1212,10 @@ int sbs_direct_venc_submit_ptr(sbs_direct_venc_t *enc,
     inbuf.buf_fmt = enc->hdr10 ? IMG_FMT_P010 : IMG_FMT_NV21;
     inbuf.buf_stride = (int)(msg->plane_stride[0] > 0 ? msg->plane_stride[0] : (enc->hdr10 ? msg->width * 2 : msg->width));
     inbuf.buf_info.in_ptr[0] = (unsigned long)submit_data;
-    if (enc->hdr10) {
-        /* The Wave521 P010 VMALLOC path only handles one contiguous Y+UV
-         * buffer. Supplying a separate UV pointer selects the broken
-         * multi-plane path and can stall/fail 4K input. */
-        inbuf.buf_info.in_ptr[1] = 0;
-    } else {
-        inbuf.buf_info.in_ptr[1] = 0;
-    }
+    inbuf.buf_info.in_ptr[1] = 0;
     inbuf.buf_info.in_ptr[2] = 0;
+
+    log_input_contract(enc, "ptr", msg, &inbuf, size);
 
     return submit_common(enc, msg, &inbuf, -1, owned_input, owned_input_size,
                          force_idr, packet);
@@ -782,8 +1228,9 @@ int sbs_direct_venc_submit_dmabuf(sbs_direct_venc_t *enc,
                                    bool force_idr,
                                    sbs_direct_venc_packet_t *packet)
 {
-    void *mapped;
-    int rc;
+    vl_buffer_info_t inbuf;
+
+    (void)size;
 
     if (!enc || !msg || dmabuf_fd < 0)
         return SBS_ERR_INVAL;
@@ -797,20 +1244,22 @@ int sbs_direct_venc_submit_dmabuf(sbs_direct_venc_t *enc,
         }
     }
 
-    /* libvpcodec only accepts DMA_TYPE for RGB/RGBA input on this platform.
-     * Native exports are NV21/P010, so map the single contiguous DMA-BUF and
-     * submit through the VMALLOC path to avoid the broken YUV DMA path. */
-    sync_dmabuf_write_end(dmabuf_fd);
-    sync_dmabuf_read(dmabuf_fd, true);
-    mapped = mmap(NULL, size, PROT_READ, MAP_SHARED, dmabuf_fd, 0);
-    if (mapped == MAP_FAILED) {
-        sync_dmabuf_read(dmabuf_fd, false);
-        LOG_E("dmabuf mmap for VMALLOC submit failed: %s", strerror(errno));
-        return SBS_ERR_IO;
-    }
+    memset(&inbuf, 0, sizeof(inbuf));
+    inbuf.buf_type = DMA_TYPE;
+    inbuf.buf_fmt = enc->hdr10 ? IMG_FMT_P010 : IMG_FMT_NV21;
+    inbuf.buf_stride = (int)(msg->plane_stride[0] > 0
+        ? msg->plane_stride[0]
+        : (enc->hdr10 ? msg->width * 2u : msg->width));
+    inbuf.buf_info.dma_info.shared_fd[0] = dmabuf_fd;
+    /* Native SDR/HDR export uses one contiguous codecmm DMA-BUF with Y
+     * followed by interleaved UV. libvpcodec's DMA path accepts this as a
+     * single-plane YUV buffer and resolves chroma addresses from stride/format. */
+    inbuf.buf_info.dma_info.shared_fd[1] = -1;
+    inbuf.buf_info.dma_info.shared_fd[2] = -1;
+    inbuf.buf_info.dma_info.num_planes = 1u;
 
-    rc = sbs_direct_venc_submit_ptr(enc, msg, mapped, size, force_idr, packet);
-    munmap(mapped, size);
-    sync_dmabuf_read(dmabuf_fd, false);
-    return rc;
+    log_input_contract(enc, "dmabuf", msg, &inbuf, size);
+
+    return submit_common(enc, msg, &inbuf, dmabuf_fd, NULL, 0,
+                         force_idr, packet);
 }

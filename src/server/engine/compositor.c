@@ -1107,6 +1107,7 @@ static int create_native_encoder_buffer(sbs_compositor_t *comp,
         return -1;
     }
     entry->encoder_size = size;
+    memset(entry->encoder_mapped, 0, (size_t)size);
     LOG_I("native encoder host buffer size=%lu mem_type=%u flags=0x%x",
           (unsigned long)size, mem_type,
           comp->mem_props.memoryTypes[mem_type].propertyFlags);
@@ -1198,7 +1199,22 @@ static int allocate_native_canvas_entry(sbs_compositor_t *comp,
     }
 
     int alloc_rc = SBS_ERR_IO;
-    if (color_mode == SBS_EXPORT_COLOR_SDR) {
+    if (color_mode == SBS_EXPORT_COLOR_HDR10) {
+        alloc_rc = sbs_dmabuf_alloc_buffer_from_heap(
+            &alloc, SBS_DMABUF_HEAP_CODECMM, layout.total_size, 0, &backing);
+        if (alloc_rc != SBS_OK) {
+            alloc_rc = sbs_dmabuf_alloc_buffer_from_heap(
+                &alloc, SBS_DMABUF_HEAP_LINUX_CMA, layout.total_size, 0, &backing);
+        }
+        if (alloc_rc != SBS_OK) {
+            alloc_rc = sbs_dmabuf_alloc_buffer_from_heap(
+                &alloc, SBS_DMABUF_HEAP_GFX, layout.total_size, 0, &backing);
+        }
+        if (alloc_rc != SBS_OK) {
+            alloc_rc = sbs_dmabuf_alloc_buffer_from_heap(
+                &alloc, SBS_DMABUF_HEAP_SYSTEM, layout.total_size, 0, &backing);
+        }
+    } else {
         alloc_rc = sbs_dmabuf_alloc_buffer_from_heap(
             &alloc, SBS_DMABUF_HEAP_CODECMM, layout.total_size, 0, &backing);
     }
@@ -1248,7 +1264,7 @@ static int allocate_native_canvas_entry(sbs_compositor_t *comp,
 
     if (getenv("SBS_NATIVE_ENCODER_HOST_BUFFER") &&
         create_native_encoder_buffer(comp, entry, layout.total_size) != 0) {
-        LOG_W("native canvas %s[%u] encoder host buffer unavailable; encoder will use DMA-BUF mmap fallback",
+        LOG_W("native canvas %s[%u] encoder host buffer unavailable; encoder will use DMA-BUF path",
               mode_name, index);
     }
 
@@ -9105,6 +9121,37 @@ static void native_record_encoder_copy(VkCommandBuffer cb,
         entry->encoder_size == 0)
         return;
 
+    VkImageMemoryBarrier pre[2] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = entry->y.layout,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = entry->y.image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = entry->uv.layout,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = entry->uv.image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        },
+    };
+
+    vkCmdPipelineBarrier(cb,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, NULL, 0, NULL, 2, pre);
+
     uint32_t y_bpp = entry->color_mode == SBS_EXPORT_COLOR_HDR10 ? 2u : 1u;
     uint32_t uv_bpp = entry->color_mode == SBS_EXPORT_COLOR_HDR10 ? 4u : 2u;
 
@@ -9134,11 +9181,44 @@ static void native_record_encoder_copy(VkCommandBuffer cb,
     };
 
     vkCmdCopyImageToBuffer(cb, entry->y.image,
-                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            entry->encoder_buffer, 1, &y_copy);
     vkCmdCopyImageToBuffer(cb, entry->uv.image,
-                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            entry->encoder_buffer, 1, &uv_copy);
+
+    VkImageMemoryBarrier post_img[2] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = entry->y.image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = entry->uv.image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        },
+    };
+
+    vkCmdPipelineBarrier(cb,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0, 0, NULL, 0, NULL, 2, post_img);
+    entry->y.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    entry->uv.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
     VkBufferMemoryBarrier barrier = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,

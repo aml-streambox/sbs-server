@@ -13,19 +13,16 @@
 #define SBS_LOG_COMP "out-router"
 
 #include "sbs/output_router.h"
-#include "sbs/dmabuf_alloc.h"
 #include "sbs/encoder_manager.h"
 #include "sbs/export_dest.h"
 #include "sbs/ipc.h"
 #include "sbs/log.h"
 
 #include <errno.h>
-#include <linux/dma-buf.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
-#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/select.h>
 #include <unistd.h>
@@ -151,151 +148,6 @@ static void native_lease_to_msg(const sbs_native_canvas_lease_t *lease,
     msg->dts_ns = UINT64_MAX;
     msg->duration_ns = duration_ns;
     msg->sequence = sequence;
-}
-
-static void native_dmabuf_sync_read(int fd, bool start)
-{
-    struct dma_buf_sync sync = {
-        .flags = (start ? DMA_BUF_SYNC_START : DMA_BUF_SYNC_END) | DMA_BUF_SYNC_READ,
-    };
-    if (fd < 0)
-        return;
-    if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) != 0 && errno != ENOTTY && errno != EINVAL) {
-        LOG_W("native DMA_BUF_SYNC_%s(READ) failed on fd=%d: %s",
-              start ? "START" : "END", fd, strerror(errno));
-    }
-}
-
-static bool p010_to_nv21_reference_into(const sbs_video_frame_msg_t *src_msg,
-                                        const uint8_t *src,
-                                        size_t src_size,
-                                        uint8_t *dst,
-                                        size_t dst_capacity,
-                                        sbs_video_frame_msg_t *dst_msg,
-                                        size_t *dst_size)
-{
-    uint32_t width;
-    uint32_t height;
-    uint32_t y_stride;
-    uint32_t uv_stride;
-    uint32_t uv_offset;
-    size_t required;
-    size_t out_size;
-
-    if (!src_msg || !src || !dst || !dst_msg || !dst_size ||
-        src_msg->drm_format != DRM_FORMAT_P010)
-        return false;
-
-    width = src_msg->width;
-    height = src_msg->height;
-    if (width == 0 || height == 0 || (width & 1u) || (height & 1u))
-        return false;
-
-    y_stride = src_msg->plane_stride[0] ? src_msg->plane_stride[0] : width * 2u;
-    uv_stride = src_msg->plane_stride[1] ? src_msg->plane_stride[1] : y_stride;
-    uv_offset = src_msg->plane_offset[1] ? src_msg->plane_offset[1]
-        : y_stride * height;
-    required = (size_t)uv_offset + (size_t)uv_stride * (height / 2u);
-    if (src_size < required)
-        return false;
-
-    out_size = (size_t)width * height * 3u / 2u;
-    if (dst_capacity < out_size)
-        return false;
-
-    for (uint32_t y = 0; y < height; y++) {
-        const uint16_t *src_y = (const uint16_t *)(const void *)(
-            src + src_msg->plane_offset[0] + (size_t)y * y_stride);
-        uint8_t *dst_y = dst + (size_t)y * width;
-        for (uint32_t x = 0; x < width; x++)
-            dst_y[x] = (uint8_t)(src_y[x] >> 8);
-    }
-    for (uint32_t y = 0; y < height / 2u; y++) {
-        const uint16_t *src_uv = (const uint16_t *)(const void *)(
-            src + uv_offset + (size_t)y * uv_stride);
-        uint8_t *dst_vu = dst + (size_t)width * height + (size_t)y * width;
-        for (uint32_t x = 0; x < width; x += 2u) {
-            uint8_t u = (uint8_t)(src_uv[x] >> 8);
-            uint8_t v = (uint8_t)(src_uv[x + 1u] >> 8);
-            dst_vu[x] = v;
-            dst_vu[x + 1u] = u;
-        }
-    }
-
-    *dst_msg = *src_msg;
-    dst_msg->drm_format = DRM_FORMAT_NV21;
-    dst_msg->n_planes = 2;
-    dst_msg->plane_offset[0] = 0;
-    dst_msg->plane_offset[1] = width * height;
-    dst_msg->plane_stride[0] = width;
-    dst_msg->plane_stride[1] = width;
-    dst_msg->buffer_type = SBS_FRAME_BUFFER_DMABUF;
-    *dst_size = out_size;
-    return true;
-}
-
-static void native_preview_cpu_dmabuf_reset(sbs_dmabuf_buffer_t *buffer,
-                                            void **mapped,
-                                            size_t *mapped_size)
-{
-    if (mapped && *mapped && mapped_size && *mapped_size > 0)
-        munmap(*mapped, *mapped_size);
-    if (buffer && buffer->fd >= 0)
-        close(buffer->fd);
-    if (buffer) {
-        memset(buffer, 0, sizeof(*buffer));
-        buffer->fd = -1;
-    }
-    if (mapped)
-        *mapped = NULL;
-    if (mapped_size)
-        *mapped_size = 0;
-}
-
-static bool native_preview_ensure_cpu_dmabuf(sbs_dmabuf_buffer_t *buffer,
-                                             void **mapped,
-                                             size_t *mapped_size,
-                                             size_t size)
-{
-    const sbs_dmabuf_heap_kind_t heaps[] = {
-        SBS_DMABUF_HEAP_SYSTEM,
-        SBS_DMABUF_HEAP_GFX,
-        SBS_DMABUF_HEAP_LINUX_CMA,
-        SBS_DMABUF_HEAP_CODECMM,
-    };
-    sbs_dmabuf_alloc_t alloc;
-
-    if (!buffer || !mapped || !mapped_size || size == 0)
-        return false;
-    if (buffer->fd >= 0 && *mapped && *mapped_size >= size)
-        return true;
-
-    native_preview_cpu_dmabuf_reset(buffer, mapped, mapped_size);
-    if (sbs_dmabuf_alloc_open(&alloc) != SBS_OK || !alloc.available) {
-        sbs_dmabuf_alloc_close(&alloc);
-        return false;
-    }
-
-    for (size_t i = 0; i < G_N_ELEMENTS(heaps); i++) {
-        if (sbs_dmabuf_alloc_buffer_from_heap(&alloc, heaps[i], size, 0, buffer) != SBS_OK)
-            continue;
-        *mapped = sbs_dmabuf_alloc_map(buffer, PROT_READ | PROT_WRITE, size, 0);
-        if (*mapped != MAP_FAILED) {
-            *mapped_size = size;
-            sbs_dmabuf_alloc_close(&alloc);
-            return true;
-        }
-        LOG_W("native preview CPU DMA-BUF map failed for heap=%d: %s",
-              heaps[i], strerror(errno));
-        close(buffer->fd);
-        memset(buffer, 0, sizeof(*buffer));
-        buffer->fd = -1;
-        *mapped = NULL;
-        *mapped_size = 0;
-    }
-
-    sbs_dmabuf_alloc_close(&alloc);
-    return false;
 }
 
 static void native_encoder_clear_lease(sbs_native_canvas_lease_t *lease)
@@ -672,9 +524,6 @@ static bool native_preview_enqueue_lease(sbs_output_router_t *router,
 static void *native_preview_thread_func(void *arg)
 {
     sbs_output_router_t *router = arg;
-    sbs_dmabuf_buffer_t hdr_sdr_buffer = { .fd = -1 };
-    void *hdr_sdr_mapped = NULL;
-    size_t hdr_sdr_mapped_size = 0;
 
     LOG_I("native preview handoff thread started");
 
@@ -710,74 +559,14 @@ static void *native_preview_thread_func(void *arg)
 
         gint64 t0 = g_get_monotonic_time();
         bool submitted = false;
-        if (lease.color_mode == SBS_EXPORT_COLOR_HDR10) {
-            sbs_preview_profile_t *active_preview = sbs_preview_engine_active_fallback(preview);
-            bool sdr_reference = active_preview && active_preview->reference_color &&
-                active_preview->active_color_mode == SBS_PREVIEW_COLOR_MODE_SDR;
-
-            if (sdr_reference) {
-                native_dmabuf_sync_read(lease.backing_fd, true);
-                void *mapped = mmap(NULL, lease.backing_size, PROT_READ,
-                                    MAP_SHARED, lease.backing_fd, 0);
-                if (mapped != MAP_FAILED) {
-                    sbs_video_frame_msg_t nv21_msg;
-                    size_t nv21_size = (size_t)msg.width * msg.height * 3u / 2u;
-                    if (native_preview_ensure_cpu_dmabuf(&hdr_sdr_buffer,
-                                                         &hdr_sdr_mapped,
-                                                         &hdr_sdr_mapped_size,
-                                                         nv21_size)) {
-                        (void)sbs_dmabuf_alloc_sync(&hdr_sdr_buffer, true,
-                                                    SBS_DMABUF_SYNC_WRITE);
-                        if (p010_to_nv21_reference_into(&msg, mapped, lease.backing_size,
-                                                        hdr_sdr_mapped,
-                                                        hdr_sdr_mapped_size,
-                                                        &nv21_msg, &nv21_size)) {
-                            (void)sbs_dmabuf_alloc_sync(&hdr_sdr_buffer, false,
-                                                        SBS_DMABUF_SYNC_WRITE);
-                            int preview_fd = dup(hdr_sdr_buffer.fd);
-                            if (preview_fd >= 0) {
-                                sbs_preview_engine_consume_frame_dmabuf(preview, &nv21_msg,
-                                                                        preview_fd, nv21_size);
-                                submitted = true;
-                            } else {
-                                LOG_W("native preview dup(HDR->SDR DMA-BUF fd=%d) failed: %s",
-                                      hdr_sdr_buffer.fd, strerror(errno));
-                            }
-                        } else {
-                            (void)sbs_dmabuf_alloc_sync(&hdr_sdr_buffer, false,
-                                                        SBS_DMABUF_SYNC_WRITE);
-                            LOG_W("native preview HDR->SDR reference conversion failed");
-                        }
-                    } else {
-                        LOG_W("native preview HDR->SDR DMA-BUF allocation failed (%zu bytes)",
-                              nv21_size);
-                    }
-                    munmap(mapped, lease.backing_size);
-                } else {
-                    LOG_W("native preview HDR->SDR mmap failed: %s", strerror(errno));
-                }
-                native_dmabuf_sync_read(lease.backing_fd, false);
-            } else {
-                int preview_fd = dup(lease.backing_fd);
-                if (preview_fd >= 0) {
-                    sbs_preview_engine_consume_frame_dmabuf(preview, &msg,
-                                                            preview_fd, lease.backing_size);
-                    submitted = true;
-                } else {
-                    LOG_W("native preview dup(fd=%d) failed: %s",
-                          lease.backing_fd, strerror(errno));
-                }
-            }
+        int preview_fd = dup(lease.backing_fd);
+        if (preview_fd >= 0) {
+            sbs_preview_engine_consume_frame_dmabuf(preview, &msg,
+                                                    preview_fd, lease.backing_size);
+            submitted = true;
         } else {
-            int preview_fd = dup(lease.backing_fd);
-            if (preview_fd >= 0) {
-                sbs_preview_engine_consume_frame_dmabuf(preview, &msg,
-                                                        preview_fd, lease.backing_size);
-                submitted = true;
-            } else {
-                LOG_W("native preview dup(fd=%d) failed: %s",
-                      lease.backing_fd, strerror(errno));
-            }
+            LOG_W("native preview dup(fd=%d) failed: %s",
+                  lease.backing_fd, strerror(errno));
         }
 
         gint64 elapsed = g_get_monotonic_time() - t0;
@@ -802,9 +591,6 @@ static void *native_preview_thread_func(void *arg)
     }
 
     LOG_I("native preview handoff thread stopped");
-    native_preview_cpu_dmabuf_reset(&hdr_sdr_buffer,
-                                    &hdr_sdr_mapped,
-                                    &hdr_sdr_mapped_size);
     return NULL;
 }
 
@@ -845,6 +631,7 @@ static void export_thread_process_frame(sbs_output_router_t *router,
         ? sbs_preview_engine_active_fallback(preview)
         : NULL;
     uint32_t preview_frame_interval = 1;
+    sbs_export_color_mode_t preview_native_color_mode = SBS_EXPORT_COLOR_SDR;
     if (preview_profile && preview_profile->framerate > 0 &&
         router->fps > preview_profile->framerate) {
         preview_frame_interval = (router->fps + preview_profile->framerate - 1u) /
@@ -852,9 +639,13 @@ static void export_thread_process_frame(sbs_output_router_t *router,
         if (preview_frame_interval == 0)
             preview_frame_interval = 1;
     }
+    if (preview_profile &&
+        preview_profile->active_color_mode == SBS_PREVIEW_COLOR_MODE_HDR10) {
+        preview_native_color_mode = SBS_EXPORT_COLOR_HDR10;
+    }
     if (!preview_profile && router->native_preview_configured) {
         if (sbs_compositor_thread_configure_native_preview(
-                router->comp_thread, 0, 0, 1) == 0) {
+                router->comp_thread, 0, 0, 1, SBS_EXPORT_COLOR_SDR) == 0) {
             router->native_preview_configured = false;
             router->native_preview_width = 0;
             router->native_preview_height = 0;
@@ -893,17 +684,18 @@ static void export_thread_process_frame(sbs_output_router_t *router,
              router->native_preview_width != preview_profile->width ||
              router->native_preview_height != preview_profile->height ||
              router->native_preview_frame_interval != preview_frame_interval ||
-             router->native_preview_color_mode != router->color_mode)) {
+              router->native_preview_color_mode != preview_native_color_mode)) {
             if (sbs_compositor_thread_configure_native_preview(
                     router->comp_thread,
                     preview_profile->width,
                     preview_profile->height,
-                    preview_frame_interval) == 0) {
+                    preview_frame_interval,
+                    preview_native_color_mode) == 0) {
                 router->native_preview_configured = true;
                 router->native_preview_width = preview_profile->width;
                 router->native_preview_height = preview_profile->height;
                 router->native_preview_frame_interval = preview_frame_interval;
-                router->native_preview_color_mode = router->color_mode;
+                router->native_preview_color_mode = preview_native_color_mode;
                 LOG_I("native preview GPU target requested: %ux%u mode=%s interval=%u",
                       router->native_preview_width,
                       router->native_preview_height,
@@ -1008,6 +800,8 @@ static void export_thread_process_frame(sbs_output_router_t *router,
                 sbs_video_frame_msg_t pmsg;
                 native_lease_to_msg(&lease, pts_ns, duration_ns,
                                     router->sequence, &pmsg);
+                if (preview_profile->framerate > 0)
+                    pmsg.duration_ns = 1000000000ULL / preview_profile->framerate;
                 gint64 t0 = g_get_monotonic_time();
                 preview_lease_transferred = native_preview_enqueue_lease(router, &lease, &pmsg);
                 if (preview_lease_transferred) {

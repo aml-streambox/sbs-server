@@ -325,7 +325,7 @@ int sbs_api_handle_preview_update_encoder_config(sbs_api_server_t *server,
     width_j = cJSON_GetObjectItemCaseSensitive(params, "width");
     height_j = cJSON_GetObjectItemCaseSensitive(params, "height");
     if (width_j || height_j) {
-        *error = api_error(-32602, "Preview resolution is derived from canvas; use downscale_factor 1, 2, 4, or 8");
+        *error = api_error(-32602, "Preview resolution is derived from canvas; use downscale_factor 1, 2, 4, 5, 6, or 8");
         return SBS_ERR_INVAL;
     }
 

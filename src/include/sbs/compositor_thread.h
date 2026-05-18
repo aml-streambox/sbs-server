@@ -157,9 +157,10 @@ bool  sbs_compositor_thread_dest_export_available(sbs_compositor_thread_t *ct,
 
 bool  sbs_compositor_thread_native_canvas_enabled(sbs_compositor_thread_t *ct);
 int   sbs_compositor_thread_configure_native_preview(sbs_compositor_thread_t *ct,
-                                                      uint32_t width,
-                                                      uint32_t height,
-                                                      uint32_t frame_interval);
+                                                       uint32_t width,
+                                                       uint32_t height,
+                                                       uint32_t frame_interval,
+                                                       sbs_export_color_mode_t color_mode);
 bool  sbs_compositor_thread_native_mailbox_acquire(sbs_compositor_thread_t *ct,
                                                      sbs_native_canvas_mailbox_type_t type,
                                                      sbs_native_canvas_lease_t *lease);

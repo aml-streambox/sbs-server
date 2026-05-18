@@ -514,6 +514,16 @@ static void apply_filter_to_comp_item(const sbs_filter_state_t *filter,
             path = filter->params ? g_hash_table_lookup(filter->params, "file") : NULL;
         if (path && *path)
             g_strlcpy(out->lut_path, path, sizeof(out->lut_path));
+    } else if (g_strcmp0(filter->type, "sdr_to_hdr") == 0) {
+        out->filter_flags |= SBS_COMP_FILTER_SDR_TO_HDR;
+        value = filter->params ? g_hash_table_lookup(filter->params, "amount") : NULL;
+        out->filter_params[5] = value ? (float)g_ascii_strtod(value, NULL) : 1.0f;
+        value = filter->params ? g_hash_table_lookup(filter->params, "saturation") : NULL;
+        out->hdr_to_sdr_saturation = value ? CLAMP((float)g_ascii_strtod(value, NULL), 0.5f, 2.5f) : 1.35f;
+        value = filter->params ? g_hash_table_lookup(filter->params, "brightness") : NULL;
+        out->hdr_to_sdr_brightness = value ? CLAMP((float)g_ascii_strtod(value, NULL), -0.3f, 0.3f) : -0.03f;
+        value = filter->params ? g_hash_table_lookup(filter->params, "hue") : NULL;
+        out->hdr_to_sdr_hue_deg = value ? CLAMP((float)g_ascii_strtod(value, NULL), -180.0f, 180.0f) : 0.0f;
     } else if (g_strcmp0(filter->type, "lut") == 0) {
         const char *path;
         value = filter->params ? g_hash_table_lookup(filter->params, "amount") : NULL;

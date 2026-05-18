@@ -205,6 +205,7 @@ struct sbs_direct_venc {
     int32_t gop_pattern;
     int32_t rc_mode;
     bool hdr10;
+    bool input_hdr10;
     bool bframe_enabled;
 
     uint8_t *outbuf;
@@ -638,8 +639,8 @@ static void log_input_contract(const sbs_direct_venc_t *enc,
     if (enc->next_submit_id > 2 && !getenv("SBS_VENC_LOG_PARAMS"))
         return;
 
-    visible_size = visible_frame_size_from_msg(msg, enc->hdr10);
-    LOG_I("VENC INPUT CONTRACT[%s] submit=%d msg={%ux%u drm=%s/0x%08x n_planes=%u offsets=%u,%u strides=%u,%u buffer_type=%u size=%zu visible=%zu pts=%lu dur=%lu seq=%lu} inbuf={type=%s/%d fmt=%s/%d stride=%d ptr0=0x%lx ptr1=0x%lx dma_fd=%d,%d,%d dma_planes=%u}",
+    visible_size = visible_frame_size_from_msg(msg, enc->input_hdr10);
+    LOG_I("VENC INPUT CONTRACT[%s] submit=%d msg={%ux%u drm=%s/0x%08x n_planes=%u offsets=%u,%u strides=%u,%u buffer_type=%u size=%zu visible=%zu pts=%lu dur=%lu seq=%lu} enc={input_hdr10=%d output_hdr10=%d} inbuf={type=%s/%d fmt=%s/%d stride=%d ptr0=0x%lx ptr1=0x%lx dma_fd=%d,%d,%d dma_planes=%u}",
           path ? path : "?", enc->next_submit_id,
           msg->width, msg->height,
           drm_format_name(msg->drm_format), (unsigned)msg->drm_format,
@@ -650,6 +651,8 @@ static void log_input_contract(const sbs_direct_venc_t *enc,
           (unsigned long)msg->pts_ns,
           (unsigned long)msg->duration_ns,
           (unsigned long)msg->sequence,
+          enc->input_hdr10 ? 1 : 0,
+          enc->hdr10 ? 1 : 0,
           buffer_type_name(inbuf->buf_type), inbuf->buf_type,
           img_format_name(inbuf->buf_fmt), inbuf->buf_fmt,
           inbuf->buf_stride,
@@ -680,7 +683,7 @@ static int init_encoder_handle(sbs_direct_venc_t *enc)
     info.bit_rate = (int)enc->bitrate_kbps * 1000;
     info.gop = (int)enc->gop_size;
     info.prepend_spspps_to_idr_frames = true;
-    info.img_format = enc->hdr10 ? IMG_FMT_P010 : IMG_FMT_NV21;
+    info.img_format = enc->input_hdr10 ? IMG_FMT_P010 : IMG_FMT_NV21;
     info.enc_feature_opts |= 0x1;
     info.internal_bit_depth = enc->hdr10 ? 10 : 8;
     info.gop_pattern = enc->gop_pattern;
@@ -735,10 +738,11 @@ static int init_encoder_handle(sbs_direct_venc_t *enc)
         return SBS_ERR_IO;
     }
 
-    LOG_I("VENC OPEN RESULT: handle=0x%lx codec=%s hdr10=%d bframes=%d frame_duration=%luns outbuf=%zuKB",
+    LOG_I("VENC OPEN RESULT: handle=0x%lx codec=%s input_hdr10=%d output_hdr10=%d bframes=%d frame_duration=%luns outbuf=%zuKB",
           (unsigned long)enc->handle,
           codec_id_name(enc->codec_id),
-          enc->hdr10,
+          enc->input_hdr10 ? 1 : 0,
+          enc->hdr10 ? 1 : 0,
           enc->bframe_enabled,
           (unsigned long)enc->frame_duration_ns,
           enc->outbuf_size / 1024u);
@@ -774,9 +778,10 @@ static int submit_common(sbs_direct_venc_t *enc,
     memset(&retbuf, 0, sizeof(retbuf));
 
     if (enc->next_submit_id <= 2) {
-        LOG_I("submit: buf_type=%d buf_fmt=%d stride=%d hdr10=%d "
+        LOG_I("submit: buf_type=%d buf_fmt=%d stride=%d input_hdr10=%d output_hdr10=%d "
               "dma_fd=%d,%d planes=%u w=%u h=%u",
-              inbuf->buf_type, inbuf->buf_fmt, inbuf->buf_stride, enc->hdr10,
+              inbuf->buf_type, inbuf->buf_fmt, inbuf->buf_stride,
+              enc->input_hdr10 ? 1 : 0, enc->hdr10 ? 1 : 0,
               inbuf->buf_type == DMA_TYPE ? inbuf->buf_info.dma_info.shared_fd[0] : -1,
               inbuf->buf_type == DMA_TYPE ? inbuf->buf_info.dma_info.shared_fd[1] : -1,
               inbuf->buf_type == DMA_TYPE ? inbuf->buf_info.dma_info.num_planes : 0,
@@ -792,7 +797,10 @@ static int submit_common(sbs_direct_venc_t *enc,
 
     if (!meta.is_valid) {
         if (meta.err_cod == -ENOSYS && meta.input_frame_num < 0) {
-            pending_frame_prune(enc);
+            sbs_pending_frame_t *pending = g_queue_pop_tail(enc->pending_frames);
+            pending_frame_free(pending);
+            if (enc->next_submit_id > 0)
+                enc->next_submit_id--;
             return SBS_ERR_WOULD_BLOCK;
         }
 
@@ -895,6 +903,7 @@ sbs_direct_venc_t *sbs_direct_venc_new(const sbs_direct_venc_config_t *config)
     enc->gop_pattern = config->gop_pattern;
     enc->rc_mode = config->rc_mode;
     enc->hdr10 = config->hdr10;
+    enc->input_hdr10 = config->input_hdr10 || config->hdr10;
     enc->bframe_enabled = gop_pattern_has_bframes(enc->gop_pattern);
     enc->frame_duration_ns = calculate_frame_duration_ns(enc->fps_num, enc->fps_den);
     enc->outbuf_size = choose_outbuf_size(config->width, config->height);
@@ -906,10 +915,11 @@ sbs_direct_venc_t *sbs_direct_venc_new(const sbs_direct_venc_config_t *config)
         return NULL;
     }
 
-    LOG_I("direct encoder ready: codec=%s %ux%u bitrate=%ukbps gop=%u gop_pattern=%d rc_mode=%d hdr10=%d outbuf=%zuKB",
+    LOG_I("direct encoder ready: codec=%s %ux%u bitrate=%ukbps gop=%u gop_pattern=%d rc_mode=%d input_hdr10=%d output_hdr10=%d outbuf=%zuKB",
           codec_id_name(enc->codec_id),
           enc->width, enc->height, enc->bitrate_kbps,
-          enc->gop_size, enc->gop_pattern, enc->rc_mode, enc->hdr10,
+          enc->gop_size, enc->gop_pattern, enc->rc_mode,
+          enc->input_hdr10 ? 1 : 0, enc->hdr10 ? 1 : 0,
           enc->outbuf_size / 1024u);
     return enc;
 }
@@ -950,19 +960,21 @@ int sbs_direct_venc_submit_dmabuf(sbs_direct_venc_t *enc,
 
     if (msg->drm_format != 0) {
         bool msg_is_p010 = (msg->drm_format == DRM_FORMAT_P010);
-        if (msg_is_p010 != enc->hdr10) {
-            LOG_W("dropping dmabuf frame: format mismatch (msg_drm=0x%x hdr10_expected=%d)",
-                  (unsigned)msg->drm_format, enc->hdr10);
+        if (msg_is_p010 != enc->input_hdr10) {
+            LOG_W("dropping dmabuf frame: format mismatch (msg_drm=0x%x input_hdr10_expected=%d output_hdr10=%d)",
+                  (unsigned)msg->drm_format,
+                  enc->input_hdr10 ? 1 : 0,
+                  enc->hdr10 ? 1 : 0);
             return SBS_ERR_INVAL;
         }
     }
 
     memset(&inbuf, 0, sizeof(inbuf));
     inbuf.buf_type = DMA_TYPE;
-    inbuf.buf_fmt = enc->hdr10 ? IMG_FMT_P010 : IMG_FMT_NV21;
+    inbuf.buf_fmt = enc->input_hdr10 ? IMG_FMT_P010 : IMG_FMT_NV21;
     inbuf.buf_stride = (int)(msg->plane_stride[0] > 0
         ? msg->plane_stride[0]
-        : (enc->hdr10 ? msg->width * 2u : msg->width));
+        : (enc->input_hdr10 ? msg->width * 2u : msg->width));
     inbuf.buf_info.dma_info.shared_fd[0] = dmabuf_fd;
     /* Native SDR/HDR export uses one contiguous codecmm DMA-BUF with Y
      * followed by interleaved UV. libvpcodec's DMA path accepts this as a

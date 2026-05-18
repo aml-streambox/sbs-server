@@ -792,12 +792,6 @@ static int create_native_preview_ring(sbs_compositor_t *comp,
             destroy_native_preview_ring(comp);
             return -1;
         }
-        if (color_mode != SBS_EXPORT_COLOR_HDR10 && !entry->encoder_mapped &&
-            create_native_encoder_buffer(comp, entry, entry->backing_size) != 0) {
-            LOG_E("native preview[%u] host buffer allocation failed", i);
-            destroy_native_preview_ring(comp);
-            return -1;
-        }
     }
 
     comp->native_preview.width = width;
@@ -814,14 +808,6 @@ static int create_native_preview_ring(sbs_compositor_t *comp,
           SBS_NATIVE_CANVAS_RING_SIZE,
           comp->native_preview.frame_interval);
     return 0;
-}
-
-static sbs_export_color_mode_t native_preview_desired_color_mode(const sbs_compositor_t *comp)
-{
-    if (!comp || !comp->native_canvas.initialized ||
-        !comp->native_canvas.entries[0].allocated)
-        return SBS_EXPORT_COLOR_SDR;
-    return comp->native_canvas.entries[0].color_mode;
 }
 
 static int create_native_canvas_ring(sbs_compositor_t *comp)
@@ -1298,7 +1284,8 @@ static int allocate_native_canvas_entries(sbs_compositor_t *comp,
 int sbs_compositor_configure_native_preview(sbs_compositor_t *comp,
                                             uint32_t width,
                                             uint32_t height,
-                                            uint32_t frame_interval)
+                                            uint32_t frame_interval,
+                                            sbs_export_color_mode_t color_mode)
 {
     if (!comp || !comp->native_canvas.initialized)
         return -1;
@@ -1311,8 +1298,6 @@ int sbs_compositor_configure_native_preview(sbs_compositor_t *comp,
         }
         return 0;
     }
-
-    sbs_export_color_mode_t color_mode = native_preview_desired_color_mode(comp);
 
     if (comp->native_preview.initialized) {
         if (comp->native_preview.width == width &&
@@ -4468,8 +4453,11 @@ static int create_native_downscale_pipeline(sbs_compositor_t *comp,
     comp->native_downscale_sdr_shader = load_shader(comp, path);
     snprintf(path, sizeof(path), "%s/native_downscale_p010.comp.spv", shader_dir);
     comp->native_downscale_hdr_shader = load_shader(comp, path);
+    snprintf(path, sizeof(path), "%s/native_downscale_p010_to_nv21.comp.spv", shader_dir);
+    comp->native_downscale_hdr_to_sdr_shader = load_shader(comp, path);
     if (comp->native_downscale_sdr_shader == VK_NULL_HANDLE &&
-        comp->native_downscale_hdr_shader == VK_NULL_HANDLE) {
+        comp->native_downscale_hdr_shader == VK_NULL_HANDLE &&
+        comp->native_downscale_hdr_to_sdr_shader == VK_NULL_HANDLE) {
         LOG_W("native preview downscale shaders unavailable");
         return -1;
     }
@@ -4538,8 +4526,18 @@ static int create_native_downscale_pipeline(sbs_compositor_t *comp,
             comp->native_downscale_hdr_pipeline = VK_NULL_HANDLE;
         }
     }
+    if (comp->native_downscale_hdr_to_sdr_shader != VK_NULL_HANDLE) {
+        cpci.stage.module = comp->native_downscale_hdr_to_sdr_shader;
+        res = vkCreateComputePipelines(comp->device, comp->pipeline_cache, 1, &cpci,
+                                        NULL, &comp->native_downscale_hdr_to_sdr_pipeline);
+        if (res != VK_SUCCESS) {
+            LOG_W("native P010->NV21 preview downscale pipeline create failed: %d", res);
+            comp->native_downscale_hdr_to_sdr_pipeline = VK_NULL_HANDLE;
+        }
+    }
     if (comp->native_downscale_sdr_pipeline == VK_NULL_HANDLE &&
-        comp->native_downscale_hdr_pipeline == VK_NULL_HANDLE)
+        comp->native_downscale_hdr_pipeline == VK_NULL_HANDLE &&
+        comp->native_downscale_hdr_to_sdr_pipeline == VK_NULL_HANDLE)
         return -1;
 
     VkDescriptorPoolSize pool_size = {
@@ -4575,9 +4573,10 @@ static int create_native_downscale_pipeline(sbs_compositor_t *comp,
         return -1;
     }
 
-    LOG_I("native preview downscale pipelines created (nv21=%d p010=%d)",
+    LOG_I("native preview downscale pipelines created (nv21=%d p010=%d p010_to_nv21=%d)",
           comp->native_downscale_sdr_pipeline != VK_NULL_HANDLE ? 1 : 0,
-          comp->native_downscale_hdr_pipeline != VK_NULL_HANDLE ? 1 : 0);
+          comp->native_downscale_hdr_pipeline != VK_NULL_HANDLE ? 1 : 0,
+          comp->native_downscale_hdr_to_sdr_pipeline != VK_NULL_HANDLE ? 1 : 0);
     return 0;
 }
 
@@ -7739,7 +7738,8 @@ static bool native_item_filters_direct_yuv_compatible(const sbs_comp_scene_item_
 {
     uint32_t direct_filter_mask = SBS_COMP_FILTER_GRAYSCALE |
         SBS_COMP_FILTER_BRIGHTNESS | SBS_COMP_FILTER_CONTRAST |
-        SBS_COMP_FILTER_HDR_TO_SDR_LUT | SBS_COMP_FILTER_COLOR_CORRECTION;
+        SBS_COMP_FILTER_HDR_TO_SDR_LUT | SBS_COMP_FILTER_COLOR_CORRECTION |
+        SBS_COMP_FILTER_SDR_TO_HDR;
     if (color_mode == SBS_EXPORT_COLOR_SDR)
         direct_filter_mask |= SBS_COMP_FILTER_LUMA_KEY;
     if (!item || item->filter_flags == 0)
@@ -7831,7 +7831,7 @@ static bool native_scene_can_full_canvas_direct_yuv(sbs_compositor_t *comp,
               comp->native_amly_to_p010_src_pipeline != VK_NULL_HANDLE)) &&
             dst_y < (int32_t)comp->height &&
             dst_y + (int32_t)dst_h > 0 &&
-            (item->filter_flags & ~SBS_COMP_FILTER_HDR_TO_SDR_LUT) == 0;
+            (item->filter_flags & ~(SBS_COMP_FILTER_HDR_TO_SDR_LUT | SBS_COMP_FILTER_SDR_TO_HDR)) == 0;
         return covers_canvas_height || source_driven_amly_with_bg_fill;
     }
 
@@ -8645,7 +8645,7 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                 tex->drm_format == SBS_DRM_FORMAT_AMLY &&
                 amly_source_pipeline != VK_NULL_HANDLE &&
                 item_base_direct && layer_opacity >= 0.999f &&
-                (item->filter_flags & ~SBS_COMP_FILTER_HDR_TO_SDR_LUT) == 0 &&
+                (item->filter_flags & ~(SBS_COMP_FILTER_HDR_TO_SDR_LUT | SBS_COMP_FILTER_SDR_TO_HDR)) == 0 &&
                 dst_x <= 0 &&
                 dst_x + (int32_t)dst_w >= (int32_t)canvas_width &&
                 dst_y < (int32_t)canvas_height &&
@@ -8732,6 +8732,8 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
 
             bool hdr_to_sdr_filter =
                 (item->filter_flags & SBS_COMP_FILTER_HDR_TO_SDR_LUT) != 0;
+            bool sdr_to_hdr_filter =
+                (item->filter_flags & SBS_COMP_FILTER_SDR_TO_HDR) != 0;
             float hdr_hue_rad = item->hdr_to_sdr_hue_deg * 0.01745329252f;
 
             sbs_native_p010_direct_pc_t pc = {
@@ -8759,10 +8761,10 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                 .bg_v = bg_v,
                 .filter_flags = item->filter_flags,
                 .hdr_to_sdr_amount = item->filter_params[5],
-                .hdr_saturation = hdr_to_sdr_filter ? item->hdr_to_sdr_saturation : item->filter_params[4],
-                .hdr_brightness = hdr_to_sdr_filter ? item->hdr_to_sdr_brightness : item->filter_params[5],
-                .hdr_hue_cos = hdr_to_sdr_filter ? cosf(hdr_hue_rad) : item->filter_params[6],
-                .hdr_hue_sin = hdr_to_sdr_filter ? sinf(hdr_hue_rad) : item->filter_params[7],
+                .hdr_saturation = (hdr_to_sdr_filter || sdr_to_hdr_filter) ? item->hdr_to_sdr_saturation : item->filter_params[4],
+                .hdr_brightness = (hdr_to_sdr_filter || sdr_to_hdr_filter) ? item->hdr_to_sdr_brightness : item->filter_params[5],
+                .hdr_hue_cos = (hdr_to_sdr_filter || sdr_to_hdr_filter) ? cosf(hdr_hue_rad) : item->filter_params[6],
+                .hdr_hue_sin = (hdr_to_sdr_filter || sdr_to_hdr_filter) ? sinf(hdr_hue_rad) : item->filter_params[7],
                 .src_offset_x = src_x,
                 .src_offset_y = src_y,
             };
@@ -9029,6 +9031,11 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
         };
         memcpy(pc.filter_params_a, item->filter_params, sizeof(float) * 4);
         memcpy(pc.filter_params_b, item->filter_params + 4, sizeof(float) * 4);
+        if ((item->filter_flags & SBS_COMP_FILTER_SDR_TO_HDR) != 0) {
+            pc.filter_params_a[0] = item->hdr_to_sdr_saturation;
+            pc.filter_params_a[1] = item->hdr_to_sdr_brightness;
+            pc.filter_params_b[1] = item->filter_params[5];
+        }
 
         sbs_native_rect_t visible_rects[SBS_NATIVE_OCCLUSION_MAX_RECTS];
         uint32_t visible_rect_count = 0;
@@ -9236,12 +9243,16 @@ static void native_record_encoder_copy(VkCommandBuffer cb,
                           0, 0, NULL, 1, &barrier, 0, NULL);
 }
 
-static VkPipeline native_downscale_pipeline_for_mode(sbs_compositor_t *comp,
-                                                     sbs_export_color_mode_t color_mode)
+static VkPipeline native_downscale_pipeline_for_modes(sbs_compositor_t *comp,
+                                                      sbs_export_color_mode_t src_color_mode,
+                                                      sbs_export_color_mode_t dst_color_mode)
 {
     if (!comp)
         return VK_NULL_HANDLE;
-    return color_mode == SBS_EXPORT_COLOR_HDR10
+    if (src_color_mode == SBS_EXPORT_COLOR_HDR10 &&
+        dst_color_mode != SBS_EXPORT_COLOR_HDR10)
+        return comp->native_downscale_hdr_to_sdr_pipeline;
+    return src_color_mode == SBS_EXPORT_COLOR_HDR10
         ? comp->native_downscale_hdr_pipeline
         : comp->native_downscale_sdr_pipeline;
 }
@@ -9378,17 +9389,21 @@ static int sbs_compositor_submit_native_preview_from_entry(sbs_compositor_t *com
 
     if (!comp || !src_entry || !comp->native_preview.initialized)
         return -1;
-    if (src_entry->color_mode != comp->native_preview.color_mode)
+    if (src_entry->color_mode != comp->native_preview.color_mode &&
+        !(src_entry->color_mode == SBS_EXPORT_COLOR_HDR10 &&
+          comp->native_preview.color_mode == SBS_EXPORT_COLOR_SDR))
         return -1;
 
-    VkPipeline pipeline = native_downscale_pipeline_for_mode(comp, src_entry->color_mode);
+    VkPipeline pipeline = native_downscale_pipeline_for_modes(
+        comp, src_entry->color_mode, comp->native_preview.color_mode);
     if (pipeline == VK_NULL_HANDLE ||
         comp->native_downscale_pipeline_layout == VK_NULL_HANDLE ||
         comp->native_downscale_ds_layout == VK_NULL_HANDLE) {
         static uint32_t warn_counter = 0;
         if (warn_counter++ % 300 == 0) {
-            LOG_W("native preview downscale pipeline unavailable for %s",
-                  src_entry->color_mode == SBS_EXPORT_COLOR_HDR10 ? "hdr10" : "sdr");
+            LOG_W("native preview downscale pipeline unavailable for %s->%s",
+                  src_entry->color_mode == SBS_EXPORT_COLOR_HDR10 ? "hdr10" : "sdr",
+                  comp->native_preview.color_mode == SBS_EXPORT_COLOR_HDR10 ? "hdr10" : "sdr");
         }
         return -1;
     }
@@ -9532,7 +9547,8 @@ static int sbs_compositor_submit_native_preview_from_entry(sbs_compositor_t *com
         {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                             VK_ACCESS_HOST_READ_BIT,
             .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
             .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             .image = dst_entry->y.image,
@@ -9541,7 +9557,8 @@ static int sbs_compositor_submit_native_preview_from_entry(sbs_compositor_t *com
         {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                             VK_ACCESS_HOST_READ_BIT,
             .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
             .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             .image = dst_entry->uv.image,
@@ -9550,7 +9567,9 @@ static int sbs_compositor_submit_native_preview_from_entry(sbs_compositor_t *com
     };
     vkCmdPipelineBarrier(cb,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                             VK_PIPELINE_STAGE_TRANSFER_BIT |
+                             VK_PIPELINE_STAGE_HOST_BIT,
                          0, 0, NULL, 0, NULL, 4, post);
     src_entry->y.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     src_entry->uv.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -9591,11 +9610,12 @@ static int sbs_compositor_submit_native_preview_from_entry(sbs_compositor_t *com
         static uint64_t submit_count = 0;
         submit_count++;
         if (submit_count <= 5 || (submit_count % 300) == 0) {
-            LOG_I("native preview downscale submit entry=%u frame=%lu %ux%u->%ux%u mode=%s",
+            LOG_I("native preview downscale submit entry=%u frame=%lu %ux%u->%ux%u mode=%s->%s",
                   idx, (unsigned long)frame_number,
                   src_entry->y.width, src_entry->y.height,
                   dst_entry->y.width, dst_entry->y.height,
-                  src_entry->color_mode == SBS_EXPORT_COLOR_HDR10 ? "hdr10" : "sdr");
+                  src_entry->color_mode == SBS_EXPORT_COLOR_HDR10 ? "hdr10" : "sdr",
+                  dst_entry->color_mode == SBS_EXPORT_COLOR_HDR10 ? "hdr10" : "sdr");
         }
     }
     return 0;
@@ -10673,6 +10693,8 @@ void sbs_compositor_destroy(sbs_compositor_t *comp)
         vkDestroyPipeline(comp->device, comp->native_downscale_sdr_pipeline, NULL);
     if (comp->native_downscale_hdr_pipeline)
         vkDestroyPipeline(comp->device, comp->native_downscale_hdr_pipeline, NULL);
+    if (comp->native_downscale_hdr_to_sdr_pipeline)
+        vkDestroyPipeline(comp->device, comp->native_downscale_hdr_to_sdr_pipeline, NULL);
     if (comp->native_downscale_pipeline_layout)
         vkDestroyPipelineLayout(comp->device, comp->native_downscale_pipeline_layout, NULL);
     if (comp->native_downscale_ds_pool)
@@ -10683,6 +10705,8 @@ void sbs_compositor_destroy(sbs_compositor_t *comp)
         vkDestroyShaderModule(comp->device, comp->native_downscale_sdr_shader, NULL);
     if (comp->native_downscale_hdr_shader)
         vkDestroyShaderModule(comp->device, comp->native_downscale_hdr_shader, NULL);
+    if (comp->native_downscale_hdr_to_sdr_shader)
+        vkDestroyShaderModule(comp->device, comp->native_downscale_hdr_to_sdr_shader, NULL);
 
     if (comp->upload_fence)
         vkDestroyFence(comp->device, comp->upload_fence, NULL);

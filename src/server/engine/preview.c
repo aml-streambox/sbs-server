@@ -15,7 +15,8 @@
 #define DRM_FORMAT_NV21 0x3132564e
 #endif
 
-#define SBS_PREVIEW_DEFAULT_DOWNSCALE_FACTOR 4u
+#define SBS_PREVIEW_DEFAULT_DOWNSCALE_FACTOR 6u
+#define SBS_PREVIEW_DEFAULT_FRAMERATE 60u
 
 #ifdef SBS_HAVE_GSTREAMER_PREVIEW
 #include <gst/gst.h>
@@ -40,6 +41,10 @@ typedef struct preview_runtime {
     GThread *thread;        /* dedicated thread for the WebRTC pipeline */
 #endif
     uint64_t frames_pushed;
+    uint64_t dmabuf_frames_input;
+    uint64_t dmabuf_encode_would_block;
+    uint64_t dmabuf_encode_empty;
+    uint64_t dmabuf_encode_errors;
     uint64_t audio_buffers_pushed;
     bool audio_pts_origin_valid;
     uint64_t audio_pts_origin_ns;
@@ -220,13 +225,21 @@ static const char *kind_name(sbs_preview_profile_kind_t kind)
 
 static bool preview_downscale_factor_allowed(uint32_t factor)
 {
-    return factor == 1u || factor == 2u || factor == 4u || factor == 8u;
+    return factor == 1u || factor == 2u || factor == 4u || factor == 5u ||
+        factor == 6u || factor == 8u;
 }
 
 static uint32_t preview_downscale_factor_or_default(uint32_t factor)
 {
     return preview_downscale_factor_allowed(factor)
         ? factor : SBS_PREVIEW_DEFAULT_DOWNSCALE_FACTOR;
+}
+
+static uint32_t align_up_u32(uint32_t value, uint32_t alignment)
+{
+    return alignment > 0
+        ? (value + alignment - 1u) & ~(alignment - 1u)
+        : value;
 }
 
 static void compute_preview_size(uint32_t src_width,
@@ -245,6 +258,8 @@ static void compute_preview_size(uint32_t src_width,
     height &= ~1u;
     if (width == 0) width = 2;
     if (height == 0) height = 2;
+    width = align_up_u32(width, 16u);
+    height = align_up_u32(height, 16u);
 
     if (out_width) *out_width = width;
     if (out_height) *out_height = height;
@@ -283,6 +298,7 @@ static sbs_preview_profile_t *profile_new(const char *id,
     profile->active = available && !requires_additional_encode;
     profile->reference_color = false;
     profile->active_color_mode = SBS_PREVIEW_COLOR_MODE_SDR;
+    profile->input_color_mode = SBS_PREVIEW_COLOR_MODE_SDR;
     profile->viewer_count = 0;
     profile->stream_url = g_strdup(stream_url);
     return profile;
@@ -334,7 +350,7 @@ sbs_preview_engine_t *sbs_preview_engine_new(void)
         sbs_preview_profile_t *webrtc_profile = profile_new(
             "preview-h264-webrtc", SBS_PREVIEW_PROFILE_KIND_FALLBACK,
             "webrtc", "h264", "rtp", "low",
-            480, 270, 30, false, true, false, webrtc_requestable,
+            480, 270, SBS_PREVIEW_DEFAULT_FRAMERATE, false, true, false, webrtc_requestable,
             "webrtc://signaling");
         webrtc_profile->downscale_factor = SBS_PREVIEW_DEFAULT_DOWNSCALE_FACTOR;
         webrtc_profile->bitrate_kbps = 2500;
@@ -372,8 +388,8 @@ void sbs_preview_engine_set_source_format(sbs_preview_engine_t *engine,
     if (!engine)
         return;
     g_mutex_lock(&engine->lock);
-    old_default_fps = engine->src_fps ? engine->src_fps : 30;
-    new_default_fps = fps ? fps : 30;
+    old_default_fps = engine->src_fps ? engine->src_fps : SBS_PREVIEW_DEFAULT_FRAMERATE;
+    new_default_fps = fps ? fps : SBS_PREVIEW_DEFAULT_FRAMERATE;
 
     engine->src_width = width;
     engine->src_height = height;
@@ -810,7 +826,8 @@ static preview_runtime_t *start_webrtc_runtime(sbs_preview_engine_t *engine,
     GstElement *aconv = NULL, *aresample = NULL, *opusenc = NULL, *opuspay = NULL;
     GstCaps *src_caps = NULL;
     GstCaps *audio_caps = NULL;
-    gboolean hdr10;
+    gboolean input_hdr10;
+    gboolean output_hdr10;
     bool context_pushed = false;
     const char *codec;
     const char *caps_name;
@@ -820,7 +837,8 @@ static preview_runtime_t *start_webrtc_runtime(sbs_preview_engine_t *engine,
     uint32_t src_w  = profile->width ? profile->width : (engine->src_width ? engine->src_width : 1920);
     uint32_t src_h  = profile->height ? profile->height : (engine->src_height ? engine->src_height : 1080);
     uint32_t src_fps = profile->framerate ? profile->framerate : (engine->src_fps ? engine->src_fps : 60);
-    hdr10 = profile->active_color_mode == SBS_PREVIEW_COLOR_MODE_HDR10;
+    input_hdr10 = profile->input_color_mode == SBS_PREVIEW_COLOR_MODE_HDR10;
+    output_hdr10 = profile->active_color_mode == SBS_PREVIEW_COLOR_MODE_HDR10;
     codec = "h264";
     caps_name = "video/x-h264";
     parser_name = "h264parse";
@@ -879,7 +897,8 @@ static preview_runtime_t *start_webrtc_runtime(sbs_preview_engine_t *engine,
             .gop_size = src_fps,
             .gop_pattern = 0,
             .rc_mode = 0,
-            .hdr10 = hdr10,
+            .hdr10 = output_hdr10,
+            .input_hdr10 = input_hdr10,
         };
         runtime->direct_enc = sbs_direct_venc_new(&venc_cfg);
     }
@@ -1126,9 +1145,10 @@ static preview_runtime_t *start_webrtc_runtime(sbs_preview_engine_t *engine,
 
     LOG_I("WebRTC preview runtime active for %s (src=%ux%u@%u %s enc=%ux%u@%u %s)",
           profile->id, src_w, src_h, src_fps,
-          hdr10 ? "bt2100-pq" : "bt709",
+          input_hdr10 ? "bt2100-pq" : "bt709",
           profile->width, profile->height, profile->framerate,
-          hdr10 ? "direct-h264-hdr10" : "direct-h264");
+          output_hdr10 ? "direct-h264-hdr10" :
+              (input_hdr10 ? "direct-h264-p010-to-8bit" : "direct-h264"));
     return runtime;
 }
 
@@ -1217,6 +1237,7 @@ int sbs_preview_engine_release_profile(sbs_preview_engine_t *engine,
         profile->available = false;
         profile->reference_color = false;
         profile->active_color_mode = SBS_PREVIEW_COLOR_MODE_SDR;
+        profile->input_color_mode = SBS_PREVIEW_COLOR_MODE_SDR;
     }
     if (out_profile) {
         *out_profile = profile;
@@ -1345,15 +1366,38 @@ void sbs_preview_engine_consume_frame_dmabuf(sbs_preview_engine_t *engine,
 
     if (runtime->direct_enc) {
         sbs_direct_venc_packet_t packet;
+        uint64_t input_count = ++runtime->dmabuf_frames_input;
         bool force_idr = runtime->frames_pushed == 0;
         int rc = sbs_direct_venc_submit_dmabuf(runtime->direct_enc, msg,
                                                dmabuf_fd, size, force_idr,
                                                &packet);
+        if (rc == SBS_ERR_WOULD_BLOCK)
+            runtime->dmabuf_encode_would_block++;
         if (rc != SBS_OK) {
+            runtime->dmabuf_encode_errors++;
+            if (input_count <= 3 || input_count % 60 == 0) {
+                LOG_I("preview dmabuf cadence input=%lu pushed=%lu would_block=%lu empty=%lu errors=%lu last=error rc=%d msg_dur=%lu",
+                      (unsigned long)runtime->dmabuf_frames_input,
+                      (unsigned long)runtime->frames_pushed,
+                      (unsigned long)runtime->dmabuf_encode_would_block,
+                      (unsigned long)runtime->dmabuf_encode_empty,
+                      (unsigned long)runtime->dmabuf_encode_errors,
+                      rc, (unsigned long)msg->duration_ns);
+            }
             engine->total_frames_dropped++;
             goto done;
         }
         if (!packet.data || packet.size == 0) {
+            runtime->dmabuf_encode_empty++;
+            if (input_count <= 3 || input_count % 60 == 0) {
+                LOG_I("preview dmabuf cadence input=%lu pushed=%lu would_block=%lu empty=%lu errors=%lu last=empty msg_dur=%lu",
+                      (unsigned long)runtime->dmabuf_frames_input,
+                      (unsigned long)runtime->frames_pushed,
+                      (unsigned long)runtime->dmabuf_encode_would_block,
+                      (unsigned long)runtime->dmabuf_encode_empty,
+                      (unsigned long)runtime->dmabuf_encode_errors,
+                      (unsigned long)msg->duration_ns);
+            }
             goto done;
         }
 
@@ -1369,7 +1413,7 @@ void sbs_preview_engine_consume_frame_dmabuf(sbs_preview_engine_t *engine,
         }
 
         {
-            uint32_t fps = profile->framerate ? profile->framerate : 30;
+            uint32_t fps = profile->framerate ? profile->framerate : SBS_PREVIEW_DEFAULT_FRAMERATE;
             GstClockTime frame_dur = GST_SECOND / fps;
             GST_BUFFER_PTS(buffer) = runtime->frames_pushed * frame_dur;
             GST_BUFFER_DTS(buffer) = GST_CLOCK_TIME_NONE;
@@ -1389,6 +1433,16 @@ void sbs_preview_engine_consume_frame_dmabuf(sbs_preview_engine_t *engine,
 
         runtime->frames_pushed++;
         schedule_webrtc_offer_after_media(runtime);
+        if (input_count <= 3 || input_count % 60 == 0) {
+            LOG_I("preview dmabuf cadence input=%lu pushed=%lu would_block=%lu empty=%lu errors=%lu last=packet size=%zu key=%d msg_dur=%lu",
+                  (unsigned long)runtime->dmabuf_frames_input,
+                  (unsigned long)runtime->frames_pushed,
+                  (unsigned long)runtime->dmabuf_encode_would_block,
+                  (unsigned long)runtime->dmabuf_encode_empty,
+                  (unsigned long)runtime->dmabuf_encode_errors,
+                  packet.size, packet.is_keyframe ? 1 : 0,
+                  (unsigned long)msg->duration_ns);
+        }
         if (runtime->frames_pushed <= 3 || packet.is_keyframe ||
             runtime->frames_pushed % 300 == 0) {
             LOG_I("preview encoded dmabuf frame pushed #%lu (%zu bytes key=%d)",
@@ -1429,7 +1483,7 @@ void sbs_preview_engine_consume_frame_dmabuf(sbs_preview_engine_t *engine,
     }
 
     {
-        uint32_t fps = profile->framerate ? profile->framerate : 30;
+        uint32_t fps = profile->framerate ? profile->framerate : SBS_PREVIEW_DEFAULT_FRAMERATE;
         GstClockTime frame_dur = GST_SECOND / fps;
         GST_BUFFER_PTS(buffer) = runtime->frames_pushed * frame_dur;
         GST_BUFFER_DURATION(buffer) = frame_dur;
@@ -1483,6 +1537,7 @@ static gboolean webrtc_start_on_main_loop(gpointer user_data)
     if (profile) {
         profile->active_color_mode = ctx->engine->src_color_mode == SBS_PREVIEW_COLOR_MODE_HDR10
             ? ctx->color_mode : SBS_PREVIEW_COLOR_MODE_SDR;
+        profile->input_color_mode = profile->active_color_mode;
         profile->reference_color = ctx->reference_color;
     }
     g_mutex_unlock(&ctx->engine->lock);
@@ -1807,6 +1862,9 @@ cJSON *sbs_preview_serialize_profile(const sbs_preview_profile_t *profile)
     cJSON_AddStringToObject(obj, "color_mode",
                             profile->active_color_mode == SBS_PREVIEW_COLOR_MODE_HDR10
                                 ? "hdr10" : "sdr_reference");
+    cJSON_AddStringToObject(obj, "input_color_mode",
+                            profile->input_color_mode == SBS_PREVIEW_COLOR_MODE_HDR10
+                                ? "hdr10" : "sdr");
     cJSON_AddBoolToObject(obj, "reference_color", profile->reference_color);
     cJSON_AddNumberToObject(obj, "viewer_count", profile->viewer_count);
     cJSON_AddNumberToObject(obj, "bitrate_kbps", profile->bitrate_kbps);

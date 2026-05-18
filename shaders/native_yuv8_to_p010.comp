@@ -48,6 +48,7 @@ const uint FLAG_ROTATION_SHIFT = 8u;
 const uint FLAG_FLIP_HORIZONTAL = 1u << 10u;
 const uint FLAG_FLIP_VERTICAL = 1u << 11u;
 const uint FILTER_HDR_TO_SDR = 32u;
+const uint FILTER_SDR_TO_HDR = 1024u;
 const float HDR_Y_OFFSET = 64.0 / 1023.0;
 const float HDR_Y_SCALE = 876.0 / (1023.0 * 255.0);
 const float HDR_UV_OFFSET = 64.0 / 1023.0;
@@ -56,27 +57,28 @@ const float HDR_UV_SCALE = 896.0 / (1023.0 * 255.0);
 bool source_is_nv21() { return (pc.flags & FLAG_SOURCE_NV21) != 0u; }
 bool dst_in_bounds() { return (pc.flags & FLAG_DST_IN_BOUNDS) != 0u; }
 bool filter_hdr_to_sdr() { return (pc.filter_flags & FILTER_HDR_TO_SDR) != 0u; }
+bool filter_sdr_to_hdr() { return (pc.filter_flags & FILTER_SDR_TO_HDR) != 0u; }
 bool source_driven_enabled() { return (pc.flags & FLAG_SOURCE_DRIVEN) != 0u; }
 uint rotation_quadrant() { return (pc.flags >> FLAG_ROTATION_SHIFT) & 3u; }
 bool flip_horizontal() { return (pc.flags & FLAG_FLIP_HORIZONTAL) != 0u; }
 bool flip_vertical() { return (pc.flags & FLAG_FLIP_VERTICAL) != 0u; }
 
 float direct_hdr_amount() {
-    return filter_hdr_to_sdr() ? clamp(pc.hdr_to_sdr_amount, 0.0, 1.0) : 0.0;
+    return (filter_sdr_to_hdr() || filter_hdr_to_sdr()) ? clamp(pc.hdr_to_sdr_amount, 0.0, 1.0) : 0.0;
 }
 
 float tone_map_y8_value(float y8) {
     float amount = direct_hdr_amount();
     if (amount <= 0.0) return y8;
     float contrast = mix(1.0, 1.35, amount);
-    float lift = mix(0.0, -7.6, amount);
+    float lift = mix(0.0, clamp(pc.hdr_brightness, -0.3, 0.3) * 255.0, amount);
     return clamp((y8 - 128.0) * contrast + 128.0 + lift, 0.0, 255.0);
 }
 
 vec2 tone_map_uv8_values(vec2 uv8) {
     float amount = direct_hdr_amount();
     if (amount <= 0.0) return uv8;
-    float sat = mix(1.0, 1.35, amount);
+    float sat = mix(1.0, clamp(pc.hdr_saturation, 0.5, 2.5), amount);
     return clamp(vec2(128.0) + (uv8 - vec2(128.0)) * sat, 0.0, 255.0);
 }
 

@@ -47,9 +47,11 @@ const uint FLAG_ROTATION_SHIFT = 8u;
 const uint FLAG_FLIP_HORIZONTAL = 1u << 10u;
 const uint FLAG_FLIP_VERTICAL = 1u << 11u;
 const uint FILTER_HDR_TO_SDR = 32u;
+const uint FILTER_SDR_TO_HDR = 1024u;
 
 bool dst_in_bounds() { return (pc.flags & FLAG_DST_IN_BOUNDS) != 0u; }
 bool filter_hdr_to_sdr() { return (pc.filter_flags & FILTER_HDR_TO_SDR) != 0u; }
+bool filter_sdr_to_hdr() { return (pc.filter_flags & FILTER_SDR_TO_HDR) != 0u; }
 bool src_offset_enabled() { return (pc.flags & FLAG_SRC_OFFSET) != 0u; }
 uint rotation_quadrant() { return (pc.flags >> FLAG_ROTATION_SHIFT) & 3u; }
 bool flip_horizontal() { return (pc.flags & FLAG_FLIP_HORIZONTAL) != 0u; }
@@ -199,7 +201,7 @@ void read_uv10_at(uint pair_x, uint y, out uint u, out uint v) {
 }
 
 float direct_hdr_amount() {
-    return filter_hdr_to_sdr() ? clamp(pc.hdr_to_sdr_amount, 0.0, 1.0) : 0.0;
+    return (filter_sdr_to_hdr() || filter_hdr_to_sdr()) ? clamp(pc.hdr_to_sdr_amount, 0.0, 1.0) : 0.0;
 }
 
 float tone_map_luma(float y) {
@@ -213,6 +215,7 @@ float map_y10(uint y10) {
         return float(y10 << 6) / 65535.0;
     float y = clamp((float(y10) - 64.0) / 876.0, 0.0, 1.0);
     float mapped = mix(y, tone_map_luma(y), amount);
+    mapped = clamp(mapped + clamp(pc.hdr_brightness, -0.3, 0.3) * amount, 0.0, 1.0);
     return ((64.0 + mapped * 876.0) * 64.0) / 65535.0;
 }
 
@@ -220,7 +223,9 @@ vec2 map_uv10(uint u10, uint v10) {
     float amount = direct_hdr_amount();
     if (amount <= 0.0)
         return vec2(float(u10 << 6), float(v10 << 6)) / 65535.0;
-    float sat = mix(1.0, 0.82, amount);
+    float sat = filter_sdr_to_hdr()
+        ? mix(1.0, clamp(pc.hdr_saturation, 0.5, 2.5), amount)
+        : mix(1.0, 0.82, amount);
     float cb = (float(u10) - 512.0) / 896.0;
     float cr = (float(v10) - 512.0) / 896.0;
     return ((vec2(512.0) + vec2(cb, cr) * (896.0 * sat)) * 64.0) / 65535.0;

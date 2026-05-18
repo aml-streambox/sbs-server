@@ -387,9 +387,11 @@ typedef struct sbs_compositor {
     /* Native final-output preview downscale: main Y/UV planes -> preview Y/UV planes. */
     VkShaderModule          native_downscale_sdr_shader;
     VkShaderModule          native_downscale_hdr_shader;
+    VkShaderModule          native_downscale_hdr_to_sdr_shader;
     VkPipelineLayout        native_downscale_pipeline_layout;
     VkPipeline              native_downscale_sdr_pipeline;
     VkPipeline              native_downscale_hdr_pipeline;
+    VkPipeline              native_downscale_hdr_to_sdr_pipeline;
     VkDescriptorSetLayout   native_downscale_ds_layout;
     VkDescriptorPool        native_downscale_ds_pool;
     VkDescriptorSet         native_downscale_ds[SBS_NATIVE_CANVAS_RING_SIZE];
@@ -478,9 +480,10 @@ int  sbs_compositor_render_native_frame(sbs_compositor_t *comp,
                                          uint32_t *entry_idx_out);
 int  sbs_compositor_load_shaders(sbs_compositor_t *comp, const char *shader_dir);
 int  sbs_compositor_configure_native_preview(sbs_compositor_t *comp,
-                                             uint32_t width,
-                                             uint32_t height,
-                                             uint32_t frame_interval);
+                                              uint32_t width,
+                                              uint32_t height,
+                                              uint32_t frame_interval,
+                                              sbs_export_color_mode_t color_mode);
 
 /* Native canvas ring helpers.  These deliberately operate on native_canvas
  * entries rather than legacy RGB render targets. */

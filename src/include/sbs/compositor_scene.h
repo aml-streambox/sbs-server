@@ -19,6 +19,7 @@
 #define SBS_COMP_FILTER_LUMA_KEY        (1u << 7)
 #define SBS_COMP_FILTER_CHROMA_KEY      (1u << 8)
 #define SBS_COMP_FILTER_LUT             (1u << 9)
+#define SBS_COMP_FILTER_SDR_TO_HDR      (1u << 10)
 
 typedef struct sbs_comp_scene_item {
     char source_id[128];

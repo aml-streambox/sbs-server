@@ -18,7 +18,7 @@ layout(push_constant) uniform PushConstants {
 uint scale_nearest(uint pos, uint src_extent, uint dst_extent) {
     if (src_extent <= 1u || dst_extent <= 1u) return 0u;
     uint factor = max(pc.factor, 1u);
-    if (factor == 1u || factor == 2u || factor == 4u || factor == 8u)
+    if (factor == 2u || factor == 4u || factor == 5u || factor == 6u || factor == 8u)
         return min(pos * factor + (factor >> 1u), src_extent - 1u);
     float f = (float(pos) + 0.5) * float(src_extent) / float(dst_extent);
     return min(uint(f), src_extent - 1u);

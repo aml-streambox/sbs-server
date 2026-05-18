@@ -1686,6 +1686,7 @@ static int ensure_pipeline(sbs_encoder_manager_t *mgr)
         .gop_pattern = mgr->gop_pattern,
         .rc_mode = mgr->rc_mode,
         .hdr10 = mgr->hdr10,
+        .input_hdr10 = mgr->hdr10,
     };
 
     mgr->video_encoder = sbs_direct_venc_new(&venc_cfg);

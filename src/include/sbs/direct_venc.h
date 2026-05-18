@@ -21,6 +21,7 @@ typedef struct sbs_direct_venc_config {
     int32_t gop_pattern;
     int32_t rc_mode;        /* 0=VBR (default), 1=CBR */
     bool hdr10;
+    bool input_hdr10;
 } sbs_direct_venc_config_t;
 
 typedef struct sbs_direct_venc_packet {

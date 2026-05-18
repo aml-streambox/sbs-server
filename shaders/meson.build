@@ -23,6 +23,7 @@ shader_spv_files = [
     'native_amly_to_nv21_src.comp.spv',
     'native_downscale_nv21.comp.spv',
     'native_downscale_p010.comp.spv',
+    'native_downscale_p010_to_nv21.comp.spv',
 ]
 
 if glslang.found() and get_option('shader_compile')
@@ -189,6 +190,14 @@ if glslang.found() and get_option('shader_compile')
     custom_target('native_downscale_p010.comp.spv',
         input  : 'native_downscale_p010.comp',
         output : 'native_downscale_p010.comp.spv',
+        command : [glslang, '-V', '@INPUT@', '-o', '@OUTPUT@'],
+        install : true,
+        install_dir : get_option('datadir') / 'sbs' / 'shaders',
+    )
+
+    custom_target('native_downscale_p010_to_nv21.comp.spv',
+        input  : 'native_downscale_p010_to_nv21.comp',
+        output : 'native_downscale_p010_to_nv21.comp.spv',
         command : [glslang, '-V', '@INPUT@', '-o', '@OUTPUT@'],
         install : true,
         install_dir : get_option('datadir') / 'sbs' / 'shaders',

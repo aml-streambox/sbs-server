@@ -34,6 +34,7 @@ layout(push_constant) uniform PushConstants {
 } pc;
 
 const uint FILTER_HDR_TO_SDR = 32u;
+const uint FILTER_SDR_TO_HDR = 1024u;
 
 uint bswap32(uint val) {
     return ((val & 0x000000FFu) << 24) |
@@ -87,7 +88,7 @@ uint out_end_for_src(uint s, float inv_scale, uint limit) {
 }
 
 float direct_hdr_amount() {
-    return ((pc.filter_flags & FILTER_HDR_TO_SDR) != 0u)
+    return ((pc.filter_flags & (FILTER_HDR_TO_SDR | FILTER_SDR_TO_HDR)) != 0u)
         ? clamp(pc.hdr_to_sdr_amount, 0.0, 1.0) : 0.0;
 }
 
@@ -109,7 +110,9 @@ vec2 map_uv10(uint u10, uint v10) {
     float amount = direct_hdr_amount();
     if (amount <= 0.0)
         return vec2(float(u10 << 6), float(v10 << 6)) / 65535.0;
-    float sat = mix(1.0, 0.82, amount);
+    float sat = ((pc.filter_flags & FILTER_SDR_TO_HDR) != 0u)
+        ? mix(1.0, 1.35, amount)
+        : mix(1.0, 0.82, amount);
     float cb = (float(u10) - 512.0) / 896.0;
     float cr = (float(v10) - 512.0) / 896.0;
     return ((vec2(512.0) + vec2(cb, cr) * (896.0 * sat)) * 64.0) / 65535.0;

@@ -38,6 +38,7 @@ typedef struct sbs_preview_profile {
     bool active;
     bool reference_color;
     sbs_preview_color_mode_t active_color_mode;
+    sbs_preview_color_mode_t input_color_mode;
     uint32_t viewer_count;
     char *stream_url;
     uint32_t bitrate_kbps;

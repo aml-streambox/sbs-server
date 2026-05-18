@@ -4,8 +4,8 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0, r16) uniform readonly image2D src_y_img;
 layout(set = 0, binding = 1, rg16) uniform readonly image2D src_uv_img;
-layout(set = 0, binding = 2, r16) uniform writeonly image2D dst_y_img;
-layout(set = 0, binding = 3, rg16) uniform writeonly image2D dst_uv_img;
+layout(set = 0, binding = 2, r8) uniform writeonly image2D dst_y_img;
+layout(set = 0, binding = 3, rg8) uniform writeonly image2D dst_uv_img;
 
 layout(push_constant) uniform PushConstants {
     uint src_w;
@@ -24,11 +24,36 @@ uint scale_nearest(uint pos, uint src_extent, uint dst_extent) {
     return min(uint(f), src_extent - 1u);
 }
 
+uint unpack_unorm16(float v) {
+    return uint(clamp(v, 0.0, 1.0) * 65535.0 + 0.5);
+}
+
+uint read_y10(uint x, uint y) {
+    return (unpack_unorm16(imageLoad(src_y_img, ivec2(x, y)).r) >> 6) & 0x3FFu;
+}
+
+uvec2 read_uv10(uint x, uint y) {
+    vec2 uv = imageLoad(src_uv_img, ivec2(x, y)).rg;
+    return uvec2((unpack_unorm16(uv.r) >> 6) & 0x3FFu,
+                 (unpack_unorm16(uv.g) >> 6) & 0x3FFu);
+}
+
+float map_hdr_y_to_sdr(uint y10) {
+    float mapped = clamp((float(y10) - 188.83) * (1.86 / 876.0), 0.0, 0.996853);
+    return clamp((16.0 / 255.0) + mapped * (219.0 / 255.0), 0.0, 1.0);
+}
+
+vec2 map_hdr_uv_to_sdr(uint u10, uint v10) {
+    float v = (128.0 / 255.0) + (float(v10) - 512.0) * (2.60 / 1020.0);
+    float u = (128.0 / 255.0) + (float(u10) - 512.0) * (1.80 / 1020.0);
+    return clamp(vec2(v, u), 0.0, 1.0);
+}
+
 void write_y(uint x, uint y) {
     if (x >= pc.dst_w || y >= pc.dst_h) return;
     uint sx = scale_nearest(x, pc.src_w, pc.dst_w);
     uint sy = scale_nearest(y, pc.src_h, pc.dst_h);
-    imageStore(dst_y_img, ivec2(x, y), imageLoad(src_y_img, ivec2(sx, sy)));
+    imageStore(dst_y_img, ivec2(x, y), vec4(map_hdr_y_to_sdr(read_y10(sx, sy)), 0.0, 0.0, 1.0));
 }
 
 void main() {
@@ -50,6 +75,7 @@ void main() {
 
     uint src_uv_x = scale_nearest(dst_uv_x, src_uv_w, dst_uv_w);
     uint src_uv_y = scale_nearest(dst_uv_y, src_uv_h, dst_uv_h);
+    uvec2 uv10 = read_uv10(src_uv_x, src_uv_y);
     imageStore(dst_uv_img, ivec2(dst_uv_x, dst_uv_y),
-               imageLoad(src_uv_img, ivec2(src_uv_x, src_uv_y)));
+               vec4(map_hdr_uv_to_sdr(uv10.x, uv10.y), 0.0, 1.0));
 }

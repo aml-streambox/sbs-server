@@ -48,6 +48,7 @@ typedef struct {
     uint32_t preview_width;
     uint32_t preview_height;
     uint32_t preview_frame_interval;
+    sbs_export_color_mode_t preview_color_mode;
     sbs_comp_scene_state_t scene_state;
 } sbs_comp_cmd_t;
 
@@ -271,7 +272,8 @@ static bool item_has_vulkan_only_filters(const sbs_compositor_thread_t *ct,
 {
     uint32_t direct_yuv_filter_mask = SBS_COMP_FILTER_GRAYSCALE |
         SBS_COMP_FILTER_BRIGHTNESS | SBS_COMP_FILTER_CONTRAST |
-        SBS_COMP_FILTER_HDR_TO_SDR_LUT | SBS_COMP_FILTER_COLOR_CORRECTION;
+        SBS_COMP_FILTER_HDR_TO_SDR_LUT | SBS_COMP_FILTER_COLOR_CORRECTION |
+        SBS_COMP_FILTER_SDR_TO_HDR;
 
     if (ct && ct->color_mode == SBS_EXPORT_COLOR_SDR)
         direct_yuv_filter_mask |= SBS_COMP_FILTER_LUMA_KEY;
@@ -641,10 +643,12 @@ static void *compositor_thread_func(void *arg)
                 if (sbs_compositor_configure_native_preview(&ct->compositor,
                                                             cmd->preview_width,
                                                             cmd->preview_height,
-                                                            cmd->preview_frame_interval) != 0) {
-                    LOG_W("native preview configure failed: %ux%u interval=%u",
+                                                            cmd->preview_frame_interval,
+                                                            cmd->preview_color_mode) != 0) {
+                    LOG_W("native preview configure failed: %ux%u interval=%u color=%d",
                           cmd->preview_width, cmd->preview_height,
-                          cmd->preview_frame_interval);
+                          cmd->preview_frame_interval,
+                          cmd->preview_color_mode);
                 }
                 ct->scene_dirty = true;
                 reset_render_deadline(ct, &next_deadline);
@@ -1229,9 +1233,10 @@ int sbs_compositor_thread_set_scene(sbs_compositor_thread_t *ct,
 }
 
 int sbs_compositor_thread_configure_native_preview(sbs_compositor_thread_t *ct,
-                                                   uint32_t width,
-                                                   uint32_t height,
-                                                   uint32_t frame_interval)
+                                                    uint32_t width,
+                                                    uint32_t height,
+                                                    uint32_t frame_interval,
+                                                    sbs_export_color_mode_t color_mode)
 {
     sbs_comp_cmd_t *cmd;
 
@@ -1247,6 +1252,7 @@ int sbs_compositor_thread_configure_native_preview(sbs_compositor_thread_t *ct,
     cmd->preview_width = width;
     cmd->preview_height = height;
     cmd->preview_frame_interval = frame_interval > 0 ? frame_interval : 1;
+    cmd->preview_color_mode = color_mode;
 
     if (!sbs_spsc_queue_push(ct->cmd_queue, cmd)) {
         free(cmd);

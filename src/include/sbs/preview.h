@@ -111,10 +111,15 @@ int sbs_preview_engine_add_webrtc_ice(sbs_preview_engine_t *engine,
                                       const char *candidate);
 
 int sbs_preview_engine_update_profile_config(sbs_preview_engine_t *engine,
-                                               const char *profile_id,
-                                               uint32_t downscale_factor,
-                                               uint32_t framerate,
-                                               uint32_t bitrate_kbps);
+                                                const char *profile_id,
+                                                uint32_t downscale_factor,
+                                                uint32_t framerate,
+                                                uint32_t bitrate_kbps);
+cJSON *sbs_preview_engine_serialize_encoder_config(const sbs_preview_engine_t *engine,
+                                                   const char *profile_id);
+int sbs_preview_engine_apply_encoder_config(sbs_preview_engine_t *engine,
+                                            const char *profile_id,
+                                            cJSON *config);
 
 cJSON *sbs_preview_serialize_profile(const sbs_preview_profile_t *profile);
 cJSON *sbs_preview_serialize_profile_catalog(const sbs_preview_engine_t *engine);

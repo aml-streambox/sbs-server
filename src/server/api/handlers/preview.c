@@ -342,11 +342,12 @@ int sbs_api_handle_preview_update_encoder_config(sbs_api_server_t *server,
         bitrate_kbps = (uint32_t)bitrate_j->valuedouble;
 
     rc = sbs_preview_engine_update_profile_config(server->preview, profile_id,
-                                                    downscale_factor, framerate, bitrate_kbps);
+                                                     downscale_factor, framerate, bitrate_kbps);
     if (rc != SBS_OK) {
         *error = api_error(-32011, "Failed to update preview encoder config");
         return rc;
     }
+    sbs_config_manager_mark_dirty(server->config, server);
 
     /* Return updated config */
     return sbs_api_handle_preview_get_encoder_config(server, client, params, result, error);

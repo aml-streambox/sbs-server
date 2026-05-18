@@ -1748,10 +1748,10 @@ int sbs_preview_engine_add_webrtc_ice(sbs_preview_engine_t *engine,
 /* ── Profile config update ────────────────────────────────────── */
 
 int sbs_preview_engine_update_profile_config(sbs_preview_engine_t *engine,
-                                               const char *profile_id,
-                                               uint32_t downscale_factor,
-                                               uint32_t framerate,
-                                               uint32_t bitrate_kbps)
+                                                const char *profile_id,
+                                                uint32_t downscale_factor,
+                                                uint32_t framerate,
+                                                uint32_t bitrate_kbps)
 {
     sbs_preview_profile_t *profile;
     bool changed = false;
@@ -1804,6 +1804,56 @@ int sbs_preview_engine_update_profile_config(sbs_preview_engine_t *engine,
           profile->framerate, profile->downscale_factor, profile->bitrate_kbps);
     g_mutex_unlock(&engine->lock);
     return SBS_OK;
+}
+
+static uint32_t json_u32_or_zero(cJSON *obj, const char *key)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    return cJSON_IsNumber(item) && item->valuedouble > 0.0
+        ? (uint32_t)item->valuedouble : 0;
+}
+
+cJSON *sbs_preview_engine_serialize_encoder_config(const sbs_preview_engine_t *engine,
+                                                   const char *profile_id)
+{
+    sbs_preview_profile_t *profile;
+    cJSON *obj;
+
+    if (!engine)
+        return NULL;
+    if (!profile_id)
+        profile_id = "preview-h264-webrtc";
+
+    g_mutex_lock((GMutex *)&engine->lock);
+    profile = preview_engine_get_profile_unlocked(engine, profile_id);
+    if (!profile) {
+        g_mutex_unlock((GMutex *)&engine->lock);
+        return NULL;
+    }
+
+    obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(obj, "profile_id", profile->id);
+    cJSON_AddNumberToObject(obj, "downscale_factor", profile->downscale_factor);
+    cJSON_AddNumberToObject(obj, "framerate", profile->framerate);
+    cJSON_AddNumberToObject(obj, "bitrate_kbps", profile->bitrate_kbps);
+    g_mutex_unlock((GMutex *)&engine->lock);
+    return obj;
+}
+
+int sbs_preview_engine_apply_encoder_config(sbs_preview_engine_t *engine,
+                                            const char *profile_id,
+                                            cJSON *config)
+{
+    if (!engine || !cJSON_IsObject(config))
+        return SBS_ERR_INVAL;
+    if (!profile_id)
+        profile_id = "preview-h264-webrtc";
+
+    return sbs_preview_engine_update_profile_config(
+        engine, profile_id,
+        json_u32_or_zero(config, "downscale_factor"),
+        json_u32_or_zero(config, "framerate"),
+        json_u32_or_zero(config, "bitrate_kbps"));
 }
 
 /* ── Telemetry / Serialization ────────────────────────────────── */

@@ -542,6 +542,45 @@ static int reconfigure_canvas_runtime_from_graph(sbs_api_server_t *server)
     return SBS_OK;
 }
 
+static cJSON *build_preview_bundle(sbs_api_server_t *server)
+{
+    cJSON *preview;
+    cJSON *encoder;
+
+    if (!server || !server->preview)
+        return NULL;
+
+    encoder = sbs_preview_engine_serialize_encoder_config(
+        server->preview, "preview-h264-webrtc");
+    if (!encoder)
+        return NULL;
+
+    preview = cJSON_CreateObject();
+    cJSON_AddItemToObject(preview, "encoder", encoder);
+    return preview;
+}
+
+static void apply_preview_bundle(sbs_api_server_t *server, cJSON *bundle)
+{
+    cJSON *preview;
+    cJSON *encoder;
+    int rc;
+
+    if (!server || !server->preview || !cJSON_IsObject(bundle))
+        return;
+
+    preview = cJSON_GetObjectItemCaseSensitive(bundle, "preview");
+    encoder = cJSON_GetObjectItemCaseSensitive(preview, "encoder");
+    if (!cJSON_IsObject(encoder))
+        return;
+
+    rc = sbs_preview_engine_apply_encoder_config(
+        server->preview, "preview-h264-webrtc", encoder);
+    if (rc != SBS_OK) {
+        LOG_W("ignored invalid persisted preview encoder config: %d", rc);
+    }
+}
+
 void sbs_config_manager_start_runtime(sbs_api_server_t *server)
 {
     restart_runtime_from_graph(server);
@@ -754,9 +793,14 @@ const char *sbs_config_manager_config_dir(const sbs_config_manager_t *mgr)
 cJSON *sbs_config_manager_build_bundle(sbs_api_server_t *server)
 {
     cJSON *bundle = cJSON_CreateObject();
+    cJSON *preview;
     cJSON_AddNumberToObject(bundle, "schema_version", 1);
     cJSON_AddStringToObject(bundle, "kind", "sbs-config");
     cJSON_AddItemToObject(bundle, "state", sbs_scene_graph_serialize_full_state(server->scene_graph));
+    preview = build_preview_bundle(server);
+    if (preview) {
+        cJSON_AddItemToObject(bundle, "preview", preview);
+    }
     if (server->audio) {
         cJSON_AddItemToObject(bundle, "audio", sbs_audio_mixer_serialize_state(server->audio));
     }
@@ -843,6 +887,7 @@ int sbs_config_manager_apply_bundle(sbs_config_manager_t *mgr, sbs_api_server_t 
         return SBS_ERR_INVAL;
     }
     restart_runtime_from_graph(server);
+    apply_preview_bundle(server, bundle);
     return sbs_config_manager_save_bundle(mgr, bundle);
 }
 

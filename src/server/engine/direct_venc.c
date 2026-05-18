@@ -421,8 +421,17 @@ static uint64_t calculate_packet_dts(sbs_direct_venc_t *enc,
     if (!enc || !pending)
         return UINT64_MAX;
 
-    if (!enc->bframe_enabled || enc->frame_duration_ns == 0)
-        return pending->dts_ns;
+    if (!enc->bframe_enabled || enc->frame_duration_ns == 0) {
+        if (pending->dts_ns != UINT64_MAX)
+            return pending->dts_ns;
+        if (packet_pts_ns != UINT64_MAX)
+            return packet_pts_ns;
+        if (pending->pts_ns != UINT64_MAX)
+            return pending->pts_ns;
+        return enc->frame_duration_ns > 0
+            ? (uint64_t)pending->id * enc->frame_duration_ns
+            : UINT64_MAX;
+    }
 
     if (packet_pts_ns == UINT64_MAX)
         packet_pts_ns = pending->pts_ns != UINT64_MAX

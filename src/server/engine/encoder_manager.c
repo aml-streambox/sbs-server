@@ -50,6 +50,8 @@ typedef struct sink_branch {
 
     /* GStreamer elements (all owned by pipeline bin) */
     GstElement *video_queue;
+    GstElement *video_parser;
+    GstElement *video_capsfilter;
     GstElement *video_pacer;
     GstElement *audio_queue;
     GstElement *audio_appsrc;
@@ -2141,7 +2143,12 @@ static GstElement *create_muxer(const char *codec, const char *sink_type,
             *out_format = "mkv";
         } else if (strcmp(container, "flv") == 0) {
             muxer = gst_element_factory_make("flvmux", NULL);
-            if (muxer) g_object_set(muxer, "streamable", TRUE, NULL);
+            if (muxer) {
+                g_object_set(muxer,
+                    "streamable", TRUE,
+                    "latency",    (guint64)100000000,
+                    NULL);
+            }
             *out_format = "flv";
         } else if (strcmp(container, "mp4") == 0) {
             muxer = gst_element_factory_make("mp4mux", NULL);
@@ -2158,8 +2165,17 @@ static GstElement *create_muxer(const char *codec, const char *sink_type,
         }
     } else if (is_rtmp && is_h264) {
         muxer = gst_element_factory_make("flvmux", NULL);
-        if (muxer) g_object_set(muxer, "streamable", TRUE, NULL);
+        if (muxer) {
+            g_object_set(muxer,
+                "streamable", TRUE,
+                "latency",    (guint64)100000000,
+                NULL);
+        }
         *out_format = "flv";
+    } else if (is_rtmp) {
+        LOG_E("RTMP output requires H.264 because the available RTMP sinks accept FLV only (codec=%s)",
+              codec ? codec : "h265");
+        return NULL;
     } else {
         muxer = gst_element_factory_make("mpegtsmux", NULL);
         if (muxer) {
@@ -2177,6 +2193,8 @@ static GstElement *create_sink(const sbs_sink_branch_config_t *config,
 {
     GstElement *sink = NULL;
     const char *sink_type = config->sink_type;
+
+    (void)muxer_format;
 
     if (sink_type && strcmp(sink_type, "fakesink") == 0) {
         sink = gst_element_factory_make("fakesink", NULL);
@@ -2210,13 +2228,8 @@ static GstElement *create_sink(const sbs_sink_branch_config_t *config,
     } else if (strcmp(sink_type, "rtmp") == 0) {
         if (config->rtmp_uri && strlen(config->rtmp_uri) > 0) {
             char *location = build_rtmp_location(config->rtmp_uri, config->rtmp_passcode);
-            if (muxer_format && strcmp(muxer_format, "flv") == 0) {
-                sink = gst_element_factory_make("rtmp2sink", NULL);
-                if (!sink) sink = gst_element_factory_make("rtmpsink", NULL);
-            } else {
-                sink = gst_element_factory_make("rtmpsink", NULL);
-                if (!sink) sink = gst_element_factory_make("rtmp2sink", NULL);
-            }
+            sink = gst_element_factory_make("rtmpsink", NULL);
+            if (!sink) sink = gst_element_factory_make("rtmp2sink", NULL);
             if (sink) {
                 g_object_set(sink, "location", location ? location : config->rtmp_uri, "sync", FALSE, NULL);
                 LOG_I("RTMP sink: %s%s", config->rtmp_uri,
@@ -2539,6 +2552,8 @@ static void stop_srt_session(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
 static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
 {
     GstElement *vqueue = gst_element_factory_make("queue", NULL);
+    GstElement *vparser = NULL;
+    GstElement *vcapsfilter = NULL;
     GstElement *vpacer = gst_element_factory_make("identity", NULL);
     GstElement *aqueue = gst_element_factory_make("queue", NULL);
     const char *muxer_format = NULL;
@@ -2550,6 +2565,7 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
     GstElement *branch_audio_encoder = NULL;
     GstElement *branch_audio_parser = NULL;
     bool direct_audio = branch->sink_type && strcmp(branch->sink_type, "srt") == 0;
+    bool flv_muxer = muxer_format && strcmp(muxer_format, "flv") == 0;
 
     sbs_sink_branch_config_t cfg = {
         .output_id    = branch->output_id,
@@ -2565,16 +2581,41 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
     };
     GstElement *sink = create_sink(&cfg, muxer_format);
 
+    if (flv_muxer) {
+        GstCaps *vcaps;
+        vparser = gst_element_factory_make("h264parse", NULL);
+        vcapsfilter = gst_element_factory_make("capsfilter", NULL);
+        if (vparser) {
+            g_object_set(vparser,
+                "config-interval",     (gint)-1,
+                "disable-passthrough", TRUE,
+                NULL);
+        }
+        vcaps = gst_caps_new_simple("video/x-h264",
+            "stream-format", G_TYPE_STRING, "avc",
+            "alignment",     G_TYPE_STRING, "au",
+            NULL);
+        if (vcapsfilter)
+            g_object_set(vcapsfilter, "caps", vcaps, NULL);
+        gst_caps_unref(vcaps);
+    }
+
     branch->manager = mgr;
     branch->drop_until_keyframe = TRUE;
     branch->srt_caller_count = 0;
     if (branch->sink_type && strcmp(branch->sink_type, "srt") == 0 && !branch->srt_callers)
         branch->srt_callers = g_hash_table_new(g_direct_hash, g_direct_equal);
 
-    if (muxer_format && strcmp(muxer_format, "mpegts") == 0) {
+    if (muxer_format &&
+        (strcmp(muxer_format, "mpegts") == 0 || strcmp(muxer_format, "flv") == 0)) {
         GstCaps *caps;
         acapsfilter = gst_element_factory_make("capsfilter", NULL);
-        if (direct_audio) {
+        if (strcmp(muxer_format, "flv") == 0) {
+            caps = gst_caps_new_simple("audio/mpeg",
+                "mpegversion",   G_TYPE_INT, 4,
+                "stream-format", G_TYPE_STRING, "raw",
+                NULL);
+        } else if (direct_audio) {
             caps = gst_caps_new_simple("audio/mpeg",
                 "parsed",      G_TYPE_BOOLEAN, TRUE,
                 "mpegversion", G_TYPE_INT, 1,
@@ -2603,12 +2644,15 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
     }
 
     if (!vqueue || !vpacer || !aqueue || !muxer || !sink ||
+        (flv_muxer && (!vparser || !vcapsfilter)) ||
         (muxer_format && strcmp(muxer_format, "mpegts") == 0 && !acapsfilter) ||
         (direct_audio && (!branch_audio_src || !branch_audio_convert ||
                           !branch_audio_resample || !branch_audio_encoder ||
                           !branch_audio_parser))) {
         LOG_E("failed to create sink branch elements for '%s'", branch->output_id);
         if (vqueue) gst_object_unref(vqueue);
+        if (vparser) gst_object_unref(vparser);
+        if (vcapsfilter) gst_object_unref(vcapsfilter);
         if (vpacer) gst_object_unref(vpacer);
         if (aqueue) gst_object_unref(aqueue);
         if (branch_audio_src) gst_object_unref(branch_audio_src);
@@ -2659,10 +2703,10 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
             NULL);
     } else {
         g_object_set(vqueue,
-            "max-size-buffers", (guint)8,
-            "max-size-time",    (guint64)(250 * GST_MSECOND),
+            "max-size-buffers", (guint)0,
+            "max-size-time",    (guint64)(2 * GST_SECOND),
             "max-size-bytes",   (guint)0,
-            "leaky",            2,
+            "leaky",            0,
             NULL);
     }
 
@@ -2676,9 +2720,9 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
     } else {
         g_object_set(aqueue,
             "max-size-buffers", (guint)0,
-            "max-size-time",    (guint64)(100 * GST_MSECOND),
+            "max-size-time",    (guint64)(2 * GST_SECOND),
             "max-size-bytes",   (guint)0,
-            "leaky",            2,
+            "leaky",            0,
             NULL);
     }
 
@@ -2710,6 +2754,9 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
                          branch_audio_src, aqueue, branch_audio_convert,
                          branch_audio_resample, branch_audio_encoder,
                          branch_audio_parser, acapsfilter, muxer, sink, NULL);
+    } else if (vparser || vcapsfilter) {
+        gst_bin_add_many(GST_BIN(mgr->pipeline), vqueue, vparser, vcapsfilter,
+                         vpacer, aqueue, acapsfilter, muxer, sink, NULL);
     } else if (acapsfilter) {
         gst_bin_add_many(GST_BIN(mgr->pipeline), vqueue, vpacer, aqueue,
                          acapsfilter, muxer, sink, NULL);
@@ -2719,8 +2766,15 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
     }
 
     /* Link: vqueue → timestamp pacer → muxer → sink */
-    if (!gst_element_link_many(vqueue, vpacer, muxer, sink, NULL)) {
+    gboolean video_linked;
+    if (vparser && vcapsfilter)
+        video_linked = gst_element_link_many(vqueue, vparser, vcapsfilter, vpacer, muxer, sink, NULL);
+    else
+        video_linked = gst_element_link_many(vqueue, vpacer, muxer, sink, NULL);
+    if (!video_linked) {
         LOG_E("failed to link video branch for '%s'", branch->output_id);
+        if (vcapsfilter) gst_bin_remove(GST_BIN(mgr->pipeline), vcapsfilter);
+        if (vparser) gst_bin_remove(GST_BIN(mgr->pipeline), vparser);
         if (acapsfilter)
             gst_bin_remove_many(GST_BIN(mgr->pipeline), vqueue, vpacer, aqueue, acapsfilter, muxer, sink, NULL);
         else
@@ -2741,28 +2795,19 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
         }
     } else if (acapsfilter) {
         if (!gst_element_link_many(aqueue, acapsfilter, muxer, NULL)) {
-            LOG_E("failed to link ADTS audio branch into muxer for '%s'", branch->output_id);
+            LOG_E("failed to link audio branch into muxer for '%s'", branch->output_id);
+            if (vcapsfilter) gst_bin_remove(GST_BIN(mgr->pipeline), vcapsfilter);
+            if (vparser) gst_bin_remove(GST_BIN(mgr->pipeline), vparser);
             gst_bin_remove_many(GST_BIN(mgr->pipeline), vqueue, vpacer, aqueue, acapsfilter, muxer, sink, NULL);
             return SBS_ERR_IO;
         }
     } else if (!gst_element_link(aqueue, muxer)) {
         LOG_E("failed to link audio branch into muxer for '%s'", branch->output_id);
+        if (vcapsfilter) gst_bin_remove(GST_BIN(mgr->pipeline), vcapsfilter);
+        if (vparser) gst_bin_remove(GST_BIN(mgr->pipeline), vparser);
         gst_bin_remove_many(GST_BIN(mgr->pipeline), vqueue, vpacer, aqueue, muxer, sink, NULL);
         return SBS_ERR_IO;
     }
-
-    /* Sync state with parent pipeline */
-    gst_element_sync_state_with_parent(vqueue);
-    gst_element_sync_state_with_parent(vpacer);
-    if (branch_audio_src) gst_element_sync_state_with_parent(branch_audio_src);
-    gst_element_sync_state_with_parent(aqueue);
-    if (branch_audio_convert) gst_element_sync_state_with_parent(branch_audio_convert);
-    if (branch_audio_resample) gst_element_sync_state_with_parent(branch_audio_resample);
-    if (branch_audio_encoder) gst_element_sync_state_with_parent(branch_audio_encoder);
-    if (branch_audio_parser) gst_element_sync_state_with_parent(branch_audio_parser);
-    if (acapsfilter) gst_element_sync_state_with_parent(acapsfilter);
-    gst_element_sync_state_with_parent(muxer);
-    gst_element_sync_state_with_parent(sink);
 
     /* Request pad from video tee and link */
     GstPad *vtee_pad = gst_element_request_pad_simple(mgr->video_tee, "src_%u");
@@ -2771,17 +2816,23 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
         LOG_E("failed to request video branch pads for '%s'", branch->output_id);
         if (vtee_pad) gst_object_unref(vtee_pad);
         if (vq_sink) gst_object_unref(vq_sink);
+        if (vcapsfilter) gst_bin_remove(GST_BIN(mgr->pipeline), vcapsfilter);
+        if (vparser) gst_bin_remove(GST_BIN(mgr->pipeline), vparser);
         if (acapsfilter)
             gst_bin_remove_many(GST_BIN(mgr->pipeline), vqueue, vpacer, aqueue, acapsfilter, muxer, sink, NULL);
         else
             gst_bin_remove_many(GST_BIN(mgr->pipeline), vqueue, vpacer, aqueue, muxer, sink, NULL);
         return SBS_ERR_IO;
     }
-    if (gst_pad_link(vtee_pad, vq_sink) != GST_PAD_LINK_OK) {
-        LOG_E("failed to link video tee to queue for '%s'", branch->output_id);
+    GstPadLinkReturn vlink_ret = gst_pad_link(vtee_pad, vq_sink);
+    if (vlink_ret != GST_PAD_LINK_OK) {
+        LOG_E("failed to link video tee to queue for '%s': %s",
+              branch->output_id, gst_pad_link_get_name(vlink_ret));
         gst_element_release_request_pad(mgr->video_tee, vtee_pad);
         gst_object_unref(vtee_pad);
         gst_object_unref(vq_sink);
+        if (vcapsfilter) gst_bin_remove(GST_BIN(mgr->pipeline), vcapsfilter);
+        if (vparser) gst_bin_remove(GST_BIN(mgr->pipeline), vparser);
         if (acapsfilter)
             gst_bin_remove_many(GST_BIN(mgr->pipeline), vqueue, vpacer, aqueue, acapsfilter, muxer, sink, NULL);
         else
@@ -2810,15 +2861,19 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
             gst_object_unref(atee_pad);
         }
         if (aq_sink) gst_object_unref(aq_sink);
+        if (vcapsfilter) gst_bin_remove(GST_BIN(mgr->pipeline), vcapsfilter);
+        if (vparser) gst_bin_remove(GST_BIN(mgr->pipeline), vparser);
         if (acapsfilter)
             gst_bin_remove_many(GST_BIN(mgr->pipeline), vqueue, vpacer, aqueue, acapsfilter, muxer, sink, NULL);
         else
             gst_bin_remove_many(GST_BIN(mgr->pipeline), vqueue, vpacer, aqueue, muxer, sink, NULL);
         return SBS_ERR_IO;
     }
-    if (!direct_audio && gst_pad_link(atee_pad, aq_sink) != GST_PAD_LINK_OK) {
+    GstPadLinkReturn alink_ret = direct_audio ? GST_PAD_LINK_OK : gst_pad_link(atee_pad, aq_sink);
+    if (!direct_audio && alink_ret != GST_PAD_LINK_OK) {
         GstPad *vq_sink2 = gst_element_get_static_pad(vqueue, "sink");
-        LOG_E("failed to link audio tee to queue for '%s'", branch->output_id);
+        LOG_E("failed to link audio tee to queue for '%s': %s",
+              branch->output_id, gst_pad_link_get_name(alink_ret));
         if (vq_sink2) {
             gst_pad_unlink(vtee_pad, vq_sink2);
             gst_object_unref(vq_sink2);
@@ -2828,6 +2883,8 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
         gst_element_release_request_pad(mgr->audio_tee, atee_pad);
         gst_object_unref(atee_pad);
         gst_object_unref(aq_sink);
+        if (vcapsfilter) gst_bin_remove(GST_BIN(mgr->pipeline), vcapsfilter);
+        if (vparser) gst_bin_remove(GST_BIN(mgr->pipeline), vparser);
         if (acapsfilter)
             gst_bin_remove_many(GST_BIN(mgr->pipeline), vqueue, vpacer, aqueue, acapsfilter, muxer, sink, NULL);
         else
@@ -2836,8 +2893,27 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
     }
     gst_object_unref(aq_sink);
 
+    /* Sync branch state only after tee pads are linked. Some live sinks try to
+     * preroll/connect as soon as they enter PLAYING, which can make dynamic pad
+     * linking fail if the branch is not connected yet. */
+    gst_element_sync_state_with_parent(vqueue);
+    if (vparser) gst_element_sync_state_with_parent(vparser);
+    if (vcapsfilter) gst_element_sync_state_with_parent(vcapsfilter);
+    gst_element_sync_state_with_parent(vpacer);
+    if (branch_audio_src) gst_element_sync_state_with_parent(branch_audio_src);
+    gst_element_sync_state_with_parent(aqueue);
+    if (branch_audio_convert) gst_element_sync_state_with_parent(branch_audio_convert);
+    if (branch_audio_resample) gst_element_sync_state_with_parent(branch_audio_resample);
+    if (branch_audio_encoder) gst_element_sync_state_with_parent(branch_audio_encoder);
+    if (branch_audio_parser) gst_element_sync_state_with_parent(branch_audio_parser);
+    if (acapsfilter) gst_element_sync_state_with_parent(acapsfilter);
+    gst_element_sync_state_with_parent(muxer);
+    gst_element_sync_state_with_parent(sink);
+
     /* Store references in branch. */
     branch->video_queue    = vqueue;
+    branch->video_parser   = vparser;
+    branch->video_capsfilter = vcapsfilter;
     branch->video_pacer    = vpacer;
     branch->audio_appsrc   = branch_audio_src;
     branch->audio_queue    = aqueue;
@@ -2971,6 +3047,14 @@ static void unlink_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch
         LOG_I("unlink branch '%s': set audio capsfilter NULL", branch->output_id);
         gst_element_set_state(branch->audio_capsfilter, GST_STATE_NULL);
     }
+    if (branch->video_capsfilter) {
+        LOG_I("unlink branch '%s': set video capsfilter NULL", branch->output_id);
+        gst_element_set_state(branch->video_capsfilter, GST_STATE_NULL);
+    }
+    if (branch->video_parser) {
+        LOG_I("unlink branch '%s': set video parser NULL", branch->output_id);
+        gst_element_set_state(branch->video_parser, GST_STATE_NULL);
+    }
     if (branch->video_pacer) {
         LOG_I("unlink branch '%s': set video pacer NULL", branch->output_id);
         gst_element_set_state(branch->video_pacer, GST_STATE_NULL);
@@ -2998,6 +3082,8 @@ static void unlink_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch
         branch->audio_encoder = NULL;
         branch->audio_parser = NULL;
         branch->audio_capsfilter = NULL;
+        branch->video_parser = NULL;
+        branch->video_capsfilter = NULL;
         branch->muxer = NULL;
         branch->sink = NULL;
         return;
@@ -3014,11 +3100,15 @@ static void unlink_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch
     if (branch->audio_convert) gst_bin_remove(GST_BIN(mgr->pipeline), branch->audio_convert);
     if (branch->audio_queue) gst_bin_remove(GST_BIN(mgr->pipeline), branch->audio_queue);
     if (branch->audio_appsrc) gst_bin_remove(GST_BIN(mgr->pipeline), branch->audio_appsrc);
+    if (branch->video_capsfilter) gst_bin_remove(GST_BIN(mgr->pipeline), branch->video_capsfilter);
+    if (branch->video_parser) gst_bin_remove(GST_BIN(mgr->pipeline), branch->video_parser);
     if (branch->video_pacer) gst_bin_remove(GST_BIN(mgr->pipeline), branch->video_pacer);
     if (branch->video_queue) gst_bin_remove(GST_BIN(mgr->pipeline), branch->video_queue);
     LOG_I("unlink branch '%s': remove complete", branch->output_id);
 
     branch->video_queue = NULL;
+    branch->video_parser = NULL;
+    branch->video_capsfilter = NULL;
     branch->video_pacer = NULL;
     branch->audio_appsrc = NULL;
     branch->audio_queue = NULL;

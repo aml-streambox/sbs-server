@@ -3,6 +3,7 @@
 #include "sbs/config_manager.h"
 #include "sbs/api_server.h"
 #include "sbs/audio_mixer.h"
+#include "sbs/encoder_manager.h"
 #include "sbs/log.h"
 #include "sbs/source_start_config.h"
 
@@ -278,6 +279,47 @@ static void clear_scene_graph(sbs_scene_graph_t *graph)
     g_clear_pointer(&graph->transition_runtime.transition_id, g_free);
 }
 
+static const char *resolve_shared_codec_for_sink(const char *sink_type,
+                                                 const char *requested_codec)
+{
+    if (requested_codec && *requested_codec)
+        return requested_codec;
+    if (g_strcmp0(sink_type, "rtmp") == 0)
+        return "h264";
+    return NULL;
+}
+
+static int ensure_restore_encoder_codec(sbs_api_server_t *server,
+                                        const char *output_id,
+                                        const char *sink_type,
+                                        const char *requested_codec)
+{
+    const char *codec = resolve_shared_codec_for_sink(sink_type, requested_codec);
+    sbs_encoder_config_t cfg = {0};
+    const char *current_codec;
+    uint32_t active_branches;
+
+    if (!server || !server->encoder_mgr || !codec)
+        return SBS_OK;
+
+    sbs_encoder_manager_get_config(server->encoder_mgr, &cfg);
+    current_codec = cfg.codec ? cfg.codec : "h265";
+    if (g_strcmp0(current_codec, codec) == 0)
+        return SBS_OK;
+
+    active_branches = sbs_encoder_manager_sink_count(server->encoder_mgr);
+    if (active_branches > 0) {
+        LOG_W("cannot restore output '%s' with codec=%s while shared encoder is codec=%s with %u active branches",
+              output_id ? output_id : "<unknown>", codec, current_codec, active_branches);
+        return SBS_ERR_INVAL;
+    }
+
+    LOG_I("reconfiguring shared encoder for restored output '%s': codec=%s -> %s",
+          output_id ? output_id : "<unknown>", current_codec, codec);
+    cfg.codec = codec;
+    return sbs_encoder_manager_update_config(server->encoder_mgr, &cfg);
+}
+
 static void restart_runtime_from_graph(sbs_api_server_t *server)
 {
     GHashTableIter iter;
@@ -354,6 +396,7 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
             const char *file_path_mode = enc ? g_hash_table_lookup(enc, "file_path_mode") : NULL;
             const char *file_prefix = enc ? g_hash_table_lookup(enc, "file_prefix") : NULL;
             const char *file_container = enc ? g_hash_table_lookup(enc, "file_container") : NULL;
+            const char *codec_str = enc ? g_hash_table_lookup(enc, "codec") : NULL;
             uint32_t srt_latency  = lat_str ? (uint32_t)strtoul(lat_str, NULL, 10) : 600;
             if (!sink_type) sink_type = "srt";
             if (!srt_uri)   srt_uri   = "srt://:8888";
@@ -374,6 +417,14 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
                 sink_cfg.file_path_mode = file_path_mode;
                 sink_cfg.file_prefix    = file_prefix;
                 sink_cfg.file_container = file_container;
+                rc = ensure_restore_encoder_codec(server, output->id, sink_type, codec_str);
+                if (rc != SBS_OK) {
+                    LOG_E("failed to prepare encoder for restored output '%s': %d", output->id, rc);
+                    output->running = false;
+                    g_free(output->runtime_state);
+                    output->runtime_state = g_strdup("error");
+                    continue;
+                }
                 rc = sbs_encoder_manager_add_sink(server->encoder_mgr, &sink_cfg);
                 if (rc != SBS_OK) {
                     LOG_E("failed to restore output '%s': %d", output->id, rc);
@@ -386,7 +437,6 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
                 g_free(output->runtime_state);
                 output->runtime_state = g_strdup("running");
             } else if (server->output_sup) {
-                const char *codec_str  = enc ? g_hash_table_lookup(enc, "codec")        : NULL;
                 const char *brate_str  = enc ? g_hash_table_lookup(enc, "bitrate_kbps") : NULL;
                 const char *gop_str    = enc ? g_hash_table_lookup(enc, "gop_size")     : NULL;
                 uint32_t fps_num = server->scene_graph->canvas.fps_num;

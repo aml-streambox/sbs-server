@@ -46,6 +46,56 @@ static uint32_t encoder_num(GHashTable *encoder, const char *key, uint32_t fallb
     return (uint32_t)strtoul(val, NULL, 10);
 }
 
+static const char *resolve_shared_codec_for_sink(const char *sink_type,
+                                                 const char *requested_codec)
+{
+    if (requested_codec && *requested_codec)
+        return requested_codec;
+    if (g_strcmp0(sink_type, "rtmp") == 0)
+        return "h264";
+    return NULL;
+}
+
+static int ensure_shared_encoder_codec(sbs_api_server_t *server,
+                                       const char *output_id,
+                                       const char *sink_type,
+                                       const char *requested_codec,
+                                       const char **resolved_codec,
+                                       cJSON **error)
+{
+    const char *codec = resolve_shared_codec_for_sink(sink_type, requested_codec);
+    sbs_encoder_config_t cfg = {0};
+    const char *current_codec;
+    uint32_t active_branches;
+
+    if (resolved_codec)
+        *resolved_codec = codec;
+    if (!server || !server->encoder_mgr || !codec)
+        return SBS_OK;
+
+    sbs_encoder_manager_get_config(server->encoder_mgr, &cfg);
+    current_codec = cfg.codec ? cfg.codec : "h265";
+    if (g_strcmp0(current_codec, codec) == 0)
+        return SBS_OK;
+
+    active_branches = sbs_encoder_manager_sink_count(server->encoder_mgr);
+    if (active_branches > 0) {
+        LOG_W("output '%s' requires codec=%s but shared encoder is codec=%s with %u active branches",
+              output_id ? output_id : "<unknown>", codec, current_codec, active_branches);
+        if (error)
+            *error = api_error(-32006, "Output codec conflicts with active shared encoder");
+        return SBS_ERR_INVAL;
+    }
+
+    LOG_I("reconfiguring shared encoder for output '%s': codec=%s -> %s",
+          output_id ? output_id : "<unknown>", current_codec, codec);
+    cfg.codec = codec;
+    int rc = sbs_encoder_manager_update_config(server->encoder_mgr, &cfg);
+    if (rc != SBS_OK && error)
+        *error = api_error(-32006, "Failed to update shared encoder codec");
+    return rc;
+}
+
 static void output_replace_encoder_from_json(sbs_output_state_t *output, cJSON *encoder_obj)
 {
     cJSON *entry = NULL;
@@ -142,6 +192,7 @@ int sbs_api_handle_output_remove(sbs_api_server_t *server, sbs_api_client_t *cli
     }
     *result = cJSON_CreateObject();
     cJSON_AddBoolToObject(*result, "ok", 1);
+    sbs_config_manager_mark_dirty(server->config, server);
     return SBS_OK;
 }
 
@@ -167,6 +218,7 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
     /* Use encoder manager (shared encoder + tee) when available */
     if (server->encoder_mgr) {
         sbs_sink_branch_config_t sink_cfg = {0};
+        const char *resolved_codec = NULL;
         sink_cfg.output_id = output->id;
 
         const char *sink_type = json_str(params, "sink_type");
@@ -196,6 +248,13 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
         const char *file_container = json_str(params, "file_container");
         sink_cfg.file_container = file_container ? file_container : encoder_str(output->encoder, "file_container", "ts");
 
+        const char *codec = json_str(params, "codec");
+        rc = ensure_shared_encoder_codec(server, output->id, sink_cfg.sink_type,
+            codec ? codec : encoder_str(output->encoder, "codec", NULL),
+            &resolved_codec, error);
+        if (rc != SBS_OK)
+            return rc;
+
         rc = sbs_encoder_manager_add_sink(server->encoder_mgr, &sink_cfg);
         if (rc != SBS_OK) {
             *error = api_error(-32006, "Failed to add output sink branch");
@@ -218,6 +277,8 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
             g_hash_table_insert(output->encoder, g_strdup("rtmp_uri"), g_strdup(sink_cfg.rtmp_uri));
         if (sink_cfg.rtmp_passcode)
             g_hash_table_insert(output->encoder, g_strdup("rtmp_passcode"), g_strdup(sink_cfg.rtmp_passcode));
+        if (resolved_codec && *resolved_codec)
+            g_hash_table_insert(output->encoder, g_strdup("codec"), g_strdup(resolved_codec));
         if (sink_cfg.file_path)
             g_hash_table_insert(output->encoder, g_strdup("file_path"), g_strdup(sink_cfg.file_path));
         if (sink_cfg.file_path_mode)
@@ -388,7 +449,18 @@ int sbs_api_handle_output_update(sbs_api_server_t *server, sbs_api_client_t *cli
             sink_cfg.file_prefix = encoder_str(output->encoder, "file_prefix", "stream");
             sink_cfg.file_container = encoder_str(output->encoder, "file_container", "ts");
 
-            int rc = sbs_encoder_manager_add_sink(server->encoder_mgr, &sink_cfg);
+            int rc = ensure_shared_encoder_codec(server, output->id, sink_cfg.sink_type,
+                encoder_str(output->encoder, "codec", NULL), NULL, NULL);
+            if (rc != SBS_OK) {
+                LOG_W("failed to prepare encoder for output '%s' after config update: %d", id, rc);
+                g_free(output->runtime_state);
+                output->runtime_state = g_strdup("error");
+                sbs_api_server_publish(server, "output.status", sbs_scene_graph_serialize_output_public(output));
+                sbs_config_manager_mark_dirty(server->config, server);
+                return SBS_OK;
+            }
+
+            rc = sbs_encoder_manager_add_sink(server->encoder_mgr, &sink_cfg);
             if (rc != SBS_OK) {
                 LOG_W("failed to restart output '%s' after config update: %d", id, rc);
                 g_free(output->runtime_state);

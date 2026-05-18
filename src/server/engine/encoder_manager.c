@@ -21,9 +21,14 @@
 #include "sbs/log.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <poll.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -43,6 +48,8 @@ typedef struct mux_feed_buffer {
 
 #define SBS_SRT_MUX_AUDIO_WAIT_NS (40ULL * GST_MSECOND)
 #define SBS_SRT_MUX_AUDIO_TOLERANCE_NS (32ULL * GST_MSECOND)
+#define SBS_RTMP_ENDPOINT_CHECK_INTERVAL_US (2 * G_USEC_PER_SEC)
+#define SBS_RTMP_ENDPOINT_CHECK_TIMEOUT_MS 100
 
 typedef struct sink_branch {
     char       *output_id;
@@ -72,6 +79,13 @@ typedef struct sink_branch {
     uint64_t    direct_audio_next_pts_ns;
     uint64_t    direct_audio_buffers_pushed;
     uint64_t    direct_audio_push_failures;
+    gulong      sink_probe_id;
+    gint        sink_buffers_seen;
+    gint        sink_warning_count;
+    gint        sink_error_count;
+    gint64      rtmp_endpoint_checked_us;
+    bool        rtmp_endpoint_reachable;
+    int         rtmp_endpoint_errno;
 
     /* Tee pad references */
     GstPad     *video_tee_pad;   /* request pad on video tee */
@@ -623,6 +637,76 @@ static gboolean on_srt_caller_connecting(GstElement *sink,
           forced_idr ? "scheduled IDR" : "waiting for natural B-frame keyframe",
           gop_pattern, (unsigned long)frames_pushed);
     return TRUE;
+}
+
+static GstPadProbeReturn branch_sink_buffer_probe(GstPad *pad,
+                                                  GstPadProbeInfo *info,
+                                                  gpointer user_data)
+{
+    (void)pad;
+    if ((info->type & GST_PAD_PROBE_TYPE_BUFFER) == 0)
+        return GST_PAD_PROBE_OK;
+
+    sink_branch_t *branch = user_data;
+    if (branch)
+        g_atomic_int_inc(&branch->sink_buffers_seen);
+    return GST_PAD_PROBE_OK;
+}
+
+static bool branch_owns_message_source(const sink_branch_t *branch,
+                                       GstObject *source)
+{
+    if (!branch || !source)
+        return false;
+
+    GstObject *objects[] = {
+        branch->video_queue ? GST_OBJECT(branch->video_queue) : NULL,
+        branch->video_parser ? GST_OBJECT(branch->video_parser) : NULL,
+        branch->video_capsfilter ? GST_OBJECT(branch->video_capsfilter) : NULL,
+        branch->video_pacer ? GST_OBJECT(branch->video_pacer) : NULL,
+        branch->audio_appsrc ? GST_OBJECT(branch->audio_appsrc) : NULL,
+        branch->audio_queue ? GST_OBJECT(branch->audio_queue) : NULL,
+        branch->audio_convert ? GST_OBJECT(branch->audio_convert) : NULL,
+        branch->audio_resample ? GST_OBJECT(branch->audio_resample) : NULL,
+        branch->audio_encoder ? GST_OBJECT(branch->audio_encoder) : NULL,
+        branch->audio_parser ? GST_OBJECT(branch->audio_parser) : NULL,
+        branch->audio_capsfilter ? GST_OBJECT(branch->audio_capsfilter) : NULL,
+        branch->muxer ? GST_OBJECT(branch->muxer) : NULL,
+        branch->sink ? GST_OBJECT(branch->sink) : NULL,
+        branch->srt_pipeline ? GST_OBJECT(branch->srt_pipeline) : NULL,
+        branch->srt_video_appsrc ? GST_OBJECT(branch->srt_video_appsrc) : NULL,
+        branch->srt_audio_appsrc ? GST_OBJECT(branch->srt_audio_appsrc) : NULL,
+    };
+
+    for (size_t i = 0; i < G_N_ELEMENTS(objects); i++) {
+        if (objects[i] == source)
+            return true;
+    }
+    return false;
+}
+
+static void note_branch_bus_message(sbs_encoder_manager_t *mgr,
+                                    GstObject *source,
+                                    bool error)
+{
+    if (!mgr || !source)
+        return;
+
+    pthread_mutex_lock(&mgr->pipeline_mutex);
+    GHashTableIter iter;
+    gpointer value;
+    g_hash_table_iter_init(&iter, mgr->branches);
+    while (g_hash_table_iter_next(&iter, NULL, &value)) {
+        sink_branch_t *branch = value;
+        if (!branch_owns_message_source(branch, source))
+            continue;
+        if (error)
+            g_atomic_int_inc(&branch->sink_error_count);
+        else
+            g_atomic_int_inc(&branch->sink_warning_count);
+        break;
+    }
+    pthread_mutex_unlock(&mgr->pipeline_mutex);
 }
 
 static void ensure_srt_ready(void)
@@ -1194,13 +1278,13 @@ h265_stream_sanitize_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_dat
 static gboolean on_bus_message(GstBus *bus, GstMessage *msg, gpointer user_data)
 {
     (void)bus;
-    (void)user_data;
 
     switch (GST_MESSAGE_TYPE(msg)) {
     case GST_MESSAGE_ERROR: {
         GError *err = NULL;
         gchar *dbg = NULL;
         gst_message_parse_error(msg, &err, &dbg);
+        note_branch_bus_message(user_data, GST_MESSAGE_SRC(msg), true);
         LOG_E("encoder pipeline error from %s: %s (%s)",
               GST_OBJECT_NAME(msg->src), err->message, dbg ? dbg : "");
         g_error_free(err);
@@ -1211,6 +1295,7 @@ static gboolean on_bus_message(GstBus *bus, GstMessage *msg, gpointer user_data)
         GError *err = NULL;
         gchar *dbg = NULL;
         gst_message_parse_warning(msg, &err, &dbg);
+        note_branch_bus_message(user_data, GST_MESSAGE_SRC(msg), false);
         LOG_W("encoder pipeline warning from %s: %s (%s)",
               GST_OBJECT_NAME(msg->src), err->message, dbg ? dbg : "");
         g_error_free(err);
@@ -2073,6 +2158,205 @@ static char *build_rtmp_location(const char *rtmp_uri, const char *rtmp_passcode
     return g_strconcat(rtmp_uri, sep, rtmp_passcode, NULL);
 }
 
+static bool parse_rtmp_endpoint(const char *uri,
+                                char *host,
+                                size_t host_len,
+                                char *service,
+                                size_t service_len)
+{
+    if (!uri || !*uri || !host || host_len == 0 || !service || service_len == 0)
+        return false;
+
+    const char *scheme_end = strstr(uri, "://");
+    const char *authority = scheme_end ? scheme_end + 3 : uri;
+    const char *default_port = "1935";
+    if (scheme_end) {
+        size_t scheme_len = (size_t)(scheme_end - uri);
+        if (scheme_len < 4 || g_ascii_strncasecmp(uri, "rtmp", 4) != 0)
+            return false;
+        if ((scheme_len == 5 && g_ascii_strncasecmp(uri, "rtmps", 5) == 0) ||
+            (scheme_len == 6 && g_ascii_strncasecmp(uri, "rtmpts", 6) == 0)) {
+            default_port = "443";
+        }
+    }
+
+    const char *authority_end = authority + strcspn(authority, "/?#");
+    if (authority == authority_end)
+        return false;
+
+    const char *at = memchr(authority, '@', (size_t)(authority_end - authority));
+    if (at)
+        authority = at + 1;
+
+    const char *host_start = authority;
+    const char *host_end = authority_end;
+    const char *port_start = NULL;
+
+    if (*host_start == '[') {
+        const char *bracket_end = memchr(host_start + 1, ']', (size_t)(authority_end - host_start - 1));
+        if (!bracket_end)
+            return false;
+        host_start++;
+        host_end = bracket_end;
+        if (bracket_end + 1 < authority_end) {
+            if (bracket_end[1] != ':')
+                return false;
+            port_start = bracket_end + 2;
+        }
+    } else {
+        const char *colon = memchr(host_start, ':', (size_t)(authority_end - host_start));
+        if (colon) {
+            if (memchr(colon + 1, ':', (size_t)(authority_end - colon - 1)))
+                return false;
+            host_end = colon;
+            port_start = colon + 1;
+        }
+    }
+
+    if (host_end <= host_start)
+        return false;
+
+    size_t parsed_host_len = (size_t)(host_end - host_start);
+    if (parsed_host_len >= host_len)
+        return false;
+    memcpy(host, host_start, parsed_host_len);
+    host[parsed_host_len] = '\0';
+
+    if (port_start && port_start < authority_end) {
+        size_t port_len = (size_t)(authority_end - port_start);
+        if (port_len == 0 || port_len >= service_len)
+            return false;
+        for (size_t i = 0; i < port_len; i++) {
+            if (!g_ascii_isdigit(port_start[i]))
+                return false;
+        }
+        long port = strtol(port_start, NULL, 10);
+        if (port <= 0 || port > 65535)
+            return false;
+        memcpy(service, port_start, port_len);
+        service[port_len] = '\0';
+    } else {
+        g_strlcpy(service, default_port, service_len);
+    }
+
+    return true;
+}
+
+static bool tcp_endpoint_reachable(const char *host,
+                                   const char *service,
+                                   int timeout_ms,
+                                   int *out_errno)
+{
+    struct addrinfo hints;
+    struct addrinfo *addrs = NULL;
+    int last_errno = ECONNREFUSED;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    int gai = getaddrinfo(host, service, &hints, &addrs);
+    if (gai != 0) {
+        if (out_errno)
+            *out_errno = EHOSTUNREACH;
+        return false;
+    }
+
+    for (struct addrinfo *ai = addrs; ai; ai = ai->ai_next) {
+        int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) {
+            last_errno = errno;
+            continue;
+        }
+
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags >= 0)
+            (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+        int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (rc == 0 || errno == EISCONN) {
+            close(fd);
+            freeaddrinfo(addrs);
+            if (out_errno)
+                *out_errno = 0;
+            return true;
+        }
+
+        if (errno == EINPROGRESS || errno == EWOULDBLOCK) {
+            struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+            do {
+                rc = poll(&pfd, 1, timeout_ms);
+            } while (rc < 0 && errno == EINTR);
+
+            if (rc > 0) {
+                int so_error = 0;
+                socklen_t so_error_len = sizeof(so_error);
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len) == 0) {
+                    if (so_error == 0) {
+                        close(fd);
+                        freeaddrinfo(addrs);
+                        if (out_errno)
+                            *out_errno = 0;
+                        return true;
+                    }
+                    last_errno = so_error;
+                } else {
+                    last_errno = errno;
+                }
+            } else if (rc == 0) {
+                last_errno = ETIMEDOUT;
+            } else {
+                last_errno = errno;
+            }
+        } else {
+            last_errno = errno;
+        }
+
+        close(fd);
+    }
+
+    freeaddrinfo(addrs);
+    if (out_errno)
+        *out_errno = last_errno;
+    return false;
+}
+
+static bool rtmp_endpoint_reachable_cached(sink_branch_t *branch, int *out_errno)
+{
+    if (!branch || !branch->rtmp_uri || !*branch->rtmp_uri) {
+        if (out_errno)
+            *out_errno = EINVAL;
+        return false;
+    }
+
+    gint64 now_us = g_get_monotonic_time();
+    if (branch->rtmp_endpoint_checked_us > 0 &&
+        now_us - branch->rtmp_endpoint_checked_us < SBS_RTMP_ENDPOINT_CHECK_INTERVAL_US) {
+        if (out_errno)
+            *out_errno = branch->rtmp_endpoint_errno;
+        return branch->rtmp_endpoint_reachable;
+    }
+
+    char host[256];
+    char service[6];
+    int check_errno = 0;
+    bool reachable = false;
+    if (!parse_rtmp_endpoint(branch->rtmp_uri, host, sizeof(host), service, sizeof(service))) {
+        check_errno = EINVAL;
+    } else {
+        reachable = tcp_endpoint_reachable(host, service,
+                                           SBS_RTMP_ENDPOINT_CHECK_TIMEOUT_MS,
+                                           &check_errno);
+    }
+
+    branch->rtmp_endpoint_checked_us = now_us;
+    branch->rtmp_endpoint_reachable = reachable;
+    branch->rtmp_endpoint_errno = reachable ? 0 : check_errno;
+    if (out_errno)
+        *out_errno = branch->rtmp_endpoint_errno;
+    return reachable;
+}
+
 static const char *normalized_file_container(const char *container)
 {
     if (container && (strcmp(container, "mkv") == 0 ||
@@ -2694,6 +2978,16 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
                          G_CALLBACK(on_srt_caller_removed), branch);
     }
 
+    if (branch->sink_type && strcmp(branch->sink_type, "rtmp") == 0) {
+        GstPad *sink_pad = gst_element_get_static_pad(sink, "sink");
+        if (sink_pad) {
+            branch->sink_probe_id = gst_pad_add_probe(
+                sink_pad, GST_PAD_PROBE_TYPE_BUFFER,
+                branch_sink_buffer_probe, branch, NULL);
+            gst_object_unref(sink_pad);
+        }
+    }
+
     if (branch->sink_type && strcmp(branch->sink_type, "srt") == 0) {
         g_object_set(vqueue,
             "max-size-buffers", (guint)8,
@@ -2990,6 +3284,14 @@ static void unlink_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch
             gst_object_unref(gate_pad);
         }
         branch->video_gate_probe_id = 0;
+    }
+    if (branch->sink && branch->sink_probe_id != 0) {
+        GstPad *sink_pad = gst_element_get_static_pad(branch->sink, "sink");
+        if (sink_pad) {
+            gst_pad_remove_probe(sink_pad, branch->sink_probe_id);
+            gst_object_unref(sink_pad);
+        }
+        branch->sink_probe_id = 0;
     }
     if (branch->audio_queue && branch->audio_gate_probe_id != 0) {
         GstPad *gate_pad = gst_element_get_static_pad(branch->audio_queue, "sink");
@@ -3586,7 +3888,7 @@ uint32_t sbs_encoder_manager_sink_count(const sbs_encoder_manager_t *mgr)
 }
 
 void sbs_encoder_manager_get_metrics(const sbs_encoder_manager_t *mgr,
-                                      sbs_encoder_manager_metrics_t *metrics)
+                                       sbs_encoder_manager_metrics_t *metrics)
 {
     sbs_encoder_manager_t *mutable_mgr;
 
@@ -3602,6 +3904,117 @@ void sbs_encoder_manager_get_metrics(const sbs_encoder_manager_t *mgr,
     metrics->active_branches = (uint32_t)g_hash_table_size(mutable_mgr->branches);
     metrics->pipeline_active = mutable_mgr->pipeline_active;
     pthread_mutex_unlock(&mutable_mgr->pipeline_mutex);
+}
+
+static cJSON *serialize_branch_health(sink_branch_t *branch)
+{
+    cJSON *obj = cJSON_CreateObject();
+    const char *sink_type = branch && branch->sink_type ? branch->sink_type : "srt";
+    const char *status = "disconnected";
+    const char *reason = "not connected";
+    bool connected = false;
+    bool degraded = false;
+
+    int warnings = branch ? g_atomic_int_get((gint *)&branch->sink_warning_count) : 0;
+    int errors = branch ? g_atomic_int_get((gint *)&branch->sink_error_count) : 0;
+    int sink_buffers = branch ? g_atomic_int_get((gint *)&branch->sink_buffers_seen) : 0;
+    int srt_callers = branch ? g_atomic_int_get((gint *)&branch->srt_caller_count) : 0;
+    uint64_t srt_failures = branch
+        ? branch->srt_sender_send_failures + branch->srt_video_push_failures +
+          branch->direct_audio_push_failures
+        : 0;
+    bool rtmp_endpoint_reachable = false;
+    int rtmp_endpoint_errno = 0;
+
+    if (g_strcmp0(sink_type, "srt") == 0) {
+        if (!branch || !branch->srt_sender_running) {
+            reason = "SRT listener is not running";
+        } else if (srt_callers <= 0) {
+            reason = "waiting for SRT caller";
+        } else if (srt_failures > 0) {
+            status = "degraded";
+            connected = true;
+            degraded = true;
+            reason = "SRT send failures detected";
+        } else if (branch->srt_sender_bytes_sent > 0) {
+            status = "connected";
+            connected = true;
+            reason = "SRT caller streaming";
+        } else {
+            status = "degraded";
+            connected = true;
+            degraded = true;
+            reason = "SRT caller connected, waiting for packets";
+        }
+    } else if (g_strcmp0(sink_type, "rtmp") == 0) {
+        rtmp_endpoint_reachable = rtmp_endpoint_reachable_cached(branch, &rtmp_endpoint_errno);
+        if (!branch || !branch->rtmp_uri || !*branch->rtmp_uri) {
+            reason = "RTMP destination not configured";
+        } else if (!rtmp_endpoint_reachable) {
+            reason = "RTMP endpoint unreachable";
+        } else if (errors > 0) {
+            reason = "RTMP sink error";
+        } else if (warnings > 0 && sink_buffers > 0) {
+            status = "degraded";
+            connected = true;
+            degraded = true;
+            reason = "RTMP sink warnings detected";
+        } else if (sink_buffers > 0) {
+            status = "connected";
+            connected = true;
+            reason = "RTMP sink streaming";
+        } else {
+            status = "degraded";
+            connected = true;
+            degraded = true;
+            reason = "RTMP endpoint reachable, waiting for sink traffic";
+        }
+    } else if (branch) {
+        status = "connected";
+        connected = true;
+        reason = "output branch active";
+    }
+
+    cJSON_AddStringToObject(obj, "sink_type", sink_type);
+    cJSON_AddStringToObject(obj, "status", status);
+    cJSON_AddBoolToObject(obj, "connected", connected);
+    cJSON_AddBoolToObject(obj, "degraded", degraded);
+    cJSON_AddStringToObject(obj, "reason", reason);
+    cJSON_AddNumberToObject(obj, "warnings", warnings);
+    cJSON_AddNumberToObject(obj, "errors", errors);
+    cJSON_AddNumberToObject(obj, "sink_buffers", sink_buffers);
+    if (g_strcmp0(sink_type, "srt") == 0) {
+        cJSON_AddNumberToObject(obj, "callers", srt_callers);
+        cJSON_AddNumberToObject(obj, "bytes_sent", (double)(branch ? branch->srt_sender_bytes_sent : 0));
+        cJSON_AddNumberToObject(obj, "send_failures", (double)srt_failures);
+    } else if (g_strcmp0(sink_type, "rtmp") == 0) {
+        cJSON_AddBoolToObject(obj, "endpoint_reachable", rtmp_endpoint_reachable);
+        cJSON_AddNumberToObject(obj, "endpoint_errno", rtmp_endpoint_errno);
+    }
+    return obj;
+}
+
+cJSON *sbs_encoder_manager_serialize_output_health(const sbs_encoder_manager_t *mgr)
+{
+    cJSON *root = cJSON_CreateObject();
+    sbs_encoder_manager_t *mutable_mgr;
+
+    if (!mgr)
+        return root;
+
+    mutable_mgr = (sbs_encoder_manager_t *)mgr;
+    pthread_mutex_lock(&mutable_mgr->pipeline_mutex);
+    GHashTableIter iter;
+    gpointer key, value;
+    g_hash_table_iter_init(&iter, mutable_mgr->branches);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        sink_branch_t *branch = value;
+        const char *output_id = branch && branch->output_id ? branch->output_id : key;
+        if (output_id)
+            cJSON_AddItemToObject(root, output_id, serialize_branch_health(branch));
+    }
+    pthread_mutex_unlock(&mutable_mgr->pipeline_mutex);
+    return root;
 }
 
 bool sbs_encoder_manager_is_active(const sbs_encoder_manager_t *mgr)

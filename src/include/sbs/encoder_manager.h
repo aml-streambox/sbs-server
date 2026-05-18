@@ -21,6 +21,7 @@
 
 #include "sbs/types.h"
 #include "sbs/ipc.h"
+#include "cjson/cJSON.h"
 
 #include <glib.h>
 #include <stdbool.h>
@@ -156,7 +157,8 @@ uint32_t sbs_encoder_manager_sink_count(const sbs_encoder_manager_t *mgr);
  * Get metrics.
  */
 void sbs_encoder_manager_get_metrics(const sbs_encoder_manager_t *mgr,
-                                      sbs_encoder_manager_metrics_t *metrics);
+                                       sbs_encoder_manager_metrics_t *metrics);
+cJSON *sbs_encoder_manager_serialize_output_health(const sbs_encoder_manager_t *mgr);
 
 /**
  * Check if the encoder pipeline is active.

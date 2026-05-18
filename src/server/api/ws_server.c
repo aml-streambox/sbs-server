@@ -932,6 +932,10 @@ void sbs_api_server_publish_telemetry(sbs_api_server_t *server)
     cJSON_AddNumberToObject(system, "cpu_usage", read_cpu_usage_pubsub());
     cJSON_AddNumberToObject(system, "gpu_usage", sbs_telemetry_read_gpu_usage());
     cJSON_AddBoolToObject(system, "pipeline_slow", pipeline_slow);
+    if (server->encoder_mgr) {
+        cJSON_AddItemToObject(system, "output_health",
+                              sbs_encoder_manager_serialize_output_health(server->encoder_mgr));
+    }
     cJSON_AddItemToObject(system, "preview", preview);
     cJSON_AddItemToObject(system, "audio", audio);
 

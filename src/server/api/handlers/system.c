@@ -167,6 +167,10 @@ int sbs_api_handle_system_get_state(sbs_api_server_t *server, sbs_api_client_t *
     if (server->audio) {
         cJSON_AddItemToObject(*result, "audio", sbs_audio_mixer_serialize_state(server->audio));
     }
+    if (server->encoder_mgr) {
+        cJSON_AddItemToObject(*result, "output_health",
+                              sbs_encoder_manager_serialize_output_health(server->encoder_mgr));
+    }
     cJSON_AddItemToObject(*result, "runtime", serialize_runtime_health(server));
 
     {
@@ -280,6 +284,10 @@ int sbs_api_handle_system_get_state(sbs_api_server_t *server, sbs_api_client_t *
         cJSON_AddNumberToObject(telemetry, "latency_ms", latency_ms);
         cJSON_AddNumberToObject(telemetry, "cpu_usage", read_cpu_usage());
         cJSON_AddNumberToObject(telemetry, "gpu_usage", sbs_telemetry_read_gpu_usage());
+        if (server->encoder_mgr) {
+            cJSON_AddItemToObject(telemetry, "output_health",
+                                  sbs_encoder_manager_serialize_output_health(server->encoder_mgr));
+        }
         if (!have_cached_telemetry) {
             pipeline_slow = frames_dropped > 10 ||
                 (target_fps > 0.0 && compositor_fps > 0.0 && compositor_fps + 0.5 < target_fps) ||

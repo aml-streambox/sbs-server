@@ -63,23 +63,55 @@ uint rotation_quadrant() { return (pc.flags >> FLAG_ROTATION_SHIFT) & 3u; }
 bool flip_horizontal() { return (pc.flags & FLAG_FLIP_HORIZONTAL) != 0u; }
 bool flip_vertical() { return (pc.flags & FLAG_FLIP_VERTICAL) != 0u; }
 
-float direct_hdr_amount() {
-    return (filter_sdr_to_hdr() || filter_hdr_to_sdr()) ? clamp(pc.hdr_to_sdr_amount, 0.0, 1.0) : 0.0;
+float hdr_filter_amount() {
+    if (filter_sdr_to_hdr()) return clamp(pc.hdr_to_sdr_amount, 0.0, 2.0);
+    if (filter_hdr_to_sdr()) return clamp(pc.hdr_to_sdr_amount, 0.0, 1.0);
+    return 0.0;
+}
+
+float expand_sdr_luma(float y, float amount) {
+    float over = clamp(amount - 1.0, 0.0, 1.0);
+    float expanded = pow(clamp(y, 0.0, 1.0), mix(0.72, 0.55, over));
+    expanded = ((expanded - 0.5) * mix(1.10, 1.28, over)) + 0.5 +
+        clamp(pc.hdr_brightness, -0.3, 0.3) * amount;
+    return clamp(expanded, 0.0, 1.0);
 }
 
 float tone_map_y8_value(float y8) {
-    float amount = direct_hdr_amount();
+    float amount = hdr_filter_amount();
     if (amount <= 0.0) return y8;
+
+    if (filter_sdr_to_hdr()) {
+        float y = clamp((y8 - 16.0) / 219.0, 0.0, 1.0);
+        return 16.0 + mix(y, expand_sdr_luma(y, amount), min(amount, 1.0)) * 219.0;
+    }
+
     float contrast = mix(1.0, 1.35, amount);
     float lift = mix(0.0, clamp(pc.hdr_brightness, -0.3, 0.3) * 255.0, amount);
     return clamp((y8 - 128.0) * contrast + 128.0 + lift, 0.0, 255.0);
 }
 
+vec2 rotate_chroma(vec2 cbcr) {
+    return vec2(
+        cbcr.x * pc.hdr_hue_cos - cbcr.y * pc.hdr_hue_sin,
+        cbcr.x * pc.hdr_hue_sin + cbcr.y * pc.hdr_hue_cos);
+}
+
 vec2 tone_map_uv8_values(vec2 uv8) {
-    float amount = direct_hdr_amount();
+    float amount = hdr_filter_amount();
     if (amount <= 0.0) return uv8;
-    float sat = mix(1.0, clamp(pc.hdr_saturation, 0.5, 2.5), amount);
-    return clamp(vec2(128.0) + (uv8 - vec2(128.0)) * sat, 0.0, 255.0);
+
+    vec2 cbcr = uv8 - vec2(128.0);
+    if (filter_sdr_to_hdr()) {
+        float over = clamp(amount - 1.0, 0.0, 1.0);
+        float target_sat = clamp(pc.hdr_saturation, 0.5, 2.5) * mix(1.0, 1.25, over);
+        vec2 adjusted = rotate_chroma(cbcr * target_sat);
+        return clamp(vec2(128.0) + mix(cbcr, adjusted, min(amount, 1.0)), 0.0, 255.0);
+    }
+
+    float target_sat = clamp(pc.hdr_saturation, 0.0, 3.0);
+    vec2 adjusted = rotate_chroma(cbcr * target_sat);
+    return clamp(vec2(128.0) + mix(cbcr, adjusted, amount), 0.0, 255.0);
 }
 
 uint read_u8(uint byte_addr) {

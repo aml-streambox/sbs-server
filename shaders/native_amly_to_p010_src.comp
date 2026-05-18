@@ -31,6 +31,10 @@ layout(push_constant) uniform PushConstants {
     float bg_v;
     uint filter_flags;
     float hdr_to_sdr_amount;
+    float hdr_saturation;
+    float hdr_brightness;
+    float hdr_hue_cos;
+    float hdr_hue_sin;
 } pc;
 
 const uint FILTER_HDR_TO_SDR = 32u;
@@ -87,9 +91,12 @@ uint out_end_for_src(uint s, float inv_scale, uint limit) {
     return uint(clamp(end_f, 0.0, float(limit)));
 }
 
-float direct_hdr_amount() {
-    return ((pc.filter_flags & (FILTER_HDR_TO_SDR | FILTER_SDR_TO_HDR)) != 0u)
-        ? clamp(pc.hdr_to_sdr_amount, 0.0, 1.0) : 0.0;
+float hdr_filter_amount() {
+    if ((pc.filter_flags & FILTER_SDR_TO_HDR) != 0u)
+        return clamp(pc.hdr_to_sdr_amount, 0.0, 2.0);
+    if ((pc.filter_flags & FILTER_HDR_TO_SDR) != 0u)
+        return clamp(pc.hdr_to_sdr_amount, 0.0, 1.0);
+    return 0.0;
 }
 
 float tone_map_luma(float y) {
@@ -97,25 +104,45 @@ float tone_map_luma(float y) {
     return clamp(((1.0 + shoulder) * y) / (y + shoulder), 0.0, 1.0);
 }
 
+float expand_sdr_luma(float y, float amount) {
+    float over = clamp(amount - 1.0, 0.0, 1.0);
+    float expanded = pow(clamp(y, 0.0, 1.0), mix(0.72, 0.55, over));
+    expanded = ((expanded - 0.5) * mix(1.10, 1.28, over)) + 0.5 +
+        clamp(pc.hdr_brightness, -0.3, 0.3) * amount;
+    return clamp(expanded, 0.0, 1.0);
+}
+
+vec2 rotate_chroma(vec2 cbcr) {
+    return vec2(
+        cbcr.x * pc.hdr_hue_cos - cbcr.y * pc.hdr_hue_sin,
+        cbcr.x * pc.hdr_hue_sin + cbcr.y * pc.hdr_hue_cos);
+}
+
 float map_y10(uint y10) {
-    float amount = direct_hdr_amount();
+    float amount = hdr_filter_amount();
     if (amount <= 0.0)
         return float(y10 << 6) / 65535.0;
     float y = clamp((float(y10) - 64.0) / 876.0, 0.0, 1.0);
-    float mapped = mix(y, tone_map_luma(y), amount);
+    bool sdr_to_hdr = (pc.filter_flags & FILTER_SDR_TO_HDR) != 0u;
+    float target = sdr_to_hdr ? expand_sdr_luma(y, amount) : tone_map_luma(y);
+    float mapped = mix(y, target, sdr_to_hdr ? min(amount, 1.0) : amount);
     return ((64.0 + mapped * 876.0) * 64.0) / 65535.0;
 }
 
 vec2 map_uv10(uint u10, uint v10) {
-    float amount = direct_hdr_amount();
+    float amount = hdr_filter_amount();
     if (amount <= 0.0)
         return vec2(float(u10 << 6), float(v10 << 6)) / 65535.0;
-    float sat = ((pc.filter_flags & FILTER_SDR_TO_HDR) != 0u)
-        ? mix(1.0, 1.35, amount)
-        : mix(1.0, 0.82, amount);
     float cb = (float(u10) - 512.0) / 896.0;
     float cr = (float(v10) - 512.0) / 896.0;
-    return ((vec2(512.0) + vec2(cb, cr) * (896.0 * sat)) * 64.0) / 65535.0;
+    bool sdr_to_hdr = (pc.filter_flags & FILTER_SDR_TO_HDR) != 0u;
+    float over = sdr_to_hdr ? clamp(amount - 1.0, 0.0, 1.0) : 0.0;
+    float target_sat = sdr_to_hdr
+        ? clamp(pc.hdr_saturation, 0.5, 2.5) * mix(1.0, 1.25, over)
+        : 0.82;
+    vec2 adjusted = rotate_chroma(vec2(cb, cr) * target_sat);
+    vec2 mapped = mix(vec2(cb, cr), adjusted, sdr_to_hdr ? min(amount, 1.0) : amount);
+    return ((vec2(512.0) + mapped * 896.0) * 64.0) / 65535.0;
 }
 
 void write_luma_rect(uint src_x, uint src_y, float y) {

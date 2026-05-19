@@ -301,6 +301,7 @@ int sbs_api_handle_preview_get_encoder_config(sbs_api_server_t *server,
     cJSON_AddNumberToObject(*result, "width", profile->width);
     cJSON_AddNumberToObject(*result, "height", profile->height);
     cJSON_AddNumberToObject(*result, "downscale_factor", profile->downscale_factor);
+    cJSON_AddBoolToObject(*result, "auto_downscale", profile->auto_downscale);
     cJSON_AddNumberToObject(*result, "framerate", profile->framerate);
     cJSON_AddNumberToObject(*result, "bitrate_kbps", profile->bitrate_kbps);
     cJSON_AddStringToObject(*result, "codec", profile->codec ? profile->codec : "h264");
@@ -315,8 +316,9 @@ int sbs_api_handle_preview_update_encoder_config(sbs_api_server_t *server,
                                                   cJSON **error)
 {
     const char *profile_id = json_str(params, "profile_id");
-    cJSON *width_j, *height_j, *downscale_j, *fps_j, *bitrate_j;
+    cJSON *width_j, *height_j, *downscale_j, *auto_j, *fps_j, *bitrate_j;
     uint32_t downscale_factor = 0, framerate = 0, bitrate_kbps = 0;
+    int auto_downscale = -1;
     int rc;
     (void)client;
 
@@ -325,13 +327,19 @@ int sbs_api_handle_preview_update_encoder_config(sbs_api_server_t *server,
     width_j = cJSON_GetObjectItemCaseSensitive(params, "width");
     height_j = cJSON_GetObjectItemCaseSensitive(params, "height");
     if (width_j || height_j) {
-        *error = api_error(-32602, "Preview resolution is derived from canvas; use downscale_factor 1, 2, 4, 5, 6, or 8");
+        *error = api_error(-32602, "Preview resolution is derived from canvas; use downscale_factor 1, 2, 3, 4, 5, 6, or 8");
         return SBS_ERR_INVAL;
     }
 
     downscale_j = cJSON_GetObjectItemCaseSensitive(params, "downscale_factor");
     if (downscale_j && cJSON_IsNumber(downscale_j))
         downscale_factor = (uint32_t)downscale_j->valuedouble;
+
+    auto_j = cJSON_GetObjectItemCaseSensitive(params, "auto_downscale");
+    if (auto_j && cJSON_IsBool(auto_j))
+        auto_downscale = cJSON_IsTrue(auto_j) ? 1 : 0;
+    else if (downscale_j && cJSON_IsNumber(downscale_j))
+        auto_downscale = 0;
 
     fps_j = cJSON_GetObjectItemCaseSensitive(params, "framerate");
     if (fps_j && cJSON_IsNumber(fps_j))
@@ -342,7 +350,8 @@ int sbs_api_handle_preview_update_encoder_config(sbs_api_server_t *server,
         bitrate_kbps = (uint32_t)bitrate_j->valuedouble;
 
     rc = sbs_preview_engine_update_profile_config(server->preview, profile_id,
-                                                     downscale_factor, framerate, bitrate_kbps);
+                                                     auto_downscale, downscale_factor,
+                                                     framerate, bitrate_kbps);
     if (rc != SBS_OK) {
         *error = api_error(-32011, "Failed to update preview encoder config");
         return rc;

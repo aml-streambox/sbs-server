@@ -300,7 +300,7 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
         cfg.codec = codec ? codec : encoder_str(output->encoder, "codec", "h265");
 
         uint32_t bitrate = (uint32_t)json_num_def(params, "bitrate_kbps", 0);
-        cfg.bitrate_kbps = bitrate ? bitrate : encoder_num(output->encoder, "bitrate_kbps", 20000);
+        cfg.bitrate_kbps = bitrate ? bitrate : encoder_num(output->encoder, "bitrate_kbps", 10000);
 
         const char *sink_type = json_str(params, "sink_type");
         cfg.sink_type = sink_type ? sink_type : encoder_str(output->encoder, "sink_type", "srt");
@@ -482,7 +482,7 @@ int sbs_api_handle_output_update(sbs_api_server_t *server, sbs_api_client_t *cli
             cfg.framerate_num = server->scene_graph->canvas.fps_num;
             cfg.framerate_den = server->scene_graph->canvas.fps_den;
             cfg.codec = encoder_str(output->encoder, "codec", "h265");
-            cfg.bitrate_kbps = encoder_num(output->encoder, "bitrate_kbps", 20000);
+            cfg.bitrate_kbps = encoder_num(output->encoder, "bitrate_kbps", 10000);
             cfg.sink_type = encoder_str(output->encoder, "sink_type", "srt");
             cfg.srt_uri = encoder_str(output->encoder, "srt_uri", "srt://:8888");
             cfg.srt_latency_ms = encoder_num(output->encoder, "srt_latency_ms", 600);

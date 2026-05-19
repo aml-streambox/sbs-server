@@ -262,7 +262,7 @@ static int run_instance_daemon(const char *argv0, sbs_log_level_t level)
     {
         sbs_encoder_config_t enc_cfg = {
             .codec        = "h265",
-            .bitrate_kbps = 20000,
+            .bitrate_kbps = 10000,
             .gop_size     = canvas_fps,
             .gop_pattern  = 0,
             .rc_mode      = 0,

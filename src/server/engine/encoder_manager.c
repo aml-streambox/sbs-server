@@ -119,6 +119,8 @@ typedef struct sink_branch {
     uint16_t        srt_listen_port;
     uint64_t        srt_sender_bytes_sent;
     uint64_t        srt_sender_send_failures;
+    uint64_t        srt_sender_packets_sent;
+    uint64_t        srt_sender_packets_dropped;
 
     pthread_mutex_t mux_feed_mutex;
     pthread_cond_t  mux_feed_cond;
@@ -926,6 +928,8 @@ static int start_custom_srt_sender(sink_branch_t *branch)
     branch->srt_accept_started = false;
     branch->srt_sender_bytes_sent = 0;
     branch->srt_sender_send_failures = 0;
+    branch->srt_sender_packets_sent = 0;
+    branch->srt_sender_packets_dropped = 0;
     pthread_mutex_unlock(&branch->srt_sender_mutex);
 
     if (pthread_create(&branch->srt_accept_thread, NULL,
@@ -992,15 +996,18 @@ static void custom_srt_send_message_locked(sink_branch_t *branch,
     for (gint i = (gint)branch->srt_clients->len - 1; i >= 0; i--) {
         SRTSOCKET client = g_array_index(branch->srt_clients, SRTSOCKET, (guint)i);
         int len = (int)size;
+        uint64_t packets = (uint64_t)((size + SBS_TS_PACKET_SIZE - 1) / SBS_TS_PACKET_SIZE);
         int rc = srt_sendmsg(client, (const char *)data, len, -1, 0);
         if (rc == SRT_ERROR || rc != len) {
             branch->srt_sender_send_failures++;
+            branch->srt_sender_packets_dropped += packets;
             srt_close(client);
             g_array_remove_index_fast(branch->srt_clients, (guint)i);
             if (removed)
                 (*removed)++;
         } else {
             branch->srt_sender_bytes_sent += size;
+            branch->srt_sender_packets_sent += packets;
         }
     }
 }
@@ -3443,7 +3450,7 @@ sbs_encoder_manager_t *sbs_encoder_manager_new(uint32_t width,
     mgr->fps_den = fps_den > 0 ? fps_den : 1;
 
     mgr->codec            = g_strdup(enc_config->codec ? enc_config->codec : "h265");
-    mgr->bitrate_kbps     = enc_config->bitrate_kbps > 0 ? enc_config->bitrate_kbps : 20000;
+    mgr->bitrate_kbps     = enc_config->bitrate_kbps > 0 ? enc_config->bitrate_kbps : 10000;
     mgr->gop_size         = enc_config->gop_size;
     mgr->gop_pattern      = enc_config->gop_pattern;
     mgr->rc_mode          = enc_config->rc_mode;
@@ -3501,7 +3508,7 @@ int sbs_encoder_manager_update_config(sbs_encoder_manager_t *mgr,
 
     /* Check if anything actually changed */
     const char *new_codec = enc_config->codec ? enc_config->codec : "h265";
-    uint32_t new_bitrate = enc_config->bitrate_kbps > 0 ? enc_config->bitrate_kbps : 20000;
+    uint32_t new_bitrate = enc_config->bitrate_kbps > 0 ? enc_config->bitrate_kbps : 10000;
 
     bool codec_changed = (strcmp(mgr->codec, new_codec) != 0);
     bool bitrate_changed = (mgr->bitrate_kbps != new_bitrate);
@@ -3923,10 +3930,14 @@ static cJSON *serialize_branch_health(sink_branch_t *branch)
         ? branch->srt_sender_send_failures + branch->srt_video_push_failures +
           branch->direct_audio_push_failures
         : 0;
+    uint64_t packets_sent = 0;
+    uint64_t packets_dropped = 0;
     bool rtmp_endpoint_reachable = false;
     int rtmp_endpoint_errno = 0;
 
     if (g_strcmp0(sink_type, "srt") == 0) {
+        packets_sent = branch ? branch->srt_sender_packets_sent : 0;
+        packets_dropped = branch ? branch->srt_sender_packets_dropped : 0;
         if (!branch || !branch->srt_sender_running) {
             reason = "SRT listener is not running";
         } else if (srt_callers <= 0) {
@@ -3948,6 +3959,7 @@ static cJSON *serialize_branch_health(sink_branch_t *branch)
         }
     } else if (g_strcmp0(sink_type, "rtmp") == 0) {
         rtmp_endpoint_reachable = rtmp_endpoint_reachable_cached(branch, &rtmp_endpoint_errno);
+        packets_sent = (uint64_t)MAX(sink_buffers, 0);
         if (!branch || !branch->rtmp_uri || !*branch->rtmp_uri) {
             reason = "RTMP destination not configured";
         } else if (!rtmp_endpoint_reachable) {
@@ -3983,6 +3995,12 @@ static cJSON *serialize_branch_health(sink_branch_t *branch)
     cJSON_AddNumberToObject(obj, "warnings", warnings);
     cJSON_AddNumberToObject(obj, "errors", errors);
     cJSON_AddNumberToObject(obj, "sink_buffers", sink_buffers);
+    cJSON_AddNumberToObject(obj, "packets_sent", (double)packets_sent);
+    cJSON_AddNumberToObject(obj, "packets_dropped", (double)packets_dropped);
+    cJSON_AddNumberToObject(obj, "packet_drop_rate",
+                            packets_sent + packets_dropped > 0
+                                ? (double)packets_dropped / (double)(packets_sent + packets_dropped)
+                                : 0.0);
     if (g_strcmp0(sink_type, "srt") == 0) {
         cJSON_AddNumberToObject(obj, "callers", srt_callers);
         cJSON_AddNumberToObject(obj, "bytes_sent", (double)(branch ? branch->srt_sender_bytes_sent : 0));

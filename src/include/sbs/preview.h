@@ -30,6 +30,7 @@ typedef struct sbs_preview_profile {
     uint32_t width;
     uint32_t height;
     uint32_t downscale_factor;
+    bool auto_downscale;
     uint32_t framerate;
     bool hardware_decode_preferred;
     bool requires_additional_encode;
@@ -111,10 +112,11 @@ int sbs_preview_engine_add_webrtc_ice(sbs_preview_engine_t *engine,
                                       const char *candidate);
 
 int sbs_preview_engine_update_profile_config(sbs_preview_engine_t *engine,
-                                                const char *profile_id,
-                                                uint32_t downscale_factor,
-                                                uint32_t framerate,
-                                                uint32_t bitrate_kbps);
+                                                 const char *profile_id,
+                                                 int auto_downscale,
+                                                 uint32_t downscale_factor,
+                                                 uint32_t framerate,
+                                                 uint32_t bitrate_kbps);
 cJSON *sbs_preview_engine_serialize_encoder_config(const sbs_preview_engine_t *engine,
                                                    const char *profile_id);
 int sbs_preview_engine_apply_encoder_config(sbs_preview_engine_t *engine,

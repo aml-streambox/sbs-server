@@ -447,7 +447,7 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
                 cfg.framerate_num = fps_num;
                 cfg.framerate_den = server->scene_graph->canvas.fps_den;
                 cfg.codec         = codec_str  ? codec_str  : "h265";
-                cfg.bitrate_kbps  = brate_str  ? (uint32_t)strtoul(brate_str, NULL, 10) : 20000;
+                cfg.bitrate_kbps  = brate_str  ? (uint32_t)strtoul(brate_str, NULL, 10) : 10000;
                 cfg.sink_type     = sink_type;
                 cfg.srt_uri       = srt_uri;
                 cfg.srt_latency_ms = srt_latency;

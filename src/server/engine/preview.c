@@ -16,7 +16,10 @@
 #endif
 
 #define SBS_PREVIEW_DEFAULT_DOWNSCALE_FACTOR 6u
-#define SBS_PREVIEW_DEFAULT_FRAMERATE 60u
+#define SBS_PREVIEW_DEFAULT_FRAMERATE 30u
+#define SBS_PREVIEW_DEFAULT_BITRATE_KBPS 2500u
+#define SBS_PREVIEW_TARGET_WIDTH 1280u
+#define SBS_PREVIEW_TARGET_HEIGHT 720u
 
 #ifdef SBS_HAVE_GSTREAMER_PREVIEW
 #include <gst/gst.h>
@@ -225,8 +228,42 @@ static const char *kind_name(sbs_preview_profile_kind_t kind)
 
 static bool preview_downscale_factor_allowed(uint32_t factor)
 {
-    return factor == 1u || factor == 2u || factor == 4u || factor == 5u ||
-        factor == 6u || factor == 8u;
+    return factor == 1u || factor == 2u || factor == 3u || factor == 4u ||
+        factor == 5u || factor == 6u || factor == 8u;
+}
+
+static double abs_double(double value)
+{
+    return value < 0.0 ? -value : value;
+}
+
+static uint32_t preview_auto_downscale_factor(uint32_t width, uint32_t height)
+{
+    static const uint32_t allowed[] = { 1u, 2u, 3u, 4u, 5u, 6u, 8u };
+    double target = 1.0;
+    uint32_t best = allowed[0];
+    double best_delta;
+
+    if (width > 0) {
+        double width_factor = (double)width / (double)SBS_PREVIEW_TARGET_WIDTH;
+        if (width_factor > target)
+            target = width_factor;
+    }
+    if (height > 0) {
+        double height_factor = (double)height / (double)SBS_PREVIEW_TARGET_HEIGHT;
+        if (height_factor > target)
+            target = height_factor;
+    }
+
+    best_delta = abs_double((double)best - target);
+    for (size_t i = 1; i < G_N_ELEMENTS(allowed); i++) {
+        double delta = abs_double((double)allowed[i] - target);
+        if (delta < best_delta || (delta == best_delta && allowed[i] > best)) {
+            best = allowed[i];
+            best_delta = delta;
+        }
+    }
+    return best;
 }
 
 static uint32_t preview_downscale_factor_or_default(uint32_t factor)
@@ -352,8 +389,9 @@ sbs_preview_engine_t *sbs_preview_engine_new(void)
             "webrtc", "h264", "rtp", "low",
             480, 270, SBS_PREVIEW_DEFAULT_FRAMERATE, false, true, false, webrtc_requestable,
             "webrtc://signaling");
+        webrtc_profile->auto_downscale = true;
         webrtc_profile->downscale_factor = SBS_PREVIEW_DEFAULT_DOWNSCALE_FACTOR;
-        webrtc_profile->bitrate_kbps = 2500;
+        webrtc_profile->bitrate_kbps = SBS_PREVIEW_DEFAULT_BITRATE_KBPS;
         g_hash_table_insert(engine->profiles, "preview-h264-webrtc", webrtc_profile);
     }
 
@@ -411,7 +449,9 @@ void sbs_preview_engine_set_source_format(sbs_preview_engine_t *engine,
             bool default_fps = profile->framerate == 0 || profile->framerate == old_default_fps;
             bool changed = false;
 
-            profile->downscale_factor = preview_downscale_factor_or_default(profile->downscale_factor);
+            profile->downscale_factor = profile->auto_downscale
+                ? preview_auto_downscale_factor(width, height)
+                : preview_downscale_factor_or_default(profile->downscale_factor);
             compute_preview_size(width, height, profile->downscale_factor,
                                  &new_default_w, &new_default_h);
             profile->requestable = engine->webrtc_requestable;
@@ -885,7 +925,7 @@ static preview_runtime_t *start_webrtc_runtime(sbs_preview_engine_t *engine,
         gst_caps_unref(src_caps);
     }
 
-    uint32_t bitrate = profile->bitrate_kbps ? profile->bitrate_kbps : 2500;
+    uint32_t bitrate = profile->bitrate_kbps ? profile->bitrate_kbps : SBS_PREVIEW_DEFAULT_BITRATE_KBPS;
     {
         sbs_direct_venc_config_t venc_cfg = {
             .codec = codec,
@@ -1748,15 +1788,18 @@ int sbs_preview_engine_add_webrtc_ice(sbs_preview_engine_t *engine,
 /* ── Profile config update ────────────────────────────────────── */
 
 int sbs_preview_engine_update_profile_config(sbs_preview_engine_t *engine,
-                                                const char *profile_id,
-                                                uint32_t downscale_factor,
-                                                uint32_t framerate,
-                                                uint32_t bitrate_kbps)
+                                                 const char *profile_id,
+                                                 int auto_downscale,
+                                                 uint32_t downscale_factor,
+                                                 uint32_t framerate,
+                                                 uint32_t bitrate_kbps)
 {
     sbs_preview_profile_t *profile;
     bool changed = false;
 
     if (!engine || !profile_id)
+        return SBS_ERR_INVAL;
+    if (auto_downscale < -1 || auto_downscale > 1)
         return SBS_ERR_INVAL;
     if (downscale_factor > 0 && !preview_downscale_factor_allowed(downscale_factor))
         return SBS_ERR_INVAL;
@@ -1768,14 +1811,28 @@ int sbs_preview_engine_update_profile_config(sbs_preview_engine_t *engine,
         return SBS_ERR_NOT_FOUND;
     }
 
-    if (downscale_factor > 0 && profile->requires_additional_encode) {
+    if (profile->requires_additional_encode && (auto_downscale >= 0 || downscale_factor > 0)) {
         uint32_t width = 0;
         uint32_t height = 0;
+        uint32_t effective_downscale = downscale_factor;
+        if (auto_downscale >= 0) {
+            bool new_auto = auto_downscale != 0;
+            changed = changed || profile->auto_downscale != new_auto;
+            profile->auto_downscale = new_auto;
+        } else if (downscale_factor > 0) {
+            changed = changed || profile->auto_downscale;
+            profile->auto_downscale = false;
+        }
+        if (profile->auto_downscale)
+            effective_downscale = preview_auto_downscale_factor(engine->src_width, engine->src_height);
+        if (effective_downscale == 0)
+            effective_downscale = profile->downscale_factor;
+        effective_downscale = preview_downscale_factor_or_default(effective_downscale);
         compute_preview_size(engine->src_width, engine->src_height,
-                             downscale_factor, &width, &height);
-        changed = changed || profile->downscale_factor != downscale_factor ||
+                             effective_downscale, &width, &height);
+        changed = changed || profile->downscale_factor != effective_downscale ||
             profile->width != width || profile->height != height;
-        profile->downscale_factor = downscale_factor;
+        profile->downscale_factor = effective_downscale;
         profile->width = width;
         profile->height = height;
     }
@@ -1799,9 +1856,10 @@ int sbs_preview_engine_update_profile_config(sbs_preview_engine_t *engine,
         profile->viewer_count = 0;
     }
 
-    LOG_I("preview profile %s config: %ux%u@%u downscale=%u bitrate=%u kbps",
+    LOG_I("preview profile %s config: %ux%u@%u downscale=%u auto=%d bitrate=%u kbps",
           profile_id, profile->width, profile->height,
-          profile->framerate, profile->downscale_factor, profile->bitrate_kbps);
+          profile->framerate, profile->downscale_factor,
+          profile->auto_downscale ? 1 : 0, profile->bitrate_kbps);
     g_mutex_unlock(&engine->lock);
     return SBS_OK;
 }
@@ -1811,6 +1869,12 @@ static uint32_t json_u32_or_zero(cJSON *obj, const char *key)
     cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
     return cJSON_IsNumber(item) && item->valuedouble > 0.0
         ? (uint32_t)item->valuedouble : 0;
+}
+
+static int json_bool_or_minus_one(cJSON *obj, const char *key)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    return cJSON_IsBool(item) ? (cJSON_IsTrue(item) ? 1 : 0) : -1;
 }
 
 cJSON *sbs_preview_engine_serialize_encoder_config(const sbs_preview_engine_t *engine,
@@ -1834,6 +1898,7 @@ cJSON *sbs_preview_engine_serialize_encoder_config(const sbs_preview_engine_t *e
     obj = cJSON_CreateObject();
     cJSON_AddStringToObject(obj, "profile_id", profile->id);
     cJSON_AddNumberToObject(obj, "downscale_factor", profile->downscale_factor);
+    cJSON_AddBoolToObject(obj, "auto_downscale", profile->auto_downscale);
     cJSON_AddNumberToObject(obj, "framerate", profile->framerate);
     cJSON_AddNumberToObject(obj, "bitrate_kbps", profile->bitrate_kbps);
     g_mutex_unlock((GMutex *)&engine->lock);
@@ -1849,11 +1914,21 @@ int sbs_preview_engine_apply_encoder_config(sbs_preview_engine_t *engine,
     if (!profile_id)
         profile_id = "preview-h264-webrtc";
 
+    int auto_downscale = json_bool_or_minus_one(config, "auto_downscale");
+    uint32_t framerate = json_u32_or_zero(config, "framerate");
+    uint32_t bitrate_kbps = json_u32_or_zero(config, "bitrate_kbps");
+    if (auto_downscale < 0) {
+        auto_downscale = 1;
+        framerate = SBS_PREVIEW_DEFAULT_FRAMERATE;
+        bitrate_kbps = SBS_PREVIEW_DEFAULT_BITRATE_KBPS;
+    }
+
     return sbs_preview_engine_update_profile_config(
         engine, profile_id,
+        auto_downscale,
         json_u32_or_zero(config, "downscale_factor"),
-        json_u32_or_zero(config, "framerate"),
-        json_u32_or_zero(config, "bitrate_kbps"));
+        framerate,
+        bitrate_kbps);
 }
 
 /* ── Telemetry / Serialization ────────────────────────────────── */
@@ -1903,6 +1978,7 @@ cJSON *sbs_preview_serialize_profile(const sbs_preview_profile_t *profile)
     cJSON_AddNumberToObject(resolution, "height", profile->height);
     cJSON_AddItemToObject(obj, "resolution", resolution);
     cJSON_AddNumberToObject(obj, "downscale_factor", profile->downscale_factor);
+    cJSON_AddBoolToObject(obj, "auto_downscale", profile->auto_downscale);
     cJSON_AddNumberToObject(obj, "framerate", profile->framerate);
     cJSON_AddBoolToObject(obj, "hardware_decode_preferred", profile->hardware_decode_preferred);
     cJSON_AddBoolToObject(obj, "requires_additional_encode", profile->requires_additional_encode);

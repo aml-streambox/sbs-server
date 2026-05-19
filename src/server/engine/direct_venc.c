@@ -907,7 +907,7 @@ sbs_direct_venc_t *sbs_direct_venc_new(const sbs_direct_venc_config_t *config)
     enc->height = config->height;
     enc->fps_num = config->fps_num;
     enc->fps_den = config->fps_den > 0 ? config->fps_den : 1;
-    enc->bitrate_kbps = config->bitrate_kbps > 0 ? config->bitrate_kbps : 20000;
+    enc->bitrate_kbps = config->bitrate_kbps > 0 ? config->bitrate_kbps : 10000;
     enc->gop_size = config->gop_size;
     enc->gop_pattern = config->gop_pattern;
     enc->rc_mode = config->rc_mode;

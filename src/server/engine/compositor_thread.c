@@ -26,6 +26,9 @@ static void bp_sync(void)
 #ifndef DRM_FORMAT_NV21
 #define DRM_FORMAT_NV21 0x3132564e
 #endif
+#ifndef DRM_FORMAT_NV12
+#define DRM_FORMAT_NV12 0x3231564e
+#endif
 #ifndef DRM_FORMAT_P010
 #define DRM_FORMAT_P010 0x3031504e
 #endif
@@ -268,7 +271,7 @@ static void capture_transition_cached_entry(sbs_compositor_thread_t *ct)
 }
 
 static bool item_has_vulkan_only_filters(const sbs_compositor_thread_t *ct,
-                                         const sbs_comp_scene_item_t *item)
+                                          const sbs_comp_scene_item_t *item)
 {
     uint32_t direct_yuv_filter_mask = SBS_COMP_FILTER_GRAYSCALE |
         SBS_COMP_FILTER_BRIGHTNESS | SBS_COMP_FILTER_CONTRAST |
@@ -280,6 +283,10 @@ static bool item_has_vulkan_only_filters(const sbs_compositor_thread_t *ct,
 
     if (!item || item->filter_flags == 0)
         return false;
+    if (ct && ct->color_mode == SBS_EXPORT_COLOR_HDR10 &&
+        (item->filter_flags & SBS_COMP_FILTER_SDR_TO_HDR) != 0 &&
+        (item->drm_format == DRM_FORMAT_NV12 || item->drm_format == DRM_FORMAT_NV21))
+        return true;
     if ((item->filter_flags & SBS_COMP_FILTER_LUMA_KEY) &&
         (item->filter_flags & SBS_COMP_FILTER_HDR_TO_SDR_LUT))
         return true;

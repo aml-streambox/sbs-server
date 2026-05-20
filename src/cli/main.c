@@ -66,7 +66,7 @@ int main(int argc, char **argv)
     }
 
     const char *command = argv[1];
-    const char *host = opt_host ? opt_host : "127.0.0.1";
+    const char *host = opt_host ? opt_host : "localhost";
 
     printf("sbs-cli %s\n", SBS_VERSION_STRING);
     printf("Connecting to ws://%s:%d/api ...\n", host, opt_port);

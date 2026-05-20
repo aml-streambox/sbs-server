@@ -519,9 +519,9 @@ static void apply_filter_to_comp_item(const sbs_filter_state_t *filter,
         value = filter->params ? g_hash_table_lookup(filter->params, "amount") : NULL;
         out->filter_params[5] = value ? (float)g_ascii_strtod(value, NULL) : 1.0f;
         value = filter->params ? g_hash_table_lookup(filter->params, "saturation") : NULL;
-        out->hdr_to_sdr_saturation = value ? CLAMP((float)g_ascii_strtod(value, NULL), 0.5f, 2.5f) : 1.35f;
+        out->hdr_to_sdr_saturation = value ? CLAMP((float)g_ascii_strtod(value, NULL), 0.5f, 2.5f) : 1.12f;
         value = filter->params ? g_hash_table_lookup(filter->params, "brightness") : NULL;
-        out->hdr_to_sdr_brightness = value ? CLAMP((float)g_ascii_strtod(value, NULL), -0.3f, 0.3f) : -0.03f;
+        out->hdr_to_sdr_brightness = value ? CLAMP((float)g_ascii_strtod(value, NULL), -0.3f, 0.3f) : 0.0f;
         value = filter->params ? g_hash_table_lookup(filter->params, "hue") : NULL;
         out->hdr_to_sdr_hue_deg = value ? CLAMP((float)g_ascii_strtod(value, NULL), -180.0f, 180.0f) : 0.0f;
     } else if (g_strcmp0(filter->type, "lut") == 0) {

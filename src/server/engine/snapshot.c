@@ -261,7 +261,11 @@ int sbs_snapshot_engine_capture(sbs_snapshot_engine_t *engine,
     cJSON_AddNumberToObject(*metadata, "width", local.msg.width);
     cJSON_AddNumberToObject(*metadata, "height", local.msg.height);
     cJSON_AddStringToObject(*metadata, "path", file);
-    cJSON_AddStringToObject(*metadata, "url", g_strdup_printf("http://127.0.0.1:%u/snapshots/%s.jpg", engine->api_port + 1, id));
+    {
+        char *url = g_strdup_printf("/snapshots/%s.jpg", id);
+        cJSON_AddStringToObject(*metadata, "url", url);
+        g_free(url);
+    }
     cJSON_AddNumberToObject(*metadata, "created_at_us", (double)g_get_monotonic_time());
     g_free(id);
     g_free(dir);

@@ -7753,15 +7753,19 @@ static bool native_item_filters_direct_yuv_compatible(const sbs_comp_scene_item_
 }
 
 static bool native_source_can_direct_yuv(const sbs_compositor_t *comp,
-                                         const sbs_native_canvas_entry_t *entry,
-                                         const sbs_source_texture_t *tex,
-                                         const sbs_comp_scene_item_t *item)
+                                          const sbs_native_canvas_entry_t *entry,
+                                          const sbs_source_texture_t *tex,
+                                          const sbs_comp_scene_item_t *item)
 {
     if (!comp || !entry || !tex ||
         comp->native_p010_direct_pipeline_layout == VK_NULL_HANDLE ||
         !tex->dmabuf_imported || tex->y_buf == VK_NULL_HANDLE)
         return false;
     if (!native_item_filters_direct_yuv_compatible(item, entry->color_mode))
+        return false;
+    if (entry->color_mode == SBS_EXPORT_COLOR_HDR10 && item &&
+        (item->filter_flags & SBS_COMP_FILTER_SDR_TO_HDR) != 0 &&
+        (tex->drm_format == DRM_FORMAT_NV12 || tex->drm_format == DRM_FORMAT_NV21))
         return false;
     if (entry->color_mode == SBS_EXPORT_COLOR_HDR10) {
         if (tex->drm_format == DRM_FORMAT_P010)

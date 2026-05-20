@@ -211,12 +211,47 @@ float hdr_filter_amount() {
     return 0.0;
 }
 
-float expand_sdr_luma(float y, float amount) {
+float bt709_to_linear(float v) {
+    v = clamp(v, 0.0, 1.0);
+    return v < 0.081 ? v / 4.5 : pow((v + 0.099) / 1.099, 1.0 / 0.45);
+}
+
+float nits_to_pq(float nits) {
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 128.0;
+    const float c3 = 2392.0 / 128.0;
+    float p = pow(clamp(nits / 10000.0, 0.0, 1.0), m1);
+    return pow((c1 + c2 * p) / (1.0 + c3 * p), m2);
+}
+
+float sdr_shadow_lift(float y, float over) {
+    return mix(0.010, 0.006, over) *
+        (1.0 - smoothstep(0.02, 0.30, clamp(y, 0.0, 1.0)));
+}
+
+float sdr_highlight_scale(float y, float over) {
+    float t = smoothstep(0.68, 0.98, clamp(y, 0.0, 1.0));
+    return mix(1.0, mix(0.68, 0.78, over), t);
+}
+
+float sdr_midtone_contrast(float pq, float y, float over) {
+    float weight = smoothstep(0.18, 0.42, clamp(y, 0.0, 1.0)) *
+        (1.0 - smoothstep(0.72, 0.90, clamp(y, 0.0, 1.0)));
+    float contrast = 1.0 + 0.035 * weight * mix(1.0, 0.75, over);
+    float pivot = mix(0.420, 0.445, over);
+    return pivot + (pq - pivot) * contrast;
+}
+
+float sdr_to_hdr_luma(float y, float amount) {
     float over = clamp(amount - 1.0, 0.0, 1.0);
-    float expanded = pow(clamp(y, 0.0, 1.0), mix(0.72, 0.55, over));
-    expanded = ((expanded - 0.5) * mix(1.10, 1.28, over)) + 0.5 +
-        clamp(pc.hdr_brightness, -0.3, 0.3) * amount;
-    return clamp(expanded, 0.0, 1.0);
+    float white_nits = mix(160.0, 240.0, over);
+    float pq = nits_to_pq(bt709_to_linear(y) * white_nits * sdr_highlight_scale(y, over));
+    pq = sdr_midtone_contrast(pq, y, over);
+    pq += sdr_shadow_lift(y, over);
+    pq += clamp(pc.hdr_brightness, -0.3, 0.3) * amount * 0.5;
+    return clamp(pq, 0.0, 1.0);
 }
 
 vec2 rotate_chroma(vec2 cbcr) {
@@ -230,7 +265,7 @@ float map_y10(uint y10) {
     if (amount <= 0.0)
         return float(y10 << 6) / 65535.0;
     float y = clamp((float(y10) - 64.0) / 876.0, 0.0, 1.0);
-    float target = filter_sdr_to_hdr() ? expand_sdr_luma(y, amount) : tone_map_luma(y);
+    float target = filter_sdr_to_hdr() ? sdr_to_hdr_luma(y, amount) : tone_map_luma(y);
     float mapped = mix(y, target, filter_sdr_to_hdr() ? min(amount, 1.0) : amount);
     if (!filter_sdr_to_hdr())
         mapped = clamp(mapped + clamp(pc.hdr_brightness, -0.3, 0.3) * amount, 0.0, 1.0);
@@ -245,7 +280,7 @@ vec2 map_uv10(uint u10, uint v10) {
     float cr = (float(v10) - 512.0) / 896.0;
     float over = filter_sdr_to_hdr() ? clamp(amount - 1.0, 0.0, 1.0) : 0.0;
     float target_sat = filter_sdr_to_hdr()
-        ? clamp(pc.hdr_saturation, 0.5, 2.5) * mix(1.0, 1.25, over)
+        ? clamp(pc.hdr_saturation, 0.5, 2.5) * mix(1.0, 1.08, over)
         : 0.82;
     vec2 adjusted = rotate_chroma(vec2(cb, cr) * target_sat);
     vec2 mapped = mix(vec2(cb, cr), adjusted, filter_sdr_to_hdr() ? min(amount, 1.0) : amount);

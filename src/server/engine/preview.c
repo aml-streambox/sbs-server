@@ -352,7 +352,7 @@ static void refresh_urls(sbs_preview_engine_t *engine)
     profile = g_hash_table_lookup(engine->profiles, "program-hevc-srt");
     if (profile) {
         g_free(profile->stream_url);
-        profile->stream_url = g_strdup("srt://127.0.0.1:8888");
+        profile->stream_url = g_strdup("srt://localhost:8888");
     }
 
     /* WebRTC profile has no URL — signaling happens over JSON-RPC */
@@ -381,7 +381,7 @@ sbs_preview_engine_t *sbs_preview_engine_new(void)
         profile_new("program-hevc-srt", SBS_PREVIEW_PROFILE_KIND_REUSE,
                     "srt", "h265", "mpegts", "low",
                     3840, 2160, 60, true, false, true, false,
-                    "srt://127.0.0.1:8888"));
+                    "srt://localhost:8888"));
 
     {
         sbs_preview_profile_t *webrtc_profile = profile_new(

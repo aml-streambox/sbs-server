@@ -109,6 +109,53 @@ float linear_to_bt709(float v) {
     return v < 0.018 ? 4.5 * v : 1.099 * pow(v, 0.45) - 0.099;
 }
 
+float bt709_to_linear(float v) {
+    v = clamp(v, 0.0, 1.0);
+    return v < 0.081 ? v / 4.5 : pow((v + 0.099) / 1.099, 1.0 / 0.45);
+}
+
+float nits_to_pq(float nits) {
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 128.0;
+    const float c3 = 2392.0 / 128.0;
+    float p = pow(clamp(nits / 10000.0, 0.0, 1.0), m1);
+    return pow((c1 + c2 * p) / (1.0 + c3 * p), m2);
+}
+
+vec3 bt709_to_linear(vec3 color) {
+    return vec3(
+        bt709_to_linear(color.r),
+        bt709_to_linear(color.g),
+        bt709_to_linear(color.b));
+}
+
+vec3 nits_to_pq(vec3 nits) {
+    return vec3(
+        nits_to_pq(nits.r),
+        nits_to_pq(nits.g),
+        nits_to_pq(nits.b));
+}
+
+float sdr_shadow_lift(float y, float over) {
+    return mix(0.010, 0.006, over) *
+        (1.0 - smoothstep(0.02, 0.30, clamp(y, 0.0, 1.0)));
+}
+
+float sdr_highlight_scale(float y, float over) {
+    float t = smoothstep(0.68, 0.98, clamp(y, 0.0, 1.0));
+    return mix(1.0, mix(0.68, 0.78, over), t);
+}
+
+vec3 sdr_midtone_contrast(vec3 pq, float y, float over) {
+    float weight = smoothstep(0.18, 0.42, clamp(y, 0.0, 1.0)) *
+        (1.0 - smoothstep(0.72, 0.90, clamp(y, 0.0, 1.0)));
+    float contrast = 1.0 + 0.035 * weight * mix(1.0, 0.75, over);
+    float pivot = mix(0.420, 0.445, over);
+    return vec3(pivot) + (pq - vec3(pivot)) * contrast;
+}
+
 vec3 bt2020_to_bt709(vec3 linear2020) {
     return clamp(vec3(
          1.6605 * linear2020.r - 0.5876 * linear2020.g - 0.0728 * linear2020.b,
@@ -137,11 +184,15 @@ vec3 sdr_to_hdr(vec3 color) {
     float blend = min(amount, 1.0);
     float over = clamp(amount - 1.0, 0.0, 1.0);
     float luma = dot(color, vec3(0.299, 0.587, 0.114));
-    float saturation = mix(1.0, clamp(pc.filter_params_a.x, 0.5, 2.5) * mix(1.0, 1.25, over), blend);
-    float brightness = clamp(pc.filter_params_a.y, -0.3, 0.3) * amount;
+    float saturation = mix(1.0, clamp(pc.filter_params_a.x, 0.5, 2.5) * mix(1.0, 1.08, over), blend);
+    float brightness = clamp(pc.filter_params_a.y, -0.3, 0.3) * amount * 0.5;
+    float white_nits = mix(160.0, 240.0, over);
     color = vec3(luma) + (color - vec3(luma)) * saturation;
-    color = pow(clamp(color, vec3(0.0), vec3(1.0)), vec3(mix(1.0, mix(0.72, 0.55, over), blend)));
-    color = ((color - 0.5) * mix(1.0, mix(1.10, 1.28, over), blend)) + 0.5 + brightness;
+    float mapped_luma = dot(color, vec3(0.299, 0.587, 0.114));
+    vec3 pq_color = nits_to_pq(bt709_to_linear(color) * white_nits * sdr_highlight_scale(mapped_luma, over));
+    pq_color = sdr_midtone_contrast(pq_color, mapped_luma, over);
+    pq_color += vec3(sdr_shadow_lift(mapped_luma, over) + brightness);
+    color = mix(color, pq_color, blend);
     return clamp(color, 0.0, 1.0);
 }
 

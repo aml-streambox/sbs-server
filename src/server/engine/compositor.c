@@ -8680,6 +8680,9 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                     canvas_width, canvas_height, ref_items, ref_count,
                     visible_rects, &visible_rect_count);
             }
+            bool can_targeted_bg_fill_base = targeted_bg_fill && item_base_direct &&
+                tex->drm_format == SBS_DRM_FORMAT_AMLY &&
+                amly_source_pipeline != VK_NULL_HANDLE;
             if (item_rotation == 0 && !item_flipped && !item_has_crop && !split_full_canvas_direct &&
                 ((item_base_direct && tex->drm_format == SBS_DRM_FORMAT_AMLY &&
                   amly_source_pipeline != VK_NULL_HANDLE) ||
@@ -8690,13 +8693,17 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                 dst_x < (int32_t)canvas_width && dst_y < (int32_t)canvas_height &&
                 dst_x + (int32_t)dst_w > 0 && dst_y + (int32_t)dst_h > 0 &&
                 (item->filter_flags & SBS_COMP_FILTER_LUMA_KEY) == 0) {
-                split_direct_layer = native_build_layer_visible_rects(
+                bool layer_was_split = native_build_layer_visible_rects(
                     comp, entry, items, count, i,
                     (sbs_native_rect_t){ dst_x, dst_y,
                                          dst_x + (int32_t)dst_w,
                                          dst_y + (int32_t)dst_h },
                     opacity_scale, scale_x, scale_y, canvas_width, canvas_height,
                     ref_items, ref_count, visible_rects, &visible_rect_count);
+                /* targeted_bg_fill skipped the full-canvas clear; force this
+                 * path so uncovered margins are written even without occluders. */
+                split_direct_layer = layer_was_split ||
+                    (can_targeted_bg_fill_base && visible_rect_count > 0);
             }
 
             VkDescriptorBufferInfo src_buf = {

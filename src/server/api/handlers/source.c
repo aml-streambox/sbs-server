@@ -76,8 +76,6 @@ static cJSON *create_source_kind_json(sbs_source_kind_t kind, bool include_field
         "smpte", "ball", "bars", "snow", "red", "green", "blue", "black", "white",
         "blink", "circular", "pinwheel", "zone-plate", "gamut", "chroma-zone-plate", NULL
     };
-    static const char * const streambox_modes[] = { "hdmirx", "vdin0", "vdin1", "test", NULL };
-    static const char * const streambox_formats[] = { "nv12", "p010", NULL };
     static const char * const vfmcap_formats[] = { "raw", NULL };
     static const char * const text_fonts[] = {
         "Liberation Sans", "Liberation Serif", "Liberation Mono", "Cantarell",
@@ -95,14 +93,6 @@ static cJSON *create_source_kind_json(sbs_source_kind_t kind, bool include_field
         cJSON_AddItemToArray(fields, source_field_string("width", "Width", "1280"));
         cJSON_AddItemToArray(fields, source_field_string("height", "Height", "720"));
         cJSON_AddItemToArray(fields, source_field_string("fps", "FPS", "30"));
-        break;
-    case SBS_SOURCE_KIND_STREAMBOXSRC:
-        cJSON_AddStringToObject(obj, "id", "streamboxsrc");
-        cJSON_AddStringToObject(obj, "name", "StreamBox Capture");
-        cJSON_AddStringToObject(obj, "summary", "Hardware-backed StreamBox capture source");
-        cJSON_AddBoolToObject(obj, "pausable", false);
-        cJSON_AddItemToArray(fields, source_field_select("capture_mode", "Capture Mode", "hdmirx", streambox_modes));
-        cJSON_AddItemToArray(fields, source_field_select("output_format", "Output Format", "nv12", streambox_formats));
         break;
     case SBS_SOURCE_KIND_V4L2SRC:
         cJSON_AddStringToObject(obj, "id", "v4l2src");
@@ -356,7 +346,6 @@ int sbs_api_handle_source_list_kinds(sbs_api_server_t *server, sbs_api_client_t 
     (void)server; (void)client; (void)params; (void)error;
     const sbs_source_kind_t supported[] = {
         SBS_SOURCE_KIND_VIDEOTESTSRC,
-        SBS_SOURCE_KIND_STREAMBOXSRC,
         SBS_SOURCE_KIND_V4L2SRC,
         SBS_SOURCE_KIND_URIDECODEBIN,
         SBS_SOURCE_KIND_IMAGE,
@@ -549,8 +538,7 @@ int sbs_api_handle_source_create(sbs_api_server_t *server, sbs_api_client_t *cli
     }
     create.enabled = true;
 
-    if (create.kind == SBS_SOURCE_KIND_STREAMBOXSRC ||
-        create.kind == SBS_SOURCE_KIND_V4L2SRC ||
+    if (create.kind == SBS_SOURCE_KIND_V4L2SRC ||
         create.kind == SBS_SOURCE_KIND_VFMCAP) {
         create.keep_alive = true;
     } else {

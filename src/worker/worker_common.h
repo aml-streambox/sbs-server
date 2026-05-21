@@ -22,9 +22,9 @@
  * Source-specific configuration fields.
  */
 typedef struct sbs_source_config {
-    char     *source_type;      /* "streamboxsrc", "videotestsrc", "v4l2src", "uridecodebin", "image", "text" */
-    char     *capture_mode;     /* "vfmcap", "vdin1", "v4l2_legacy" (streamboxsrc only) */
-    char     *output_format;    /* "nv12", "p010" (streamboxsrc only) */
+    char     *source_type;      /* "vfmcap", "videotestsrc", "v4l2src", "uridecodebin", "image", "text" */
+    char     *capture_mode;     /* vfmcap color mode */
+    char     *output_format;    /* vfmcap output format */
     char     *pattern;          /* "smpte", "snow", etc. (videotestsrc only) */
     char     *device_path;      /* "/dev/videoN" (v4l2src only) */
     char     *format;           /* V4L2 fourcc, e.g. "NV12", "MJPG" */

@@ -12,8 +12,8 @@
  *
  * Builds a GStreamer pipeline based on config.source.source_type:
  *   - "videotestsrc": test pattern generator (CPU buffers)
- *   - "streamboxsrc": HDMI capture (DMA-BUF)
  *   - "v4l2src": USB camera (DMA-BUF or mmap)
+ *   - "vfmcap": direct HDMI capture path
  *
  * Extracts frames from appsink and sends them to the supervisor via IPC.
  * Runs the GLib main loop until shutdown or pipeline error.

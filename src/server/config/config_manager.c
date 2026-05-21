@@ -622,8 +622,7 @@ static int apply_scene_graph_bundle(sbs_api_server_t *server, cJSON *bundle)
         };
         sbs_source_state_t *source = NULL;
         sbs_scene_graph_create_source(graph, &create, &source);
-        if (source && (create.kind == SBS_SOURCE_KIND_STREAMBOXSRC ||
-                       create.kind == SBS_SOURCE_KIND_V4L2SRC ||
+        if (source && (create.kind == SBS_SOURCE_KIND_V4L2SRC ||
                        create.kind == SBS_SOURCE_KIND_VFMCAP)) {
             source->keep_alive = true;
         }

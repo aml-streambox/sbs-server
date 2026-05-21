@@ -2,7 +2,7 @@
  * SBS - StreamBox Broadcast System
  * Source worker — GStreamer capture pipeline → IPC frame delivery
  *
- * Builds a GStreamer pipeline based on source_type (videotestsrc, streamboxsrc,
+ * Builds a GStreamer pipeline based on source_type (videotestsrc,
  * v4l2src, uridecodebin, image), extracts video frames from appsink, and sends them with DMA-BUF fds
  * (or memfd for CPU buffers) to the supervisor over the IPC socket.
  *
@@ -611,92 +611,6 @@ static GstElement *build_decode_pipeline(sbs_worker_config_t *config, bool freez
 }
 
 /**
- * Build streamboxsrc pipeline:
- *   streamboxsrc source=MODE [output-format=FMT] ! capsfilter ! appsink
- *
- * Native DMA-BUF output from HDMI capture hardware.
- */
-static GstElement *build_streamboxsrc_pipeline(sbs_worker_config_t *config)
-{
-    GstElement *pipeline = gst_pipeline_new("source-pipeline");
-    GstElement *src      = gst_element_factory_make("streamboxsrc", "src");
-    GstElement *sink     = gst_element_factory_make("appsink", "sink");
-
-    if (!pipeline || !src || !sink) {
-        LOG_E("failed to create streamboxsrc pipeline elements (is streamboxsrc available?)");
-        if (pipeline) gst_object_unref(pipeline);
-        if (src) gst_object_unref(src);
-        if (sink) gst_object_unref(sink);
-        return NULL;
-    }
-
-    /* Set capture mode (source property) */
-    const char *capture_mode = config->source.capture_mode;
-    if (capture_mode) {
-        g_object_set(src, "source", capture_mode, NULL);
-    }
-
-    /* Set output format if specified.
-     * The "output-format" property is a GEnum, so g_object_set needs an int.
-     * Passing a string directly would reinterpret the pointer as an int.
-     * Use the nick-to-value conversion via the property's GParamSpec. */
-    const char *output_format = config->source.output_format;
-    if (output_format) {
-        GParamSpec *pspec = g_object_class_find_property(
-            G_OBJECT_GET_CLASS(src), "output-format");
-        if (pspec && G_IS_PARAM_SPEC_ENUM(pspec)) {
-            GEnumClass *eclass = G_PARAM_SPEC_ENUM(pspec)->enum_class;
-            GEnumValue *eval = g_enum_get_value_by_nick(eclass, output_format);
-            if (eval) {
-                g_object_set(src, "output-format", eval->value, NULL);
-                LOG_I("streamboxsrc output-format set to %s (%d)",
-                      eval->value_nick, eval->value);
-            } else {
-                LOG_W("unknown output-format '%s', valid:", output_format);
-                for (uint32_t i = 0; i < eclass->n_values; i++) {
-                    LOG_W("  %s (%d)", eclass->values[i].value_nick,
-                          eclass->values[i].value);
-                }
-            }
-        } else {
-            LOG_W("output-format property not found or not an enum");
-        }
-    }
-
-    /* Apply any additional properties from config JSON */
-    if (config->source.properties) {
-        cJSON *prop = config->source.properties->child;
-        while (prop) {
-            if (cJSON_IsString(prop)) {
-                g_object_set(src, prop->string, prop->valuestring, NULL);
-            } else if (cJSON_IsNumber(prop)) {
-                g_object_set(src, prop->string, (gint)prop->valuedouble, NULL);
-            }
-            prop = prop->next;
-        }
-    }
-
-    /* Configure appsink */
-    g_object_set(sink,
-        "emit-signals", TRUE,
-        "max-buffers",  2,
-        "drop",         TRUE,
-        "sync",         FALSE,  /* No sync for live capture */
-        NULL);
-
-    /* streamboxsrc already produces the correct format and size;
-     * skip videoconvert/videoscale to avoid CPU bottlenecks */
-    gst_bin_add_many(GST_BIN(pipeline), src, sink, NULL);
-    if (!gst_element_link(src, sink)) {
-        LOG_E("failed to link streamboxsrc pipeline");
-        gst_object_unref(pipeline);
-        return NULL;
-    }
-
-    return pipeline;
-}
-
-/**
  * Build v4l2src pipeline:
  *   v4l2src device=PATH io-mode=dmabuf ! capsfilter ! appsink
  */
@@ -1196,8 +1110,7 @@ static GstFlowReturn on_new_sample(GstAppSink *appsink, gpointer user_data)
     bool compressed_v4l2 = source_type && strcmp(source_type, "v4l2src") == 0 &&
         (v4l2_format_is_mjpeg(state->ctx->config.source.format) ||
          v4l2_format_is_h264(state->ctx->config.source.format));
-    bool force_cpu_export = source_type &&
-        (strcmp(source_type, "streamboxsrc") == 0 || strcmp(source_type, "v4l2src") == 0);
+    bool force_cpu_export = source_type && strcmp(source_type, "v4l2src") == 0;
 
     sbs_video_frame_msg_t msg;
     sbs_video_frame_msg_init(&msg, SBS_IPC_MSG_VIDEO_FRAME);
@@ -1239,8 +1152,8 @@ static GstFlowReturn on_new_sample(GstAppSink *appsink, gpointer user_data)
         return GST_FLOW_OK;
     }
 
-    /* Fill detailed plane info from caps — always do this for streamboxsrc
-     * since the actual capture resolution may differ from the canvas config. */
+    /* Fill detailed plane info from caps since source resolution may differ
+     * from the canvas config. */
     fill_frame_from_caps(&msg, caps);
 
     if (msg.width != state->ctx->config.width || msg.height != state->ctx->config.height) {
@@ -2495,8 +2408,6 @@ int source_worker_run(sbs_worker_ctx_t *ctx)
         state.pipeline = build_decode_pipeline(&ctx->config, true);
     } else if (strcmp(source_type, "uridecodebin") == 0) {
         state.pipeline = build_decode_pipeline(&ctx->config, false);
-    } else if (strcmp(source_type, "streamboxsrc") == 0) {
-        state.pipeline = build_streamboxsrc_pipeline(&ctx->config);
     } else if (strcmp(source_type, "v4l2src") == 0) {
         state.pipeline = build_v4l2src_pipeline(&ctx->config);
     } else {

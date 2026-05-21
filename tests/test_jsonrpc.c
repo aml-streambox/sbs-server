@@ -147,7 +147,7 @@ SBS_TEST_FIXTURE(jsonrpc, source_catalog_lists_supported_kinds, setup_api, teard
         &response), SBS_OK);
     SBS_ASSERT_NOT_NULL(response);
     SBS_ASSERT(strstr(response, "videotestsrc") != NULL);
-    SBS_ASSERT(strstr(response, "streamboxsrc") != NULL);
+    SBS_ASSERT(strstr(response, "streamboxsrc") == NULL);
     SBS_ASSERT(strstr(response, "text") != NULL);
     SBS_ASSERT(strstr(response, "vfmcap") != NULL);
     free(response);

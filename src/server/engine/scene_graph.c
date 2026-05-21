@@ -677,7 +677,6 @@ static void fill_comp_item(const sbs_canvas_state_t *canvas,
 const char *sbs_scene_graph_source_kind_name(sbs_source_kind_t kind)
 {
     switch (kind) {
-    case SBS_SOURCE_KIND_STREAMBOXSRC: return "streamboxsrc";
     case SBS_SOURCE_KIND_V4L2SRC: return "v4l2src";
     case SBS_SOURCE_KIND_URIDECODEBIN: return "uridecodebin";
     case SBS_SOURCE_KIND_VIDEOTESTSRC: return "videotestsrc";
@@ -693,7 +692,6 @@ bool sbs_scene_graph_parse_source_kind(const char *type, sbs_source_kind_t *out_
 {
     if (!out_kind) return false;
     if (!type || strcmp(type, "videotestsrc") == 0) *out_kind = SBS_SOURCE_KIND_VIDEOTESTSRC;
-    else if (strcmp(type, "streamboxsrc") == 0) *out_kind = SBS_SOURCE_KIND_STREAMBOXSRC;
     else if (strcmp(type, "v4l2src") == 0) *out_kind = SBS_SOURCE_KIND_V4L2SRC;
     else if (strcmp(type, "uridecodebin") == 0) *out_kind = SBS_SOURCE_KIND_URIDECODEBIN;
     else if (strcmp(type, "image") == 0) *out_kind = SBS_SOURCE_KIND_IMAGE;

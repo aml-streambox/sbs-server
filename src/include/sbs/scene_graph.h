@@ -19,14 +19,13 @@ typedef enum sbs_scene_color_mode {
 } sbs_scene_color_mode_t;
 
 typedef enum sbs_source_kind {
-    SBS_SOURCE_KIND_STREAMBOXSRC = 0,
-    SBS_SOURCE_KIND_V4L2SRC = 1,
-    SBS_SOURCE_KIND_URIDECODEBIN = 2,
-    SBS_SOURCE_KIND_VIDEOTESTSRC = 3,
-    SBS_SOURCE_KIND_IMAGE = 4,
-    SBS_SOURCE_KIND_TEXT = 5,
-    SBS_SOURCE_KIND_VFMCAP = 6,
-    SBS_SOURCE_KIND_ALSA_AUDIO = 7,
+    SBS_SOURCE_KIND_V4L2SRC = 0,
+    SBS_SOURCE_KIND_URIDECODEBIN = 1,
+    SBS_SOURCE_KIND_VIDEOTESTSRC = 2,
+    SBS_SOURCE_KIND_IMAGE = 3,
+    SBS_SOURCE_KIND_TEXT = 4,
+    SBS_SOURCE_KIND_VFMCAP = 5,
+    SBS_SOURCE_KIND_ALSA_AUDIO = 6,
 } sbs_source_kind_t;
 
 typedef enum sbs_transition_kind {

@@ -31,7 +31,7 @@ typedef struct sbs_api_server sbs_api_server_t;
  */
 typedef struct sbs_source_start_config {
     const char *source_id;       /* Unique source ID */
-    const char *source_type;     /* "videotestsrc", "streamboxsrc", "v4l2src", "image", "uridecodebin", "text" */
+    const char *source_type;     /* "videotestsrc", "vfmcap", "v4l2src", "image", "uridecodebin", "text" */
     uint32_t    width;
     uint32_t    height;
     uint32_t    framerate_num;
@@ -39,8 +39,8 @@ typedef struct sbs_source_start_config {
 
     /* Source-type-specific fields (optional, may be NULL/0) */
     const char *pattern;         /* videotestsrc pattern name */
-    const char *capture_mode;    /* streamboxsrc capture mode */
-    const char *output_format;   /* streamboxsrc output format */
+    const char *capture_mode;    /* vfmcap color mode */
+    const char *output_format;   /* vfmcap output format */
     const char *device_path;     /* v4l2src device path */
     const char *format;          /* v4l2src selected fourcc */
     const char *framerate;       /* v4l2src selected rate, e.g. "30/1" */

@@ -135,6 +135,13 @@ sbs_audio_buffer_t *sbs_audio_mixer_take_latest_buffer(sbs_audio_mixer_t *audio)
 #else
 
 #define SBS_AUDIO_PENDING_MAX 256u
+#define SBS_AUDIO_SILENCE_SAMPLE_RATE 48000u
+#define SBS_AUDIO_SILENCE_CHANNELS 2u
+#define SBS_AUDIO_SILENCE_SAMPLES 480u
+#define SBS_AUDIO_SILENCE_INTERVAL_US 10000u
+#define SBS_AUDIO_SILENCE_DURATION_NS 10000000ull
+#define SBS_AUDIO_SILENCE_DATA_SIZE \
+    (SBS_AUDIO_SILENCE_SAMPLES * SBS_AUDIO_SILENCE_CHANNELS * sizeof(int16_t))
 
 static void ensure_gstreamer_audio_ready(void)
 {
@@ -235,6 +242,8 @@ struct sbs_audio_mixer {
     uint64_t popped_buffers;
     uint64_t dropped_buffers;
     uint64_t dropped_samples;
+    uint64_t silence_buffers_generated;
+    gint64 silence_next_emit_us;
     gint64 last_queue_log_us;
     double master_volume_value;
     double master_left_gain;
@@ -447,6 +456,43 @@ static GstFlowReturn on_audio_sample(GstAppSink *sink, gpointer user_data)
     gst_buffer_unmap(buffer, &map);
     gst_sample_unref(sample);
     return GST_FLOW_OK;
+}
+
+static sbs_audio_buffer_t *make_silent_master_buffer(void)
+{
+    sbs_audio_buffer_t *abuf = g_malloc0(sizeof(*abuf) + SBS_AUDIO_SILENCE_DATA_SIZE);
+    abuf->msg.header.msg_type = SBS_IPC_MSG_AUDIO_BUFFER;
+    abuf->msg.header.payload_size = sizeof(abuf->msg) - sizeof(abuf->msg.header) +
+                                     SBS_AUDIO_SILENCE_DATA_SIZE;
+    abuf->msg.pts_ns = UINT64_MAX;
+    abuf->msg.duration_ns = SBS_AUDIO_SILENCE_DURATION_NS;
+    abuf->msg.sample_rate = SBS_AUDIO_SILENCE_SAMPLE_RATE;
+    abuf->msg.channels = SBS_AUDIO_SILENCE_CHANNELS;
+    abuf->msg.format = SBS_AUDIO_FORMAT_S16LE;
+    abuf->msg.n_samples = SBS_AUDIO_SILENCE_SAMPLES;
+    abuf->msg.data_size = SBS_AUDIO_SILENCE_DATA_SIZE;
+    return abuf;
+}
+
+static bool should_emit_silent_master_buffer(sbs_audio_mixer_t *audio, gint64 now_us)
+{
+    if (!audio)
+        return false;
+
+    if (audio->silence_next_emit_us == 0 ||
+        now_us > audio->silence_next_emit_us + 10 * SBS_AUDIO_SILENCE_INTERVAL_US) {
+        audio->silence_next_emit_us = now_us;
+    }
+
+    if (now_us < audio->silence_next_emit_us)
+        return false;
+
+    audio->silence_next_emit_us += SBS_AUDIO_SILENCE_INTERVAL_US;
+    audio->silence_buffers_generated++;
+    audio->master_meter.level_db = -120.0;
+    audio->master_meter.peak_db = -120.0;
+    audio->master_meter.timestamp_us = now_us;
+    return true;
 }
 
 static sbs_audio_branch_t *add_branch_for_binding(sbs_audio_mixer_t *audio,
@@ -930,6 +976,7 @@ cJSON *sbs_audio_mixer_serialize_state(sbs_audio_mixer_t *audio)
 sbs_audio_buffer_t *sbs_audio_mixer_take_latest_buffer(sbs_audio_mixer_t *audio)
 {
     sbs_audio_buffer_t *buf;
+    bool emit_silence = false;
     if (!audio) return NULL;
     g_mutex_lock(&audio->lock);
     buf = audio->pending_buffers ? g_queue_pop_head(audio->pending_buffers) : NULL;
@@ -937,8 +984,12 @@ sbs_audio_buffer_t *sbs_audio_mixer_take_latest_buffer(sbs_audio_mixer_t *audio)
         audio->pending_samples -= MIN(audio->pending_samples,
                                       (uint64_t)buf->msg.n_samples);
         audio->popped_buffers++;
+    } else {
+        emit_silence = should_emit_silent_master_buffer(audio, g_get_monotonic_time());
     }
     g_mutex_unlock(&audio->lock);
+    if (emit_silence)
+        return make_silent_master_buffer();
     return buf;
 }
 

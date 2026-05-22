@@ -45,6 +45,7 @@ typedef struct mux_feed_buffer {
 
 #define SBS_SRT_MUX_AUDIO_WAIT_NS (40ULL * GST_MSECOND)
 #define SBS_SRT_MUX_AUDIO_TOLERANCE_NS (32ULL * GST_MSECOND)
+#define SBS_SRT_MUX_AUDIO_MISSING_MAX_WAITS 5u
 
 typedef struct sink_branch {
     char       *output_id;
@@ -123,6 +124,8 @@ typedef struct sink_branch {
     bool            mux_audio_coverage_valid;
     GstClockTime    mux_audio_pushed_until_ns;
     uint64_t        mux_audio_wait_warnings;
+    uint64_t        mux_audio_missing_waits;
+    gint            mux_video_only_mode;
     GQueue         *mux_video_queue;
     GQueue         *mux_audio_queue;
 
@@ -247,20 +250,6 @@ static GstFlowReturn on_srt_ts_sample(GstAppSink *appsink, gpointer user_data);
 static int  start_custom_srt_sender(sink_branch_t *branch);
 static void stop_custom_srt_sender(sink_branch_t *branch);
 
-static bool srt_gop_pattern_has_bframes(int32_t gop_pattern)
-{
-    switch (gop_pattern) {
-    case 1:
-    case 2:
-    case 3:
-    case 6:
-    case 7:
-        return true;
-    default:
-        return false;
-    }
-}
-
 static bool schedule_srt_late_join_keyframe(sink_branch_t *branch,
                                             int32_t *gop_pattern_out,
                                             uint64_t *frames_pushed_out)
@@ -278,9 +267,8 @@ static bool schedule_srt_late_join_keyframe(sink_branch_t *branch,
     pthread_mutex_lock(&mgr->pipeline_mutex);
     gop_pattern = mgr->gop_pattern;
     frames_pushed = mgr->frames_pushed;
-    force_idr = !srt_gop_pattern_has_bframes(gop_pattern) || frames_pushed == 0;
-    if (force_idr)
-        mgr->force_next_idr = true;
+    force_idr = true;
+    mgr->force_next_idr = true;
     pthread_mutex_unlock(&mgr->pipeline_mutex);
 
     if (gop_pattern_out)
@@ -376,6 +364,8 @@ static void mux_feed_reset_locked(sink_branch_t *branch)
     branch->mux_audio_coverage_valid = false;
     branch->mux_audio_pushed_until_ns = 0;
     branch->mux_audio_wait_warnings = 0;
+    branch->mux_audio_missing_waits = 0;
+    g_atomic_int_set(&branch->mux_video_only_mode, FALSE);
 }
 
 static void mux_feed_enqueue_buffer(sink_branch_t *branch,
@@ -437,9 +427,20 @@ static void *mux_feed_thread_main(void *data)
             bool audio_covers_video = branch->mux_audio_coverage_valid &&
                 branch->mux_audio_pushed_until_ns + SBS_SRT_MUX_AUDIO_TOLERANCE_NS >= video->pts_time;
             if (!audio_covers_video && !audio) {
-                mux_feed_timedwait_ns(branch, SBS_SRT_MUX_AUDIO_WAIT_NS);
-                pthread_mutex_unlock(&branch->mux_feed_mutex);
-                continue;
+                if (branch->mux_audio_missing_waits < SBS_SRT_MUX_AUDIO_MISSING_MAX_WAITS) {
+                    branch->mux_audio_missing_waits++;
+                    mux_feed_timedwait_ns(branch, SBS_SRT_MUX_AUDIO_WAIT_NS);
+                    pthread_mutex_unlock(&branch->mux_feed_mutex);
+                    continue;
+                }
+                if (!g_atomic_int_get(&branch->mux_video_only_mode)) {
+                    g_atomic_int_set(&branch->mux_video_only_mode, TRUE);
+                    LOG_W("SRT session '%s' has no audio after %ums; feeding video-only until audio resumes",
+                          branch->output_id ? branch->output_id : "<unknown>",
+                          (unsigned)(SBS_SRT_MUX_AUDIO_MISSING_MAX_WAITS *
+                                     (SBS_SRT_MUX_AUDIO_WAIT_NS / GST_MSECOND)));
+                }
+                branch->mux_audio_missing_waits++;
             } else if (!audio_covers_video && audio && audio->sort_time > video->pts_time) {
                 branch->mux_audio_wait_warnings++;
                 if (branch->mux_audio_wait_warnings <= 5 ||
@@ -452,6 +453,8 @@ static void *mux_feed_thread_main(void *data)
                           (unsigned long)(branch->mux_audio_coverage_valid
                               ? branch->mux_audio_pushed_until_ns : 0));
                 }
+            } else {
+                branch->mux_audio_missing_waits = 0;
             }
 
             if (!item)
@@ -515,11 +518,13 @@ static void *mux_feed_thread_main(void *data)
                     end += duration;
 
                 pthread_mutex_lock(&branch->mux_feed_mutex);
+                branch->mux_audio_missing_waits = 0;
                 if (!branch->mux_audio_coverage_valid || end > branch->mux_audio_pushed_until_ns) {
                     branch->mux_audio_coverage_valid = true;
                     branch->mux_audio_pushed_until_ns = end;
                 }
                 pthread_mutex_unlock(&branch->mux_feed_mutex);
+                g_atomic_int_set(&branch->mux_video_only_mode, FALSE);
 
                 branch->direct_audio_buffers_pushed++;
                 if (branch->direct_audio_buffers_pushed <= 3 ||
@@ -777,12 +782,22 @@ static void custom_srt_client_connected(sink_branch_t *branch,
         return;
 
     g_atomic_int_set(&branch->srt_caller_count, (gint)caller_count);
+    if (caller_count == 1) {
+        pthread_mutex_lock(&branch->srt_sender_mutex);
+        if (branch->srt_video_ts_backlog)
+            g_byte_array_set_size(branch->srt_video_ts_backlog, 0);
+        if (branch->srt_ts_input)
+            g_byte_array_set_size(branch->srt_ts_input, 0);
+        if (branch->srt_send_payload)
+            g_byte_array_set_size(branch->srt_send_payload, 0);
+        pthread_mutex_unlock(&branch->srt_sender_mutex);
+    }
     int32_t gop_pattern = -1;
     uint64_t frames_pushed = 0;
     bool forced_idr = custom_srt_schedule_keyframe(branch, &gop_pattern, &frames_pushed);
     LOG_I("custom SRT caller %d connected; callers=%u %s (gop_pattern=%d frames_pushed=%lu)",
           (int)client, caller_count,
-          forced_idr ? "scheduled IDR" : "waiting for natural B-frame keyframe",
+          forced_idr ? "scheduled IDR" : "waiting for keyframe",
           gop_pattern, (unsigned long)frames_pushed);
 }
 
@@ -1091,9 +1106,15 @@ static void custom_srt_send_interleaved_locked(sink_branch_t *branch,
         pid = ts_packet_pid(packet);
         if (pid == SBS_TS_VIDEO_PID) {
             g_byte_array_append(branch->srt_video_ts_backlog, packet, SBS_TS_PACKET_SIZE);
-            while (branch->srt_video_ts_backlog->len / SBS_TS_PACKET_SIZE >
-                   SBS_SRT_VIDEO_BACKLOG_MAX_PACKETS) {
-                custom_srt_send_video_backlog_locked(branch, 7, removed);
+            if (g_atomic_int_get(&branch->mux_video_only_mode)) {
+                custom_srt_send_video_backlog_locked(branch,
+                                                    SBS_SRT_VIDEO_DRAIN_AFTER_AUDIO_PACKETS,
+                                                    removed);
+            } else {
+                while (branch->srt_video_ts_backlog->len / SBS_TS_PACKET_SIZE >
+                       SBS_SRT_VIDEO_BACKLOG_MAX_PACKETS) {
+                    custom_srt_send_video_backlog_locked(branch, 7, removed);
+                }
             }
         } else if (pid == SBS_TS_AUDIO_PID) {
             custom_srt_send_bytes_locked(branch, packet, SBS_TS_PACKET_SIZE, removed);

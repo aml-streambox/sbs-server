@@ -479,6 +479,11 @@ static bool should_emit_silent_master_buffer(sbs_audio_mixer_t *audio, gint64 no
     if (!audio)
         return false;
 
+    if (audio->branches && g_hash_table_size(audio->branches) > 0) {
+        audio->silence_next_emit_us = 0;
+        return false;
+    }
+
     if (audio->silence_next_emit_us == 0 ||
         now_us > audio->silence_next_emit_us + 10 * SBS_AUDIO_SILENCE_INTERVAL_US) {
         audio->silence_next_emit_us = now_us;

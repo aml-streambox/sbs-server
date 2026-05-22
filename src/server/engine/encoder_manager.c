@@ -2730,7 +2730,7 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
             caps = gst_caps_new_simple("audio/mpeg",
                 "framed",        G_TYPE_BOOLEAN, TRUE,
                 "mpegversion",   G_TYPE_INT, 4,
-                "stream-format", G_TYPE_STRING, "adts",
+                "stream-format", G_TYPE_STRING, "raw",
                 NULL);
         }
         if (acapsfilter)

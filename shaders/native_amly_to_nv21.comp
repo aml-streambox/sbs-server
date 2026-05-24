@@ -47,6 +47,7 @@ const uint FLAG_SRC_RECT_OFFSET = 32u;
 const uint FLAG_ROTATION_SHIFT = 8u;
 const uint FLAG_FLIP_HORIZONTAL = 1u << 10u;
 const uint FLAG_FLIP_VERTICAL = 1u << 11u;
+const uint FLAG_CHROMA_ONLY = 1u << 12u;
 const uint FILTER_GRAYSCALE = 1u;
 const uint FILTER_BRIGHTNESS = 2u;
 const uint FILTER_CONTRAST = 4u;
@@ -64,6 +65,7 @@ uint rotation_quadrant() { return (pc.flags >> FLAG_ROTATION_SHIFT) & 3u; }
 bool flip_horizontal() { return (pc.flags & FLAG_FLIP_HORIZONTAL) != 0u; }
 bool flip_vertical() { return (pc.flags & FLAG_FLIP_VERTICAL) != 0u; }
 bool source_flipped() { return flip_horizontal() || flip_vertical(); }
+bool chroma_only() { return (pc.flags & FLAG_CHROMA_ONLY) != 0u; }
 
 float luma_key_alpha(float y) {
     if (!luma_key_enabled())
@@ -76,6 +78,8 @@ float luma_key_alpha(float y) {
 }
 
 void store_y_alpha(ivec2 dst, float y, float alpha) {
+    if (chroma_only())
+        return;
     alpha = clamp(alpha, 0.0, 1.0);
     if (alpha <= 0.0)
         return;
@@ -378,10 +382,12 @@ void main() {
                 read_uv10_at(pair_x, row1, u1, v1);
             }
 
-            imageStore(y_img, dst_base, vec4(map_y10(y00, hdr_enabled), 0.0, 0.0, 1.0));
-            imageStore(y_img, dst_base + ivec2(1, 0), vec4(map_y10(y10, hdr_enabled), 0.0, 0.0, 1.0));
-            imageStore(y_img, dst_base + ivec2(0, 1), vec4(map_y10(y01, hdr_enabled), 0.0, 0.0, 1.0));
-            imageStore(y_img, dst_base + ivec2(1, 1), vec4(map_y10(y11, hdr_enabled), 0.0, 0.0, 1.0));
+            if (!chroma_only()) {
+                imageStore(y_img, dst_base, vec4(map_y10(y00, hdr_enabled), 0.0, 0.0, 1.0));
+                imageStore(y_img, dst_base + ivec2(1, 0), vec4(map_y10(y10, hdr_enabled), 0.0, 0.0, 1.0));
+                imageStore(y_img, dst_base + ivec2(0, 1), vec4(map_y10(y01, hdr_enabled), 0.0, 0.0, 1.0));
+                imageStore(y_img, dst_base + ivec2(1, 1), vec4(map_y10(y11, hdr_enabled), 0.0, 0.0, 1.0));
+            }
 
             uint u_avg = (u0 + u1 + 1u) >> 1;
             uint v_avg = (v0 + v1 + 1u) >> 1;
@@ -402,10 +408,12 @@ void main() {
         decode_pair(base.y * pairs_per_row() + pair_x, y00, u0, y10, v0);
         decode_pair((base.y + 1u) * pairs_per_row() + pair_x, y01, u1, y11, v1);
 
-        imageStore(y_img, dst_base, vec4(map_y10(y00, hdr_enabled), 0.0, 0.0, 1.0));
-        imageStore(y_img, dst_base + ivec2(1, 0), vec4(map_y10(y10, hdr_enabled), 0.0, 0.0, 1.0));
-        imageStore(y_img, dst_base + ivec2(0, 1), vec4(map_y10(y01, hdr_enabled), 0.0, 0.0, 1.0));
-        imageStore(y_img, dst_base + ivec2(1, 1), vec4(map_y10(y11, hdr_enabled), 0.0, 0.0, 1.0));
+        if (!chroma_only()) {
+            imageStore(y_img, dst_base, vec4(map_y10(y00, hdr_enabled), 0.0, 0.0, 1.0));
+            imageStore(y_img, dst_base + ivec2(1, 0), vec4(map_y10(y10, hdr_enabled), 0.0, 0.0, 1.0));
+            imageStore(y_img, dst_base + ivec2(0, 1), vec4(map_y10(y01, hdr_enabled), 0.0, 0.0, 1.0));
+            imageStore(y_img, dst_base + ivec2(1, 1), vec4(map_y10(y11, hdr_enabled), 0.0, 0.0, 1.0));
+        }
 
         uint u_avg = (u0 + u1 + 1u) >> 1;
         uint v_avg = (v0 + v1 + 1u) >> 1;
@@ -426,13 +434,15 @@ void main() {
         decode_pair(src_y0 * pairs_per_row() + pair_x, y00, u0, y10, v0);
         decode_pair((src_y0 + 1u) * pairs_per_row() + pair_x, y01, u1, y11, v1);
 
-        imageStore(y_img, dst_base, vec4(map_y10(y00, hdr_enabled), 0.0, 0.0, 1.0));
-        if (base.x + 1u < limit_w)
-            imageStore(y_img, dst_base + ivec2(1, 0), vec4(map_y10(y10, hdr_enabled), 0.0, 0.0, 1.0));
-        if (base.y + 1u < limit_h) {
-            imageStore(y_img, dst_base + ivec2(0, 1), vec4(map_y10(y01, hdr_enabled), 0.0, 0.0, 1.0));
+        if (!chroma_only()) {
+            imageStore(y_img, dst_base, vec4(map_y10(y00, hdr_enabled), 0.0, 0.0, 1.0));
             if (base.x + 1u < limit_w)
-                imageStore(y_img, dst_base + ivec2(1, 1), vec4(map_y10(y11, hdr_enabled), 0.0, 0.0, 1.0));
+                imageStore(y_img, dst_base + ivec2(1, 0), vec4(map_y10(y10, hdr_enabled), 0.0, 0.0, 1.0));
+            if (base.y + 1u < limit_h) {
+                imageStore(y_img, dst_base + ivec2(0, 1), vec4(map_y10(y01, hdr_enabled), 0.0, 0.0, 1.0));
+                if (base.x + 1u < limit_w)
+                    imageStore(y_img, dst_base + ivec2(1, 1), vec4(map_y10(y11, hdr_enabled), 0.0, 0.0, 1.0));
+            }
         }
 
         uint u_avg = (u0 + u1 + 1u) >> 1;
@@ -472,10 +482,12 @@ void main() {
             read_uv10_at(pair_x, row0, u0, v0);
             read_uv10_at(pair_x, row1, u1, v1);
         }
-        imageStore(y_img, dst_base, vec4(map_y10(y00, hdr_enabled), 0.0, 0.0, 1.0));
-        imageStore(y_img, dst_base + ivec2(1, 0), vec4(map_y10(y10, hdr_enabled), 0.0, 0.0, 1.0));
-        imageStore(y_img, dst_base + ivec2(0, 1), vec4(map_y10(y01, hdr_enabled), 0.0, 0.0, 1.0));
-        imageStore(y_img, dst_base + ivec2(1, 1), vec4(map_y10(y11, hdr_enabled), 0.0, 0.0, 1.0));
+        if (!chroma_only()) {
+            imageStore(y_img, dst_base, vec4(map_y10(y00, hdr_enabled), 0.0, 0.0, 1.0));
+            imageStore(y_img, dst_base + ivec2(1, 0), vec4(map_y10(y10, hdr_enabled), 0.0, 0.0, 1.0));
+            imageStore(y_img, dst_base + ivec2(0, 1), vec4(map_y10(y01, hdr_enabled), 0.0, 0.0, 1.0));
+            imageStore(y_img, dst_base + ivec2(1, 1), vec4(map_y10(y11, hdr_enabled), 0.0, 0.0, 1.0));
+        }
 
         uint u_avg = (u0 + u1 + 1u) >> 1;
         uint v_avg = (v0 + v1 + 1u) >> 1;
@@ -511,13 +523,15 @@ void main() {
             read_uv10_at(pair_x, row1, u1, v1);
         }
 
-        imageStore(y_img, dst_base, vec4(map_y10(y00, hdr_enabled), 0.0, 0.0, 1.0));
-        if (base.x + 1u < limit_w)
-            imageStore(y_img, dst_base + ivec2(1, 0), vec4(map_y10(y10, hdr_enabled), 0.0, 0.0, 1.0));
-        if (base.y + 1u < limit_h) {
-            imageStore(y_img, dst_base + ivec2(0, 1), vec4(map_y10(y01, hdr_enabled), 0.0, 0.0, 1.0));
+        if (!chroma_only()) {
+            imageStore(y_img, dst_base, vec4(map_y10(y00, hdr_enabled), 0.0, 0.0, 1.0));
             if (base.x + 1u < limit_w)
-                imageStore(y_img, dst_base + ivec2(1, 1), vec4(map_y10(y11, hdr_enabled), 0.0, 0.0, 1.0));
+                imageStore(y_img, dst_base + ivec2(1, 0), vec4(map_y10(y10, hdr_enabled), 0.0, 0.0, 1.0));
+            if (base.y + 1u < limit_h) {
+                imageStore(y_img, dst_base + ivec2(0, 1), vec4(map_y10(y01, hdr_enabled), 0.0, 0.0, 1.0));
+                if (base.x + 1u < limit_w)
+                    imageStore(y_img, dst_base + ivec2(1, 1), vec4(map_y10(y11, hdr_enabled), 0.0, 0.0, 1.0));
+            }
         }
 
         uint u_avg = (u0 + u1 + 1u) >> 1;

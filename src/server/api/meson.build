@@ -8,6 +8,7 @@ api_sources = files(
     'handlers/system.c',
     'handlers/auth.c',
     'handlers/command.c',
+    'handlers/debug.c',
     'handlers/preview.c',
     'handlers/source.c',
     'handlers/audio.c',

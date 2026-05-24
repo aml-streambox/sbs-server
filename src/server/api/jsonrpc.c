@@ -137,6 +137,7 @@ void sbs_api_register_core_methods(sbs_api_server_t *server)
     register_method(server, "preview.getEncoderConfig", sbs_api_handle_preview_get_encoder_config);
     register_method(server, "preview.updateEncoderConfig", sbs_api_handle_preview_update_encoder_config);
     register_method(server, "command.execute", sbs_api_handle_command_execute);
+    register_method(server, "debug.getLogs", sbs_api_handle_debug_get_logs);
     register_method(server, "pubsub.subscribe", sbs_api_handle_pubsub_subscribe);
     register_method(server, "pubsub.unsubscribe", sbs_api_handle_pubsub_unsubscribe);
     register_method(server, "instance.list", sbs_api_handle_instance_list);

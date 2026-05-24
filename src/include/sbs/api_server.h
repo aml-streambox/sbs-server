@@ -239,8 +239,10 @@ int sbs_api_handle_preview_webrtc_ice(sbs_api_server_t *server, sbs_api_client_t
                                       cJSON *params, cJSON **result, cJSON **error);
 int sbs_api_handle_command_execute(sbs_api_server_t *server, sbs_api_client_t *client,
                                    cJSON *params, cJSON **result, cJSON **error);
+int sbs_api_handle_debug_get_logs(sbs_api_server_t *server, sbs_api_client_t *client,
+                                  cJSON *params, cJSON **result, cJSON **error);
 int sbs_api_handle_snapshot_capture(sbs_api_server_t *server, sbs_api_client_t *client,
-                                    cJSON *params, cJSON **result, cJSON **error);
+                                     cJSON *params, cJSON **result, cJSON **error);
 int sbs_api_handle_audio_get_levels(sbs_api_server_t *server, sbs_api_client_t *client,
                                     cJSON *params, cJSON **result, cJSON **error);
 int sbs_api_handle_audio_set_source(sbs_api_server_t *server, sbs_api_client_t *client,

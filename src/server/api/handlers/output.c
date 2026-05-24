@@ -99,8 +99,17 @@ static int ensure_shared_encoder_codec(sbs_api_server_t *server,
 static void output_replace_encoder_from_json(sbs_output_state_t *output, cJSON *encoder_obj)
 {
     cJSON *entry = NULL;
+    cJSON *rtmp_passcode_item;
+    cJSON *rtmp_stream_key_item;
+    char *old_rtmp_passcode = NULL;
 
     if (!output || !cJSON_IsObject(encoder_obj)) return;
+    if (output->encoder) {
+        old_rtmp_passcode = g_strdup(g_hash_table_lookup(output->encoder, "rtmp_passcode"));
+    }
+    rtmp_passcode_item = cJSON_GetObjectItemCaseSensitive(encoder_obj, "rtmp_passcode");
+    rtmp_stream_key_item = cJSON_GetObjectItemCaseSensitive(encoder_obj, "rtmp_stream_key");
+
     if (output->encoder) g_hash_table_destroy(output->encoder);
     output->encoder = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
     for (entry = encoder_obj->child; entry; entry = entry->next) {
@@ -114,6 +123,12 @@ static void output_replace_encoder_from_json(sbs_output_state_t *output, cJSON *
             g_hash_table_insert(output->encoder, g_strdup(entry->string), g_strdup(buf));
         }
     }
+    if (!cJSON_IsString(rtmp_passcode_item) && !cJSON_IsString(rtmp_stream_key_item) &&
+        old_rtmp_passcode && *old_rtmp_passcode) {
+        g_hash_table_insert(output->encoder, g_strdup("rtmp_passcode"), old_rtmp_passcode);
+        old_rtmp_passcode = NULL;
+    }
+    g_free(old_rtmp_passcode);
 }
 
 int sbs_api_handle_output_list(sbs_api_server_t *server, sbs_api_client_t *client,

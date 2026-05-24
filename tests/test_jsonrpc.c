@@ -283,6 +283,19 @@ SBS_TEST_FIXTURE(jsonrpc, output_rtmp_passcode_redacted, setup_api, teardown_api
     free(response);
 }
 
+SBS_TEST_FIXTURE(jsonrpc, output_stale_remote_password_redacted, setup_api, teardown_api)
+{
+    char *response = NULL;
+    SBS_ASSERT_EQ(sbs_api_server_dispatch_json(server, client,
+        "{\"jsonrpc\":\"2.0\",\"id\":34,\"method\":\"output.create\",\"params\":{\"id\":\"output-file\",\"name\":\"File\",\"encoder\":{\"sink_type\":\"file\",\"remote_password\":\"share-secret\",\"file_path\":\"/tmp/stream.ts\",\"file_path_mode\":\"file\"}}}",
+        &response), SBS_OK);
+    SBS_ASSERT_NOT_NULL(response);
+    SBS_ASSERT(strstr(response, "\"remote_password\":") == NULL);
+    SBS_ASSERT(strstr(response, "remote_password_set") != NULL);
+    SBS_ASSERT(strstr(response, "share-secret") == NULL);
+    free(response);
+}
+
 SBS_TEST_FIXTURE(jsonrpc, output_update_restart_failure_marks_error, setup_api, teardown_api)
 {
     sbs_output_state_t *output = NULL;

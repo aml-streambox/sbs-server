@@ -924,6 +924,11 @@ static cJSON *output_encoder_to_public_json(GHashTable *map)
                                   value && ((const char *)value)[0] != '\0');
             continue;
         }
+        if (g_strcmp0((const char *)key, "remote_password") == 0) {
+            cJSON_AddBoolToObject(obj, "remote_password_set",
+                                  value && ((const char *)value)[0] != '\0');
+            continue;
+        }
         cJSON_AddStringToObject(obj, (const char *)key, (const char *)value);
     }
 

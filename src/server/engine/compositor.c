@@ -7792,7 +7792,7 @@ static bool native_scene_can_full_canvas_direct_yuv(sbs_compositor_t *comp,
 {
     if (!comp || !entry || !scene || scene->transition_active)
         return false;
-    if (scene->active_item_count <= 1)
+    if (scene->active_item_count == 0)
         return false;
 
     for (uint32_t i = 0; i < scene->active_item_count && i < SBS_MAX_SOURCE_TEXTURES; i++) {
@@ -7807,15 +7807,15 @@ static bool native_scene_can_full_canvas_direct_yuv(sbs_compositor_t *comp,
                                                    scene->active_item_count, i,
                                                    NULL, 0);
         if (slot >= SBS_MAX_SOURCE_TEXTURES)
-            return false;
+            continue;
 
         if (!source_texture_matches_item(&comp->sources[slot], item))
-            return false;
+            continue;
 
         bool direct_yuv = native_source_can_direct_yuv(comp, entry,
                                                        &comp->sources[slot], item);
         if (!direct_yuv)
-            return false;
+            continue;
 
         int32_t dst_x = item->render_x;
         int32_t dst_y = item->render_y;
@@ -7823,7 +7823,7 @@ static bool native_scene_can_full_canvas_direct_yuv(sbs_compositor_t *comp,
         uint32_t dst_h = (uint32_t)item->render_height;
         if (dst_w == 0 || dst_h == 0 || dst_x > 0 ||
             dst_x + (int32_t)dst_w < (int32_t)comp->width)
-            return false;
+            continue;
 
         bool covers_canvas_height = dst_y + (int32_t)dst_h >= (int32_t)comp->height;
         bool source_driven_amly_with_bg_fill =
@@ -7863,7 +7863,8 @@ static bool native_scene_can_targeted_bg_fill_yuv(sbs_compositor_t *comp,
         int32_t dst_x, dst_y;
         uint32_t dst_w, dst_h;
 
-        if (!item->visible || item->render_width <= 0 || item->render_height <= 0)
+        if (!item->visible || !item->frame_slot ||
+            item->render_width <= 0 || item->render_height <= 0)
             continue;
         if (item->opacity < 0.999f || item->rotation_deg != 0.0f ||
             item->flip_horizontal || item->flip_vertical ||
@@ -7875,10 +7876,12 @@ static bool native_scene_can_targeted_bg_fill_yuv(sbs_compositor_t *comp,
                                                    scene->active_item_count, i,
                                                    NULL, 0);
         if (slot >= SBS_MAX_SOURCE_TEXTURES)
-            return false;
+            continue;
         tex = &comp->sources[slot];
-        if (!source_texture_matches_item(tex, item) ||
-            tex->drm_format != SBS_DRM_FORMAT_AMLY ||
+        if (!tex->allocated || !tex->has_content ||
+            !source_texture_matches_item(tex, item))
+            continue;
+        if (tex->drm_format != SBS_DRM_FORMAT_AMLY ||
             !native_source_can_direct_yuv(comp, entry, tex, item))
             return false;
 

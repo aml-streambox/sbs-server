@@ -1122,8 +1122,12 @@ static cJSON *serialize_full_state_internal(const sbs_scene_graph_t *graph, bool
     cJSON_AddNumberToObject(canvas, "height", graph->canvas.height);
     cJSON_AddNumberToObject(canvas, "fps_num", graph->canvas.fps_num);
     cJSON_AddNumberToObject(canvas, "fps_den", graph->canvas.fps_den);
+    cJSON_AddStringToObject(canvas, "pixel_format",
+                            sbs_pixel_format_name(graph->canvas.pixel_format));
+    cJSON_AddStringToObject(canvas, "colorimetry",
+                            sbs_colorimetry_name(graph->canvas.colorimetry));
     cJSON_AddStringToObject(canvas, "color_mode",
-                            graph->canvas.color_mode == SBS_SCENE_COLOR_MODE_HDR10 ? "hdr10" : "sdr");
+                            sbs_legacy_color_mode_for_pixel_format(graph->canvas.pixel_format));
     cJSON_AddStringToObject(canvas, "background_color", graph->canvas.background_color);
     cJSON_AddItemToObject(obj, "canvas", canvas);
 
@@ -1249,6 +1253,8 @@ sbs_scene_graph_t *sbs_scene_graph_new_default(void)
     graph->canvas.height = 1080;
     graph->canvas.fps_num = 60;
     graph->canvas.fps_den = 1;
+    graph->canvas.pixel_format = SBS_PIXEL_FORMAT_NV21;
+    graph->canvas.colorimetry = SBS_COLORIMETRY_SDR;
     graph->canvas.color_mode = SBS_SCENE_COLOR_MODE_SDR;
     g_strlcpy(graph->canvas.background_color, "#000000", sizeof(graph->canvas.background_color));
 

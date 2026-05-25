@@ -579,9 +579,9 @@ sbs_api_server_t *sbs_api_server_new(sbs_scene_graph_t *scene_graph,
                                              scene_graph->canvas.width,
                                              scene_graph->canvas.height,
                                              scene_graph->canvas.fps_num,
-                                             scene_graph->canvas.color_mode == SBS_SCENE_COLOR_MODE_HDR10
-                                                 ? SBS_PREVIEW_COLOR_MODE_HDR10
-                                                 : SBS_PREVIEW_COLOR_MODE_SDR);
+                                             scene_graph->canvas.pixel_format == SBS_PIXEL_FORMAT_P010
+                                                  ? SBS_PREVIEW_COLOR_MODE_HDR10
+                                                  : SBS_PREVIEW_COLOR_MODE_SDR);
     }
     if (server->output_router) {
         sbs_output_router_set_preview_engine(server->output_router, server->preview);
@@ -619,6 +619,8 @@ void sbs_api_server_free(sbs_api_server_t *server)
     g_hash_table_destroy(server->methods);
     g_hash_table_destroy(server->clients);
     g_free(server->pending_canvas_color_mode);
+    g_free(server->pending_canvas_pixel_format);
+    g_free(server->pending_canvas_colorimetry);
     g_free(server->pending_canvas_background_color);
     g_free(server->unix_socket_path);
     g_free(server);

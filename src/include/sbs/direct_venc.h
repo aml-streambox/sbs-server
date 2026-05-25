@@ -20,8 +20,10 @@ typedef struct sbs_direct_venc_config {
     uint32_t gop_size;
     int32_t gop_pattern;
     int32_t rc_mode;        /* 0=VBR (default), 1=CBR */
-    bool hdr10;
-    bool input_hdr10;
+    sbs_pixel_format_t input_format;
+    sbs_colorimetry_t colorimetry;
+    bool hdr10;             /* Legacy: maps to P010 + BT.2020 PQ when used alone. */
+    bool input_hdr10;       /* Legacy input-format alias. */
 } sbs_direct_venc_config_t;
 
 typedef struct sbs_direct_venc_packet {

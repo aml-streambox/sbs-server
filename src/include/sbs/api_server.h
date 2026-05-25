@@ -75,6 +75,8 @@ struct sbs_api_server {
     uint32_t pending_canvas_fps_num;
     uint32_t pending_canvas_fps_den;
     char *pending_canvas_color_mode;
+    char *pending_canvas_pixel_format;
+    char *pending_canvas_colorimetry;
     char *pending_canvas_background_color;
     bool running;
     gpointer socket_service;

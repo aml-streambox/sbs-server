@@ -79,6 +79,8 @@ int sbs_api_handle_encoder_get_config(sbs_api_server_t *server,
     cJSON_AddStringToObject(obj, "gop_preset", gop_preset_from_pattern(cfg.gop_pattern));
     cJSON_AddBoolToObject(obj, "enable_b_frames", cfg.gop_pattern != 0);
     cJSON_AddNumberToObject(obj, "rc_mode", cfg.rc_mode);
+    cJSON_AddStringToObject(obj, "pixel_format", sbs_pixel_format_name(cfg.pixel_format));
+    cJSON_AddStringToObject(obj, "colorimetry", sbs_colorimetry_name(cfg.colorimetry));
     if (cfg.encoder)
         cJSON_AddStringToObject(obj, "encoder", cfg.encoder);
     cJSON_AddNumberToObject(obj, "width", width);
@@ -146,6 +148,20 @@ int sbs_api_handle_encoder_update_config(sbs_api_server_t *server,
     if (rc_mode_j && cJSON_IsNumber(rc_mode_j))
         cfg.rc_mode = (int32_t)rc_mode_j->valuedouble;
 
+    cJSON *pixel_format_j = cJSON_GetObjectItemCaseSensitive(params, "pixel_format");
+    if (pixel_format_j && cJSON_IsString(pixel_format_j) &&
+        !sbs_pixel_format_parse(cJSON_GetStringValue(pixel_format_j), &cfg.pixel_format)) {
+        *error = api_error(-32602, "Invalid encoder pixel_format");
+        return SBS_ERR_INVAL;
+    }
+
+    cJSON *colorimetry_j = cJSON_GetObjectItemCaseSensitive(params, "colorimetry");
+    if (colorimetry_j && cJSON_IsString(colorimetry_j) &&
+        !sbs_colorimetry_parse(cJSON_GetStringValue(colorimetry_j), &cfg.colorimetry)) {
+        *error = api_error(-32602, "Invalid encoder colorimetry");
+        return SBS_ERR_INVAL;
+    }
+
     char *log_codec = g_strdup(cfg.codec ? cfg.codec : "h265");
     int rc = sbs_encoder_manager_update_config(server->encoder_mgr, &cfg);
     if (rc != 0) {
@@ -154,8 +170,10 @@ int sbs_api_handle_encoder_update_config(sbs_api_server_t *server,
         return rc;
     }
 
-    LOG_I("encoder config updated: codec=%s bitrate=%u gop=%u gop_pattern=%d rc_mode=%d",
-          log_codec, cfg.bitrate_kbps, cfg.gop_size, cfg.gop_pattern, cfg.rc_mode);
+    LOG_I("encoder config updated: codec=%s bitrate=%u gop=%u gop_pattern=%d rc_mode=%d pixel_format=%s colorimetry=%s",
+          log_codec, cfg.bitrate_kbps, cfg.gop_size, cfg.gop_pattern, cfg.rc_mode,
+          sbs_pixel_format_name(cfg.pixel_format),
+          sbs_colorimetry_name(cfg.colorimetry));
     g_free(log_codec);
 
     /* Return new config */

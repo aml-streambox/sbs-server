@@ -95,7 +95,8 @@ static cJSON *serialize_runtime_health(sbs_api_server_t *server)
 
 static bool pending_canvas_differs(const sbs_api_server_t *server)
 {
-    const char *running_mode;
+    const char *running_pixel_format;
+    const char *running_colorimetry;
 
     if (!server || !server->scene_graph || !server->pending_canvas_valid) {
         return false;
@@ -106,9 +107,10 @@ static bool pending_canvas_differs(const sbs_api_server_t *server)
     if (server->pending_canvas_fps_num != server->scene_graph->canvas.fps_num) return true;
     if (server->pending_canvas_fps_den != server->scene_graph->canvas.fps_den) return true;
 
-    running_mode = server->scene_graph->canvas.color_mode == SBS_SCENE_COLOR_MODE_HDR10
-        ? "hdr10" : "sdr";
-    if (g_strcmp0(server->pending_canvas_color_mode, running_mode) != 0) return true;
+    running_pixel_format = sbs_pixel_format_name(server->scene_graph->canvas.pixel_format);
+    running_colorimetry = sbs_colorimetry_name(server->scene_graph->canvas.colorimetry);
+    if (g_strcmp0(server->pending_canvas_pixel_format, running_pixel_format) != 0) return true;
+    if (g_strcmp0(server->pending_canvas_colorimetry, running_colorimetry) != 0) return true;
     if (g_strcmp0(server->pending_canvas_background_color,
                   server->scene_graph->canvas.background_color) != 0) return true;
 
@@ -128,6 +130,10 @@ static cJSON *duplicate_pending_canvas_object(const sbs_api_server_t *server)
     cJSON_AddNumberToObject(canvas, "height", server->pending_canvas_height);
     cJSON_AddNumberToObject(canvas, "fps_num", server->pending_canvas_fps_num);
     cJSON_AddNumberToObject(canvas, "fps_den", server->pending_canvas_fps_den);
+    cJSON_AddStringToObject(canvas, "pixel_format",
+                            server->pending_canvas_pixel_format ?: "nv21");
+    cJSON_AddStringToObject(canvas, "colorimetry",
+                            server->pending_canvas_colorimetry ?: "sdr");
     cJSON_AddStringToObject(canvas, "color_mode",
                             server->pending_canvas_color_mode ?: "sdr");
     cJSON_AddStringToObject(canvas, "background_color",

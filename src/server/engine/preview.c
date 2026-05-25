@@ -937,6 +937,8 @@ static preview_runtime_t *start_webrtc_runtime(sbs_preview_engine_t *engine,
             .gop_size = src_fps,
             .gop_pattern = 0,
             .rc_mode = 0,
+            .input_format = input_hdr10 ? SBS_PIXEL_FORMAT_P010 : SBS_PIXEL_FORMAT_NV21,
+            .colorimetry = output_hdr10 ? SBS_COLORIMETRY_BT2020_PQ : SBS_COLORIMETRY_SDR,
             .hdr10 = output_hdr10,
             .input_hdr10 = input_hdr10,
         };

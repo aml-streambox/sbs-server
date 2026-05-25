@@ -25,19 +25,62 @@ static double json_num(cJSON *obj, const char *key, double fallback)
     return cJSON_IsNumber(item) ? item->valuedouble : fallback;
 }
 
+static sbs_export_color_mode_t export_color_mode_from_pixel_format(sbs_pixel_format_t pixel_format)
+{
+    return pixel_format == SBS_PIXEL_FORMAT_P010
+        ? SBS_EXPORT_COLOR_HDR10
+        : SBS_EXPORT_COLOR_SDR;
+}
+
+static bool resolve_canvas_color_fields(const char *pixel_format_str,
+                                        const char *colorimetry_str,
+                                        const char *legacy_color_mode,
+                                        sbs_pixel_format_t base_pixel_format,
+                                        sbs_colorimetry_t base_colorimetry,
+                                        sbs_pixel_format_t *pixel_format_out,
+                                        sbs_colorimetry_t *colorimetry_out)
+{
+    sbs_pixel_format_t pixel_format = base_pixel_format;
+    sbs_colorimetry_t colorimetry = base_colorimetry;
+
+    if (pixel_format_str) {
+        if (!sbs_pixel_format_parse(pixel_format_str, &pixel_format))
+            return false;
+    } else if (legacy_color_mode) {
+        pixel_format = sbs_pixel_format_from_legacy_color_mode(legacy_color_mode);
+    }
+
+    if (colorimetry_str) {
+        if (!sbs_colorimetry_parse(colorimetry_str, &colorimetry))
+            return false;
+    } else if (legacy_color_mode) {
+        colorimetry = sbs_colorimetry_from_legacy_color_mode(legacy_color_mode);
+    }
+
+    if (pixel_format_out)
+        *pixel_format_out = pixel_format;
+    if (colorimetry_out)
+        *colorimetry_out = colorimetry;
+    return true;
+}
+
 static void add_canvas_json(cJSON *obj,
                             uint32_t width,
                             uint32_t height,
                             uint32_t fps_num,
                             uint32_t fps_den,
-                            const char *color_mode,
+                            const char *pixel_format,
+                            const char *colorimetry,
                             const char *background_color)
 {
     cJSON_AddNumberToObject(obj, "width", width);
     cJSON_AddNumberToObject(obj, "height", height);
     cJSON_AddNumberToObject(obj, "fps_num", fps_num);
     cJSON_AddNumberToObject(obj, "fps_den", fps_den);
-    cJSON_AddStringToObject(obj, "color_mode", color_mode);
+    cJSON_AddStringToObject(obj, "pixel_format", pixel_format ? pixel_format : "nv21");
+    cJSON_AddStringToObject(obj, "colorimetry", colorimetry ? colorimetry : "sdr");
+    cJSON_AddStringToObject(obj, "color_mode",
+                            g_strcmp0(pixel_format, "p010") == 0 ? "hdr10" : "sdr");
     cJSON_AddStringToObject(obj, "background_color", background_color);
 }
 
@@ -49,21 +92,24 @@ static void add_running_canvas_result(cJSON *result, const sbs_scene_graph_t *gr
                     graph->canvas.height,
                     graph->canvas.fps_num,
                     graph->canvas.fps_den,
-                    graph->canvas.color_mode == SBS_SCENE_COLOR_MODE_HDR10 ? "hdr10" : "sdr",
+                    sbs_pixel_format_name(graph->canvas.pixel_format),
+                    sbs_colorimetry_name(graph->canvas.colorimetry),
                     graph->canvas.background_color);
     cJSON_AddItemToObject(result, "canvas", canvas);
 }
 
 static void add_pending_canvas_result(cJSON *result,
-                                      uint32_t width,
-                                      uint32_t height,
-                                      uint32_t fps_num,
-                                      uint32_t fps_den,
-                                      const char *color_mode,
-                                      const char *background_color)
+                                       uint32_t width,
+                                       uint32_t height,
+                                       uint32_t fps_num,
+                                       uint32_t fps_den,
+                                       const char *pixel_format,
+                                       const char *colorimetry,
+                                       const char *background_color)
 {
     cJSON *canvas = cJSON_CreateObject();
-    add_canvas_json(canvas, width, height, fps_num, fps_den, color_mode, background_color);
+    add_canvas_json(canvas, width, height, fps_num, fps_den,
+                    pixel_format, colorimetry, background_color);
     cJSON_AddItemToObject(result, "pending_canvas", canvas);
 }
 
@@ -72,7 +118,8 @@ static void set_server_pending_canvas(sbs_api_server_t *server,
                                       uint32_t height,
                                       uint32_t fps_num,
                                       uint32_t fps_den,
-                                      const char *color_mode,
+                                      const char *pixel_format,
+                                      const char *colorimetry,
                                       const char *background_color)
 {
     if (!server) {
@@ -85,8 +132,13 @@ static void set_server_pending_canvas(sbs_api_server_t *server,
     server->pending_canvas_fps_num = fps_num;
     server->pending_canvas_fps_den = fps_den ? fps_den : 1;
     g_free(server->pending_canvas_color_mode);
+    g_free(server->pending_canvas_pixel_format);
+    g_free(server->pending_canvas_colorimetry);
     g_free(server->pending_canvas_background_color);
-    server->pending_canvas_color_mode = g_strdup(color_mode ? color_mode : "sdr");
+    server->pending_canvas_pixel_format = g_strdup(pixel_format ? pixel_format : "nv21");
+    server->pending_canvas_colorimetry = g_strdup(colorimetry ? colorimetry : "sdr");
+    server->pending_canvas_color_mode = g_strdup(
+        g_strcmp0(server->pending_canvas_pixel_format, "p010") == 0 ? "hdr10" : "sdr");
     server->pending_canvas_background_color = g_strdup(background_color ? background_color : "#000000");
 }
 
@@ -98,6 +150,8 @@ static void clear_server_pending_canvas(sbs_api_server_t *server)
 
     server->pending_canvas_valid = false;
     g_clear_pointer(&server->pending_canvas_color_mode, g_free);
+    g_clear_pointer(&server->pending_canvas_pixel_format, g_free);
+    g_clear_pointer(&server->pending_canvas_colorimetry, g_free);
     g_clear_pointer(&server->pending_canvas_background_color, g_free);
 }
 
@@ -107,7 +161,8 @@ static bool saved_canvas_requires_restart(sbs_api_server_t *server,
                                           uint32_t *height_out,
                                           uint32_t *fps_num_out,
                                           uint32_t *fps_den_out,
-                                          const char **color_mode_out,
+                                          const char **pixel_format_out,
+                                          const char **colorimetry_out,
                                           const char **background_color_out)
 {
     cJSON *canvas = state_obj ? cJSON_GetObjectItemCaseSensitive(state_obj, "canvas") : NULL;
@@ -115,7 +170,10 @@ static bool saved_canvas_requires_restart(sbs_api_server_t *server,
     uint32_t desired_h;
     uint32_t desired_fps_num;
     uint32_t desired_fps_den;
-    const char *desired_cm;
+    sbs_pixel_format_t desired_pixel_format;
+    sbs_colorimetry_t desired_colorimetry;
+    const char *desired_pf;
+    const char *desired_ci;
     const char *desired_bg;
     uint32_t comp_w = 0;
     uint32_t comp_h = 0;
@@ -132,9 +190,15 @@ static bool saved_canvas_requires_restart(sbs_api_server_t *server,
     desired_fps_den = (uint32_t)json_num(canvas, "fps_den", server->scene_graph->canvas.fps_den);
     if (!desired_fps_den)
         desired_fps_den = 1;
-    desired_cm = json_str(canvas, "color_mode");
-    if (!desired_cm)
-        desired_cm = server->scene_graph->canvas.color_mode == SBS_SCENE_COLOR_MODE_HDR10 ? "hdr10" : "sdr";
+    resolve_canvas_color_fields(json_str(canvas, "pixel_format"),
+                                json_str(canvas, "colorimetry"),
+                                json_str(canvas, "color_mode"),
+                                server->scene_graph->canvas.pixel_format,
+                                server->scene_graph->canvas.colorimetry,
+                                &desired_pixel_format,
+                                &desired_colorimetry);
+    desired_pf = sbs_pixel_format_name(desired_pixel_format);
+    desired_ci = sbs_colorimetry_name(desired_colorimetry);
     desired_bg = json_str(canvas, "background_color");
     if (!desired_bg)
         desired_bg = server->scene_graph->canvas.background_color;
@@ -143,7 +207,8 @@ static bool saved_canvas_requires_restart(sbs_api_server_t *server,
     if (height_out) *height_out = desired_h;
     if (fps_num_out) *fps_num_out = desired_fps_num;
     if (fps_den_out) *fps_den_out = desired_fps_den;
-    if (color_mode_out) *color_mode_out = desired_cm;
+    if (pixel_format_out) *pixel_format_out = desired_pf;
+    if (colorimetry_out) *colorimetry_out = desired_ci;
     if (background_color_out) *background_color_out = desired_bg;
 
     if (!server->comp_thread)
@@ -152,8 +217,7 @@ static bool saved_canvas_requires_restart(sbs_api_server_t *server,
     sbs_compositor_thread_get_canvas_config(server->comp_thread,
                                             &comp_w, &comp_h, &comp_fps,
                                             &comp_color);
-    desired_color = g_strcmp0(desired_cm, "hdr10") == 0
-        ? SBS_EXPORT_COLOR_HDR10 : SBS_EXPORT_COLOR_SDR;
+    desired_color = export_color_mode_from_pixel_format(desired_pixel_format);
 
     return desired_w != comp_w || desired_h != comp_h ||
            desired_fps_num != comp_fps || desired_fps_den != 1 ||
@@ -175,6 +239,10 @@ static void set_canvas_string_field(cJSON *canvas, const char *key, const char *
     cJSON *item = cJSON_GetObjectItemCaseSensitive(canvas, key);
     char *copy;
 
+    if (!item) {
+        cJSON_AddStringToObject(canvas, key, value ? value : "");
+        return;
+    }
     if (!cJSON_IsString(item)) {
         return;
     }
@@ -212,9 +280,12 @@ int sbs_api_handle_canvas_update(sbs_api_server_t *server, sbs_api_client_t *cli
     uint32_t base_h = server->pending_canvas_valid ? server->pending_canvas_height : graph->canvas.height;
     uint32_t base_fps_num = server->pending_canvas_valid ? server->pending_canvas_fps_num : graph->canvas.fps_num;
     uint32_t base_fps_den = server->pending_canvas_valid ? server->pending_canvas_fps_den : graph->canvas.fps_den;
-    const char *base_cm = server->pending_canvas_valid && server->pending_canvas_color_mode
-        ? server->pending_canvas_color_mode
-        : (graph->canvas.color_mode == SBS_SCENE_COLOR_MODE_HDR10 ? "hdr10" : "sdr");
+    sbs_pixel_format_t base_pixel_format = graph->canvas.pixel_format;
+    sbs_colorimetry_t base_colorimetry = graph->canvas.colorimetry;
+    sbs_pixel_format_t resolved_pixel_format;
+    sbs_colorimetry_t resolved_colorimetry;
+    const char *resolved_pf;
+    const char *resolved_ci;
     const char *base_bg = server->pending_canvas_valid && server->pending_canvas_background_color
         ? server->pending_canvas_background_color
         : graph->canvas.background_color;
@@ -226,9 +297,25 @@ int sbs_api_handle_canvas_update(sbs_api_server_t *server, sbs_api_client_t *cli
     cJSON *height_item = cJSON_GetObjectItemCaseSensitive(canvas_obj, "height");
     const char *new_bg = json_str(canvas_obj, "background_color");
     const char *new_cm = json_str(canvas_obj, "color_mode");
-    const char *resolved_cm = new_cm ? new_cm : base_cm;
+    const char *new_pf = json_str(canvas_obj, "pixel_format");
+    const char *new_ci = json_str(canvas_obj, "colorimetry");
     const char *resolved_bg = new_bg ? new_bg : base_bg;
     bool resolution_changed = cJSON_IsNumber(width_item) || cJSON_IsNumber(height_item);
+
+    if (server->pending_canvas_valid && server->pending_canvas_pixel_format)
+        sbs_pixel_format_parse(server->pending_canvas_pixel_format, &base_pixel_format);
+    if (server->pending_canvas_valid && server->pending_canvas_colorimetry)
+        sbs_colorimetry_parse(server->pending_canvas_colorimetry, &base_colorimetry);
+
+    if (!resolve_canvas_color_fields(new_pf, new_ci, new_cm,
+                                     base_pixel_format, base_colorimetry,
+                                     &resolved_pixel_format,
+                                     &resolved_colorimetry)) {
+        *error = api_error(-32602, "Invalid canvas pixel_format or colorimetry");
+        return SBS_ERR_INVAL;
+    }
+    resolved_pf = sbs_pixel_format_name(resolved_pixel_format);
+    resolved_ci = sbs_colorimetry_name(resolved_colorimetry);
 
     if (!new_fps_den) {
         new_fps_den = 1;
@@ -256,7 +343,10 @@ int sbs_api_handle_canvas_update(sbs_api_server_t *server, sbs_api_client_t *cli
     set_canvas_number_field(bundle_canvas, "height", new_h);
     set_canvas_number_field(bundle_canvas, "fps_num", new_fps_num);
     set_canvas_number_field(bundle_canvas, "fps_den", new_fps_den);
-    set_canvas_string_field(bundle_canvas, "color_mode", resolved_cm);
+    set_canvas_string_field(bundle_canvas, "pixel_format", resolved_pf);
+    set_canvas_string_field(bundle_canvas, "colorimetry", resolved_ci);
+    set_canvas_string_field(bundle_canvas, "color_mode",
+                            sbs_legacy_color_mode_for_pixel_format(resolved_pixel_format));
     set_canvas_string_field(bundle_canvas, "background_color", resolved_bg);
 
     if (sbs_config_manager_save_bundle(server->config, bundle) != SBS_OK) {
@@ -266,14 +356,15 @@ int sbs_api_handle_canvas_update(sbs_api_server_t *server, sbs_api_client_t *cli
     }
     cJSON_Delete(bundle);
 
-    LOG_I("saved canvas settings; waiting for apply: %ux%u@%u/%u color=%s",
-          new_w, new_h, new_fps_num, new_fps_den, resolved_cm);
+    LOG_I("saved canvas settings; waiting for apply: %ux%u@%u/%u pixel_format=%s colorimetry=%s",
+          new_w, new_h, new_fps_num, new_fps_den, resolved_pf, resolved_ci);
     set_server_pending_canvas(server, new_w, new_h, new_fps_num, new_fps_den,
-                              resolved_cm, resolved_bg);
+                              resolved_pf, resolved_ci, resolved_bg);
 
     *result = cJSON_CreateObject();
     add_running_canvas_result(*result, graph);
-    add_pending_canvas_result(*result, new_w, new_h, new_fps_num, new_fps_den, resolved_cm, resolved_bg);
+    add_pending_canvas_result(*result, new_w, new_h, new_fps_num, new_fps_den,
+                              resolved_pf, resolved_ci, resolved_bg);
     cJSON_AddBoolToObject(*result, "restart_required", true);
     cJSON_AddBoolToObject(*result, "saved", true);
     return SBS_OK;
@@ -288,7 +379,8 @@ int sbs_api_handle_canvas_apply(sbs_api_server_t *server, sbs_api_client_t *clie
     uint32_t pending_h = 0;
     uint32_t pending_fps_num = 0;
     uint32_t pending_fps_den = 1;
-    const char *pending_cm = NULL;
+    const char *pending_pf = NULL;
+    const char *pending_ci = NULL;
     const char *pending_bg = NULL;
     (void)client;
     (void)params;
@@ -307,13 +399,15 @@ int sbs_api_handle_canvas_apply(sbs_api_server_t *server, sbs_api_client_t *clie
     if (saved_canvas_requires_restart(server, state_obj,
                                       &pending_w, &pending_h,
                                       &pending_fps_num, &pending_fps_den,
-                                      &pending_cm, &pending_bg)) {
-        LOG_I("saved canvas requires compositor restart; applying supervised restart: %ux%u@%u/%u color=%s",
+                                      &pending_pf, &pending_ci, &pending_bg)) {
+        LOG_I("saved canvas requires compositor restart; applying supervised restart: %ux%u@%u/%u pixel_format=%s colorimetry=%s",
               pending_w, pending_h, pending_fps_num, pending_fps_den,
-              pending_cm ? pending_cm : "sdr");
+              pending_pf ? pending_pf : "nv21",
+              pending_ci ? pending_ci : "sdr");
         set_server_pending_canvas(server, pending_w, pending_h,
                                   pending_fps_num, pending_fps_den,
-                                  pending_cm ? pending_cm : "sdr",
+                                  pending_pf ? pending_pf : "nv21",
+                                  pending_ci ? pending_ci : "sdr",
                                   pending_bg ? pending_bg : "#000000");
     }
 

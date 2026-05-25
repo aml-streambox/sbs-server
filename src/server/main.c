@@ -242,7 +242,7 @@ static int run_instance_daemon(const char *argv0, sbs_log_level_t level)
     uint32_t canvas_h = scene_graph->canvas.height;
     uint32_t canvas_fps = scene_graph->canvas.fps_num;
     sbs_export_color_mode_t canvas_export_color =
-        scene_graph->canvas.color_mode == SBS_SCENE_COLOR_MODE_HDR10
+        scene_graph->canvas.pixel_format == SBS_PIXEL_FORMAT_P010
             ? SBS_EXPORT_COLOR_HDR10 : SBS_EXPORT_COLOR_SDR;
 
     LOG_I("[init:3] creating compositor thread (%ux%u@%u)", canvas_w, canvas_h, canvas_fps);
@@ -267,14 +267,18 @@ static int run_instance_daemon(const char *argv0, sbs_log_level_t level)
             .gop_pattern  = 0,
             .rc_mode      = 0,
             .encoder      = NULL,
-            .hdr10        = (canvas_export_color == SBS_EXPORT_COLOR_HDR10),
+            .pixel_format = scene_graph->canvas.pixel_format,
+            .colorimetry  = scene_graph->canvas.colorimetry,
+            .hdr10        = (scene_graph->canvas.colorimetry == SBS_COLORIMETRY_BT2020_PQ),
         };
         encoder_mgr = sbs_encoder_manager_new(canvas_w, canvas_h, canvas_fps, 1, &enc_cfg);
         if (encoder_mgr) {
             sbs_output_router_set_encoder_manager(output_router, encoder_mgr);
             sbs_output_router_set_color_mode(output_router,
                 canvas_export_color);
-            LOG_I("[init:6.1] encoder manager created and wired to output router (hdr10=%d)", enc_cfg.hdr10);
+            LOG_I("[init:6.1] encoder manager created and wired to output router (pixel_format=%s colorimetry=%s)",
+                  sbs_pixel_format_name(enc_cfg.pixel_format),
+                  sbs_colorimetry_name(enc_cfg.colorimetry));
         } else {
             LOG_W("failed to create encoder manager, falling back to supervisor-only");
         }

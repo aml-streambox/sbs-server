@@ -205,6 +205,8 @@ struct sbs_encoder_manager {
     int32_t  gop_pattern;       /* -1 = unset, 0 = IPP, 1 = IBP, etc. */
     int32_t  rc_mode;           /* 0 = VBR (default), 1 = CBR */
     char    *encoder_override;
+    sbs_pixel_format_t pixel_format;
+    sbs_colorimetry_t colorimetry;
 
     /* Frame counters */
     uint64_t frames_pushed;
@@ -1792,8 +1794,10 @@ static int ensure_pipeline(sbs_encoder_manager_t *mgr)
         .gop_size = mgr->gop_size,
         .gop_pattern = mgr->gop_pattern,
         .rc_mode = mgr->rc_mode,
+        .input_format = mgr->pixel_format,
+        .colorimetry = mgr->colorimetry,
         .hdr10 = mgr->hdr10,
-        .input_hdr10 = mgr->hdr10,
+        .input_hdr10 = mgr->pixel_format == SBS_PIXEL_FORMAT_P010,
     };
 
     mgr->video_encoder = sbs_direct_venc_new(&venc_cfg);
@@ -3269,7 +3273,15 @@ sbs_encoder_manager_t *sbs_encoder_manager_new(uint32_t width,
     mgr->gop_pattern      = enc_config->gop_pattern;
     mgr->rc_mode          = enc_config->rc_mode;
     mgr->encoder_override = g_strdup(enc_config->encoder);
-    mgr->hdr10            = enc_config->hdr10;
+    mgr->pixel_format     = enc_config->pixel_format;
+    mgr->colorimetry      = enc_config->colorimetry;
+    if (enc_config->hdr10 &&
+        mgr->pixel_format == SBS_PIXEL_FORMAT_NV21 &&
+        mgr->colorimetry == SBS_COLORIMETRY_SDR) {
+        mgr->pixel_format = SBS_PIXEL_FORMAT_P010;
+        mgr->colorimetry = SBS_COLORIMETRY_BT2020_PQ;
+    }
+    mgr->hdr10            = mgr->colorimetry == SBS_COLORIMETRY_BT2020_PQ;
 
     mgr->branches = g_hash_table_new_full(g_str_hash, g_str_equal, NULL, sink_branch_free);
     mgr->direct_audio_branches = g_ptr_array_new();
@@ -3282,9 +3294,11 @@ sbs_encoder_manager_t *sbs_encoder_manager_new(uint32_t width,
     }
     pthread_mutex_init(&mgr->audio_mutex, NULL);
 
-    LOG_I("encoder manager created: %ux%u@%u/%u codec=%s bitrate=%u",
+    LOG_I("encoder manager created: %ux%u@%u/%u codec=%s bitrate=%u pixel_format=%s colorimetry=%s",
           width, height, fps_num, mgr->fps_den,
-          mgr->codec, mgr->bitrate_kbps);
+          mgr->codec, mgr->bitrate_kbps,
+          sbs_pixel_format_name(mgr->pixel_format),
+          sbs_colorimetry_name(mgr->colorimetry));
 
     return mgr;
 }
@@ -3329,18 +3343,32 @@ int sbs_encoder_manager_update_config(sbs_encoder_manager_t *mgr,
     bool gop_changed = (mgr->gop_size != enc_config->gop_size);
     bool gop_pattern_changed = (mgr->gop_pattern != enc_config->gop_pattern);
     bool rc_mode_changed = (mgr->rc_mode != enc_config->rc_mode);
-    bool hdr_changed = (mgr->hdr10 != enc_config->hdr10);
+    sbs_pixel_format_t new_pixel_format = enc_config->pixel_format;
+    sbs_colorimetry_t new_colorimetry = enc_config->colorimetry;
+    if (enc_config->hdr10 &&
+        new_pixel_format == SBS_PIXEL_FORMAT_NV21 &&
+        new_colorimetry == SBS_COLORIMETRY_SDR) {
+        new_pixel_format = SBS_PIXEL_FORMAT_P010;
+        new_colorimetry = SBS_COLORIMETRY_BT2020_PQ;
+    }
+    bool pixel_format_changed = (mgr->pixel_format != new_pixel_format);
+    bool colorimetry_changed = (mgr->colorimetry != new_colorimetry);
 
-    if (!codec_changed && !bitrate_changed && !gop_changed && !gop_pattern_changed && !rc_mode_changed && !hdr_changed) {
+    if (!codec_changed && !bitrate_changed && !gop_changed && !gop_pattern_changed &&
+        !rc_mode_changed && !pixel_format_changed && !colorimetry_changed) {
         LOG_D("encoder config unchanged, skipping rebuild");
         pthread_mutex_unlock(&mgr->pipeline_mutex);
         return SBS_OK;
     }
 
-    LOG_I("encoder config changed: codec=%s→%s bitrate=%u→%u gop=%u→%u gop_pattern=%d→%d rc_mode=%d→%d hdr10=%d→%d",
+    LOG_I("encoder config changed: codec=%s→%s bitrate=%u→%u gop=%u→%u gop_pattern=%d→%d rc_mode=%d→%d pixel_format=%s→%s colorimetry=%s→%s",
           mgr->codec, new_codec, mgr->bitrate_kbps, new_bitrate,
           mgr->gop_size, enc_config->gop_size, mgr->gop_pattern, enc_config->gop_pattern,
-          mgr->rc_mode, enc_config->rc_mode, mgr->hdr10, enc_config->hdr10);
+          mgr->rc_mode, enc_config->rc_mode,
+          sbs_pixel_format_name(mgr->pixel_format),
+          sbs_pixel_format_name(new_pixel_format),
+          sbs_colorimetry_name(mgr->colorimetry),
+          sbs_colorimetry_name(new_colorimetry));
 
     mgr->pipeline_active = false;
 
@@ -3388,12 +3416,16 @@ int sbs_encoder_manager_update_config(sbs_encoder_manager_t *mgr,
     mgr->rc_mode = enc_config->rc_mode;
     g_free(mgr->encoder_override);
     mgr->encoder_override = new_encoder_owned;
-    mgr->hdr10 = enc_config->hdr10;
+    mgr->pixel_format = new_pixel_format;
+    mgr->colorimetry = new_colorimetry;
+    mgr->hdr10 = mgr->colorimetry == SBS_COLORIMETRY_BT2020_PQ;
 
     /* Teardown and rebuild */
     LOG_I("encoder teardown starting...");
     teardown_pipeline(mgr);
-    LOG_I("encoder teardown done, rebuilding with hdr10=%d...", enc_config->hdr10);
+    LOG_I("encoder teardown done, rebuilding with pixel_format=%s colorimetry=%s...",
+          sbs_pixel_format_name(mgr->pixel_format),
+          sbs_colorimetry_name(mgr->colorimetry));
 
     int rc = ensure_pipeline(mgr);
     LOG_I("encoder rebuild rc=%d", rc);
@@ -3447,7 +3479,8 @@ int sbs_encoder_manager_reconfigure_video(sbs_encoder_manager_t *mgr,
                                            uint32_t height,
                                            uint32_t fps_num,
                                            uint32_t fps_den,
-                                           bool hdr10)
+                                           sbs_pixel_format_t pixel_format,
+                                           sbs_colorimetry_t colorimetry)
 {
     uint32_t old_fps_num;
 
@@ -3459,14 +3492,19 @@ int sbs_encoder_manager_reconfigure_video(sbs_encoder_manager_t *mgr,
     pthread_mutex_lock(&mgr->pipeline_mutex);
     if (mgr->width == width && mgr->height == height &&
         mgr->fps_num == fps_num && mgr->fps_den == fps_den &&
-        mgr->hdr10 == hdr10) {
+        mgr->pixel_format == pixel_format &&
+        mgr->colorimetry == colorimetry) {
         pthread_mutex_unlock(&mgr->pipeline_mutex);
         return SBS_OK;
     }
 
-    LOG_I("reconfiguring encoder video: %ux%u@%u/%u hdr10=%d -> %ux%u@%u/%u hdr10=%d",
-          mgr->width, mgr->height, mgr->fps_num, mgr->fps_den, mgr->hdr10,
-          width, height, fps_num, fps_den, hdr10);
+    LOG_I("reconfiguring encoder video: %ux%u@%u/%u %s/%s -> %ux%u@%u/%u %s/%s",
+          mgr->width, mgr->height, mgr->fps_num, mgr->fps_den,
+          sbs_pixel_format_name(mgr->pixel_format),
+          sbs_colorimetry_name(mgr->colorimetry),
+          width, height, fps_num, fps_den,
+          sbs_pixel_format_name(pixel_format),
+          sbs_colorimetry_name(colorimetry));
 
     mgr->pipeline_active = false;
     teardown_pipeline(mgr);
@@ -3476,7 +3514,9 @@ int sbs_encoder_manager_reconfigure_video(sbs_encoder_manager_t *mgr,
     mgr->height = height;
     mgr->fps_num = fps_num;
     mgr->fps_den = fps_den;
-    mgr->hdr10 = hdr10;
+    mgr->pixel_format = pixel_format;
+    mgr->colorimetry = colorimetry;
+    mgr->hdr10 = mgr->colorimetry == SBS_COLORIMETRY_BT2020_PQ;
     if (mgr->gop_size == old_fps_num)
         mgr->gop_size = fps_num;
     mgr->force_next_idr = true;
@@ -3861,6 +3901,8 @@ void sbs_encoder_manager_get_config(const sbs_encoder_manager_t *mgr,
     out_config->gop_pattern  = mgr->gop_pattern;
     out_config->rc_mode      = mgr->rc_mode;
     out_config->encoder      = mgr->encoder_override;
+    out_config->pixel_format = mgr->pixel_format;
+    out_config->colorimetry  = mgr->colorimetry;
     out_config->hdr10        = mgr->hdr10;
 }
 

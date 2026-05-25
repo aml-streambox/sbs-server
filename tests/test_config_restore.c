@@ -127,6 +127,8 @@ SBS_TEST_FIXTURE(config_restore, older_schema_bundle_migrates, setup_restore, te
     cJSON_AddItemToObject(state, "state", cJSON_CreateObject());
     cJSON_AddItemToObject(bundle, "state", state);
     SBS_ASSERT_EQ(sbs_config_manager_apply_bundle(mgr, server, bundle), SBS_OK);
+    SBS_ASSERT_EQ(server->scene_graph->canvas.pixel_format, SBS_PIXEL_FORMAT_NV21);
+    SBS_ASSERT_EQ(server->scene_graph->canvas.colorimetry, SBS_COLORIMETRY_SDR);
     cJSON_Delete(bundle);
 }
 
@@ -163,6 +165,8 @@ SBS_TEST_FIXTURE(config_restore, vfmcap_restore_preserves_output_format, setup_r
     server->source_sup = (sbs_source_supervisor_t *)0x1;
     test_api_stubs_reset_last_source_start();
     SBS_ASSERT_EQ(sbs_config_manager_apply_bundle(mgr, server, bundle), SBS_OK);
+    SBS_ASSERT_EQ(server->scene_graph->canvas.pixel_format, SBS_PIXEL_FORMAT_P010);
+    SBS_ASSERT_EQ(server->scene_graph->canvas.colorimetry, SBS_COLORIMETRY_BT2020_PQ);
     SBS_ASSERT_STR_EQ(test_api_stubs_last_source_output_format(), "nv12");
     SBS_ASSERT_EQ(test_api_stubs_source_start_count(), 1u);
     server->source_sup = NULL;

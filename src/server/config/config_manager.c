@@ -139,14 +139,55 @@ static int validate_bundle(cJSON *bundle)
     return SBS_OK;
 }
 
+static void migrate_canvas_color_fields(cJSON *bundle)
+{
+    cJSON *state;
+    cJSON *canvas;
+    const char *legacy_color_mode;
+    const char *pixel_format;
+
+    if (!cJSON_IsObject(bundle))
+        return;
+
+    state = cJSON_GetObjectItemCaseSensitive(bundle, "state");
+    canvas = cJSON_GetObjectItemCaseSensitive(state ? state : bundle, "canvas");
+    if (!cJSON_IsObject(canvas))
+        return;
+
+    legacy_color_mode = json_str(canvas, "color_mode");
+    pixel_format = json_str(canvas, "pixel_format");
+
+    if (!pixel_format) {
+        cJSON_AddStringToObject(canvas, "pixel_format",
+                                sbs_pixel_format_name(
+                                    sbs_pixel_format_from_legacy_color_mode(legacy_color_mode)));
+        pixel_format = json_str(canvas, "pixel_format");
+    }
+    if (!json_str(canvas, "colorimetry")) {
+        cJSON_AddStringToObject(canvas, "colorimetry",
+                                sbs_colorimetry_name(
+                                    sbs_colorimetry_from_legacy_color_mode(legacy_color_mode)));
+    }
+    if (!legacy_color_mode) {
+        sbs_pixel_format_t parsed_pixel_format = SBS_PIXEL_FORMAT_NV21;
+        sbs_pixel_format_parse(pixel_format, &parsed_pixel_format);
+        cJSON_AddStringToObject(canvas, "color_mode",
+                                sbs_legacy_color_mode_for_pixel_format(parsed_pixel_format));
+    }
+}
+
 static int migrate_bundle(cJSON *bundle)
 {
     cJSON *version = cJSON_GetObjectItemCaseSensitive(bundle, "schema_version");
     if (!cJSON_IsNumber(version)) return SBS_ERR_INVAL;
-    if (version->valueint == 1) return SBS_OK;
+    if (version->valueint == 1) {
+        migrate_canvas_color_fields(bundle);
+        return SBS_OK;
+    }
     if (version->valueint < 1) {
         version->valueint = 1;
         version->valuedouble = 1;
+        migrate_canvas_color_fields(bundle);
         return SBS_OK;
     }
     return SBS_ERR_INVAL;
@@ -320,6 +361,57 @@ static int ensure_restore_encoder_codec(sbs_api_server_t *server,
     return sbs_encoder_manager_update_config(server->encoder_mgr, &cfg);
 }
 
+static sbs_scene_color_mode_t scene_color_mode_from_pixel_format(sbs_pixel_format_t pixel_format)
+{
+    return pixel_format == SBS_PIXEL_FORMAT_P010
+        ? SBS_SCENE_COLOR_MODE_HDR10
+        : SBS_SCENE_COLOR_MODE_SDR;
+}
+
+static sbs_export_color_mode_t export_color_mode_from_pixel_format(sbs_pixel_format_t pixel_format)
+{
+    return pixel_format == SBS_PIXEL_FORMAT_P010
+        ? SBS_EXPORT_COLOR_HDR10
+        : SBS_EXPORT_COLOR_SDR;
+}
+
+static sbs_preview_color_mode_t preview_color_mode_from_pixel_format(sbs_pixel_format_t pixel_format)
+{
+    return pixel_format == SBS_PIXEL_FORMAT_P010
+        ? SBS_PREVIEW_COLOR_MODE_HDR10
+        : SBS_PREVIEW_COLOR_MODE_SDR;
+}
+
+static void resolve_canvas_color_fields(cJSON *canvas,
+                                        sbs_pixel_format_t fallback_pixel_format,
+                                        sbs_colorimetry_t fallback_colorimetry,
+                                        sbs_pixel_format_t *pixel_format_out,
+                                        sbs_colorimetry_t *colorimetry_out)
+{
+    const char *legacy_color_mode = json_str(canvas, "color_mode");
+    const char *pixel_format_str = json_str(canvas, "pixel_format");
+    const char *colorimetry_str = json_str(canvas, "colorimetry");
+    sbs_pixel_format_t pixel_format = fallback_pixel_format;
+    sbs_colorimetry_t colorimetry = fallback_colorimetry;
+
+    if (pixel_format_str) {
+        sbs_pixel_format_parse(pixel_format_str, &pixel_format);
+    } else if (legacy_color_mode) {
+        pixel_format = sbs_pixel_format_from_legacy_color_mode(legacy_color_mode);
+    }
+
+    if (colorimetry_str) {
+        sbs_colorimetry_parse(colorimetry_str, &colorimetry);
+    } else if (legacy_color_mode) {
+        colorimetry = sbs_colorimetry_from_legacy_color_mode(legacy_color_mode);
+    }
+
+    if (pixel_format_out)
+        *pixel_format_out = pixel_format;
+    if (colorimetry_out)
+        *colorimetry_out = colorimetry;
+}
+
 static void restart_runtime_from_graph(sbs_api_server_t *server)
 {
     GHashTableIter iter;
@@ -331,9 +423,8 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
                                              server->scene_graph->canvas.width,
                                              server->scene_graph->canvas.height,
                                              server->scene_graph->canvas.fps_num,
-                                             server->scene_graph->canvas.color_mode == SBS_SCENE_COLOR_MODE_HDR10
-                                                 ? SBS_PREVIEW_COLOR_MODE_HDR10
-                                                 : SBS_PREVIEW_COLOR_MODE_SDR);
+                                             preview_color_mode_from_pixel_format(
+                                                 server->scene_graph->canvas.pixel_format));
     }
 
     server->audio = sbs_audio_mixer_new(server->scene_graph);
@@ -342,8 +433,7 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
         if (server->output_router) {
             sbs_output_router_set_audio_mixer(server->output_router, server->audio);
             sbs_output_router_set_color_mode(server->output_router,
-                server->scene_graph->canvas.color_mode == SBS_SCENE_COLOR_MODE_HDR10
-                    ? SBS_EXPORT_COLOR_HDR10 : SBS_EXPORT_COLOR_SDR);
+                export_color_mode_from_pixel_format(server->scene_graph->canvas.pixel_format));
         }
     }
 
@@ -372,7 +462,7 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
             source->frame_width = cfg.width;
             source->frame_height = cfg.height;
             source->color_depth = source->kind == SBS_SOURCE_KIND_VFMCAP &&
-                                  server->scene_graph->canvas.color_mode == SBS_SCENE_COLOR_MODE_HDR10 ? 10 : 8;
+                                  server->scene_graph->canvas.pixel_format == SBS_PIXEL_FORMAT_P010 ? 10 : 8;
             source->hdr = false;
             g_strlcpy(source->color_space, source->color_depth > 8 ? "BT.2020" : "BT.709",
                       sizeof(source->color_space));
@@ -495,8 +585,9 @@ static int reconfigure_canvas_runtime_from_graph(sbs_api_server_t *server)
     uint32_t height;
     uint32_t fps_num;
     uint32_t fps_den;
+    sbs_pixel_format_t pixel_format;
+    sbs_colorimetry_t colorimetry;
     sbs_export_color_mode_t color_mode;
-    bool hdr10;
     bool comp_needs_reconfigure = false;
 
     if (!server || !server->scene_graph)
@@ -506,8 +597,9 @@ static int reconfigure_canvas_runtime_from_graph(sbs_api_server_t *server)
     height = server->scene_graph->canvas.height;
     fps_num = server->scene_graph->canvas.fps_num;
     fps_den = server->scene_graph->canvas.fps_den ? server->scene_graph->canvas.fps_den : 1;
-    hdr10 = server->scene_graph->canvas.color_mode == SBS_SCENE_COLOR_MODE_HDR10;
-    color_mode = hdr10 ? SBS_EXPORT_COLOR_HDR10 : SBS_EXPORT_COLOR_SDR;
+    pixel_format = server->scene_graph->canvas.pixel_format;
+    colorimetry = server->scene_graph->canvas.colorimetry;
+    color_mode = export_color_mode_from_pixel_format(pixel_format);
 
     if (server->comp_thread) {
         uint32_t cur_w = 0;
@@ -522,8 +614,10 @@ static int reconfigure_canvas_runtime_from_graph(sbs_api_server_t *server)
     }
 
     if (comp_needs_reconfigure) {
-        LOG_I("canvas change requires supervised instance restart: %ux%u@%u/%u color=%s",
-              width, height, fps_num, fps_den, hdr10 ? "hdr10" : "sdr");
+        LOG_I("canvas change requires supervised instance restart: %ux%u@%u/%u pixel_format=%s colorimetry=%s",
+              width, height, fps_num, fps_den,
+              sbs_pixel_format_name(pixel_format),
+              sbs_colorimetry_name(colorimetry));
         return SBS_ERR_WOULD_BLOCK;
     }
 
@@ -531,7 +625,8 @@ static int reconfigure_canvas_runtime_from_graph(sbs_api_server_t *server)
         int rc = sbs_encoder_manager_reconfigure_video(server->encoder_mgr,
                                                        width, height,
                                                        fps_num, fps_den,
-                                                       hdr10);
+                                                       pixel_format,
+                                                       colorimetry);
         if (rc != SBS_OK)
             return rc;
     }
@@ -608,7 +703,12 @@ static int apply_scene_graph_bundle(sbs_api_server_t *server, cJSON *bundle)
     graph->canvas.fps_num = (uint32_t)json_num(canvas, "fps_num", 60);
     graph->canvas.fps_den = (uint32_t)json_num(canvas, "fps_den", 1);
     g_strlcpy(graph->canvas.background_color, json_str(canvas, "background_color") ? json_str(canvas, "background_color") : "#000000", sizeof(graph->canvas.background_color));
-    graph->canvas.color_mode = g_strcmp0(json_str(canvas, "color_mode"), "hdr10") == 0 ? SBS_SCENE_COLOR_MODE_HDR10 : SBS_SCENE_COLOR_MODE_SDR;
+    resolve_canvas_color_fields(canvas,
+                                SBS_PIXEL_FORMAT_NV21,
+                                SBS_COLORIMETRY_SDR,
+                                &graph->canvas.pixel_format,
+                                &graph->canvas.colorimetry);
+    graph->canvas.color_mode = scene_color_mode_from_pixel_format(graph->canvas.pixel_format);
 
     for (entry = sources ? sources->child : NULL; entry; entry = entry->next) {
         sbs_source_kind_t kind;
@@ -935,6 +1035,24 @@ int sbs_config_manager_apply_system_overrides(sbs_config_manager_t *mgr,
         if (g_key_file_has_key(kf, "canvas", "height", NULL)) graph->canvas.height = g_key_file_get_integer(kf, "canvas", "height", NULL);
         if (g_key_file_has_key(kf, "canvas", "fps_num", NULL)) graph->canvas.fps_num = g_key_file_get_integer(kf, "canvas", "fps_num", NULL);
         if (g_key_file_has_key(kf, "canvas", "fps_den", NULL)) graph->canvas.fps_den = g_key_file_get_integer(kf, "canvas", "fps_den", NULL);
+        if (g_key_file_has_key(kf, "canvas", "color_mode", NULL)) {
+            char *cm = g_key_file_get_string(kf, "canvas", "color_mode", NULL);
+            graph->canvas.pixel_format = sbs_pixel_format_from_legacy_color_mode(cm);
+            graph->canvas.colorimetry = sbs_colorimetry_from_legacy_color_mode(cm);
+            graph->canvas.color_mode = scene_color_mode_from_pixel_format(graph->canvas.pixel_format);
+            g_free(cm);
+        }
+        if (g_key_file_has_key(kf, "canvas", "pixel_format", NULL)) {
+            char *pf = g_key_file_get_string(kf, "canvas", "pixel_format", NULL);
+            sbs_pixel_format_parse(pf, &graph->canvas.pixel_format);
+            graph->canvas.color_mode = scene_color_mode_from_pixel_format(graph->canvas.pixel_format);
+            g_free(pf);
+        }
+        if (g_key_file_has_key(kf, "canvas", "colorimetry", NULL)) {
+            char *ci = g_key_file_get_string(kf, "canvas", "colorimetry", NULL);
+            sbs_colorimetry_parse(ci, &graph->canvas.colorimetry);
+            g_free(ci);
+        }
         if (g_key_file_has_key(kf, "canvas", "background_color", NULL)) {
             char *bg = g_key_file_get_string(kf, "canvas", "background_color", NULL);
             g_strlcpy(graph->canvas.background_color, bg ? bg : "#000000", sizeof(graph->canvas.background_color));
@@ -985,15 +1103,17 @@ int sbs_config_manager_preload_canvas(sbs_config_manager_t *mgr,
         graph->canvas.height  = (uint32_t)json_num(canvas, "height",  graph->canvas.height);
         graph->canvas.fps_num = (uint32_t)json_num(canvas, "fps_num", graph->canvas.fps_num);
         graph->canvas.fps_den = (uint32_t)json_num(canvas, "fps_den", graph->canvas.fps_den);
-        const char *cm = json_str(canvas, "color_mode");
-        if (cm) {
-            graph->canvas.color_mode = (strcmp(cm, "hdr10") == 0)
-                ? SBS_SCENE_COLOR_MODE_HDR10 : SBS_SCENE_COLOR_MODE_SDR;
-        }
-        LOG_I("preloaded canvas: %ux%u@%u/%u color_mode=%s",
+        resolve_canvas_color_fields(canvas,
+                                    graph->canvas.pixel_format,
+                                    graph->canvas.colorimetry,
+                                    &graph->canvas.pixel_format,
+                                    &graph->canvas.colorimetry);
+        graph->canvas.color_mode = scene_color_mode_from_pixel_format(graph->canvas.pixel_format);
+        LOG_I("preloaded canvas: %ux%u@%u/%u pixel_format=%s colorimetry=%s",
               graph->canvas.width, graph->canvas.height,
               graph->canvas.fps_num, graph->canvas.fps_den,
-              graph->canvas.color_mode == SBS_SCENE_COLOR_MODE_HDR10 ? "hdr10" : "sdr");
+              sbs_pixel_format_name(graph->canvas.pixel_format),
+              sbs_colorimetry_name(graph->canvas.colorimetry));
     } else {
         LOG_I("preload_canvas: no canvas object in state.json");
     }

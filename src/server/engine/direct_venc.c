@@ -204,6 +204,8 @@ struct sbs_direct_venc {
     uint32_t gop_size;
     int32_t gop_pattern;
     int32_t rc_mode;
+    sbs_pixel_format_t input_format;
+    sbs_colorimetry_t colorimetry;
     bool hdr10;
     bool input_hdr10;
     bool bframe_enabled;
@@ -265,6 +267,37 @@ static const char *drm_format_name(uint32_t drm_format)
     case DRM_FORMAT_P010: return "P010";
     case 0: return "unset";
     default: return "unknown";
+    }
+}
+
+static void colorimetry_to_vui(sbs_colorimetry_t colorimetry,
+                               uint8_t *primaries,
+                               uint8_t *transfer,
+                               uint8_t *matrix)
+{
+    switch (colorimetry) {
+    case SBS_COLORIMETRY_BT601:
+        *primaries = 6;
+        *transfer = 6;
+        *matrix = 6;
+        break;
+    case SBS_COLORIMETRY_BT2020_PQ:
+        *primaries = 9;
+        *transfer = 16;
+        *matrix = 9;
+        break;
+    case SBS_COLORIMETRY_BT2100_HLG:
+        *primaries = 9;
+        *transfer = 18;
+        *matrix = 9;
+        break;
+    case SBS_COLORIMETRY_BT709:
+    case SBS_COLORIMETRY_SDR:
+    default:
+        *primaries = 1;
+        *transfer = 1;
+        *matrix = 1;
+        break;
     }
 }
 
@@ -649,7 +682,7 @@ static void log_input_contract(const sbs_direct_venc_t *enc,
         return;
 
     visible_size = visible_frame_size_from_msg(msg, enc->input_hdr10);
-    LOG_I("VENC INPUT CONTRACT[%s] submit=%d msg={%ux%u drm=%s/0x%08x n_planes=%u offsets=%u,%u strides=%u,%u buffer_type=%u size=%zu visible=%zu pts=%lu dur=%lu seq=%lu} enc={input_hdr10=%d output_hdr10=%d} inbuf={type=%s/%d fmt=%s/%d stride=%d ptr0=0x%lx ptr1=0x%lx dma_fd=%d,%d,%d dma_planes=%u}",
+    LOG_I("VENC INPUT CONTRACT[%s] submit=%d msg={%ux%u drm=%s/0x%08x n_planes=%u offsets=%u,%u strides=%u,%u buffer_type=%u size=%zu visible=%zu pts=%lu dur=%lu seq=%lu} enc={input_format=%s colorimetry=%s legacy_input_hdr10=%d legacy_hdr10=%d} inbuf={type=%s/%d fmt=%s/%d stride=%d ptr0=0x%lx ptr1=0x%lx dma_fd=%d,%d,%d dma_planes=%u}",
           path ? path : "?", enc->next_submit_id,
           msg->width, msg->height,
           drm_format_name(msg->drm_format), (unsigned)msg->drm_format,
@@ -660,6 +693,8 @@ static void log_input_contract(const sbs_direct_venc_t *enc,
           (unsigned long)msg->pts_ns,
           (unsigned long)msg->duration_ns,
           (unsigned long)msg->sequence,
+          sbs_pixel_format_name(enc->input_format),
+          sbs_colorimetry_name(enc->colorimetry),
           enc->input_hdr10 ? 1 : 0,
           enc->hdr10 ? 1 : 0,
           buffer_type_name(inbuf->buf_type), inbuf->buf_type,
@@ -692,9 +727,9 @@ static int init_encoder_handle(sbs_direct_venc_t *enc)
     info.bit_rate = (int)enc->bitrate_kbps * 1000;
     info.gop = (int)enc->gop_size;
     info.prepend_spspps_to_idr_frames = true;
-    info.img_format = enc->input_hdr10 ? IMG_FMT_P010 : IMG_FMT_NV21;
+    info.img_format = enc->input_format == SBS_PIXEL_FORMAT_P010 ? IMG_FMT_P010 : IMG_FMT_NV21;
     info.enc_feature_opts |= 0x1;
-    info.internal_bit_depth = enc->hdr10 ? 10 : 8;
+    info.internal_bit_depth = enc->input_format == SBS_PIXEL_FORMAT_P010 ? 10 : 8;
     info.gop_pattern = enc->gop_pattern;
     info.rc_mode = enc->rc_mode;
     info.bitstream_buf_sz_kb = choose_bitstream_buf_sz_kb(enc->width, enc->height);
@@ -703,15 +738,10 @@ static int init_encoder_handle(sbs_direct_venc_t *enc)
     info.video_signal_type_present_flag = 1;
     info.video_full_range_flag = 0;
     info.colour_description_present_flag = 1;
-    if (enc->hdr10) {
-        info.colour_primaries = 9;
-        info.transfer_characteristics = 16;
-        info.matrix_coefficients = 9;
-    } else {
-        info.colour_primaries = 1;
-        info.transfer_characteristics = 1;
-        info.matrix_coefficients = 1;
-    }
+    colorimetry_to_vui(enc->colorimetry,
+                       &info.colour_primaries,
+                       &info.transfer_characteristics,
+                       &info.matrix_coefficients);
 
     qp.qp_min = 0;
     qp.qp_max = 51;
@@ -722,10 +752,12 @@ static int init_encoder_handle(sbs_direct_venc_t *enc)
     qp.qp_P_min = 0;
     qp.qp_P_max = 51;
 
-    LOG_I("VENC OPEN REQUEST: codec=%s(%d) size=%dx%d fps=%d bitrate=%d gop=%d img_format=%s(%d) enc_opts=0x%x internal_bit_depth=%d gop_pattern=%d rc_mode=%d bitstream_buf_kb=%d vui={present=%u full_range=%u signal=%u colour_desc=%u prim=%u transfer=%u matrix=%u} qp={min=%d max=%d I=%d/%d-%d P=%d/%d-%d}",
+    LOG_I("VENC OPEN REQUEST: codec=%s(%d) size=%dx%d fps=%d bitrate=%d gop=%d input_format=%s img_format=%s(%d) colorimetry=%s enc_opts=0x%x internal_bit_depth=%d gop_pattern=%d rc_mode=%d bitstream_buf_kb=%d vui={present=%u full_range=%u signal=%u colour_desc=%u prim=%u transfer=%u matrix=%u} qp={min=%d max=%d I=%d/%d-%d P=%d/%d-%d}",
           codec_id_name(enc->codec_id), enc->codec_id,
           info.width, info.height, info.frame_rate, info.bit_rate,
-          info.gop, img_format_name(info.img_format), info.img_format,
+          info.gop, sbs_pixel_format_name(enc->input_format),
+          img_format_name(info.img_format), info.img_format,
+          sbs_colorimetry_name(enc->colorimetry),
           info.enc_feature_opts, info.internal_bit_depth,
           info.gop_pattern, info.rc_mode, info.bitstream_buf_sz_kb,
           info.vui_parameters_present_flag,
@@ -747,9 +779,11 @@ static int init_encoder_handle(sbs_direct_venc_t *enc)
         return SBS_ERR_IO;
     }
 
-    LOG_I("VENC OPEN RESULT: handle=0x%lx codec=%s input_hdr10=%d output_hdr10=%d bframes=%d frame_duration=%luns outbuf=%zuKB",
+    LOG_I("VENC OPEN RESULT: handle=0x%lx codec=%s input_format=%s colorimetry=%s legacy_input_hdr10=%d legacy_hdr10=%d bframes=%d frame_duration=%luns outbuf=%zuKB",
           (unsigned long)enc->handle,
           codec_id_name(enc->codec_id),
+          sbs_pixel_format_name(enc->input_format),
+          sbs_colorimetry_name(enc->colorimetry),
           enc->input_hdr10 ? 1 : 0,
           enc->hdr10 ? 1 : 0,
           enc->bframe_enabled,
@@ -787,9 +821,11 @@ static int submit_common(sbs_direct_venc_t *enc,
     memset(&retbuf, 0, sizeof(retbuf));
 
     if (enc->next_submit_id <= 2) {
-        LOG_I("submit: buf_type=%d buf_fmt=%d stride=%d input_hdr10=%d output_hdr10=%d "
+        LOG_I("submit: buf_type=%d buf_fmt=%d stride=%d input_format=%s colorimetry=%s legacy_input_hdr10=%d legacy_hdr10=%d "
               "dma_fd=%d,%d planes=%u w=%u h=%u",
               inbuf->buf_type, inbuf->buf_fmt, inbuf->buf_stride,
+              sbs_pixel_format_name(enc->input_format),
+              sbs_colorimetry_name(enc->colorimetry),
               enc->input_hdr10 ? 1 : 0, enc->hdr10 ? 1 : 0,
               inbuf->buf_type == DMA_TYPE ? inbuf->buf_info.dma_info.shared_fd[0] : -1,
               inbuf->buf_type == DMA_TYPE ? inbuf->buf_info.dma_info.shared_fd[1] : -1,
@@ -911,8 +947,16 @@ sbs_direct_venc_t *sbs_direct_venc_new(const sbs_direct_venc_config_t *config)
     enc->gop_size = config->gop_size;
     enc->gop_pattern = config->gop_pattern;
     enc->rc_mode = config->rc_mode;
-    enc->hdr10 = config->hdr10;
-    enc->input_hdr10 = config->input_hdr10 || config->hdr10;
+    enc->input_format = config->input_format;
+    enc->colorimetry = config->colorimetry;
+    if ((config->input_hdr10 || config->hdr10) &&
+        enc->input_format == SBS_PIXEL_FORMAT_NV21 &&
+        enc->colorimetry == SBS_COLORIMETRY_SDR) {
+        enc->input_format = SBS_PIXEL_FORMAT_P010;
+        enc->colorimetry = SBS_COLORIMETRY_BT2020_PQ;
+    }
+    enc->hdr10 = enc->colorimetry == SBS_COLORIMETRY_BT2020_PQ;
+    enc->input_hdr10 = enc->input_format == SBS_PIXEL_FORMAT_P010;
     enc->bframe_enabled = gop_pattern_has_bframes(enc->gop_pattern);
     enc->frame_duration_ns = calculate_frame_duration_ns(enc->fps_num, enc->fps_den);
     enc->outbuf_size = choose_outbuf_size(config->width, config->height);
@@ -924,11 +968,12 @@ sbs_direct_venc_t *sbs_direct_venc_new(const sbs_direct_venc_config_t *config)
         return NULL;
     }
 
-    LOG_I("direct encoder ready: codec=%s %ux%u bitrate=%ukbps gop=%u gop_pattern=%d rc_mode=%d input_hdr10=%d output_hdr10=%d outbuf=%zuKB",
+    LOG_I("direct encoder ready: codec=%s %ux%u bitrate=%ukbps gop=%u gop_pattern=%d rc_mode=%d input_format=%s colorimetry=%s outbuf=%zuKB",
           codec_id_name(enc->codec_id),
           enc->width, enc->height, enc->bitrate_kbps,
           enc->gop_size, enc->gop_pattern, enc->rc_mode,
-          enc->input_hdr10 ? 1 : 0, enc->hdr10 ? 1 : 0,
+          sbs_pixel_format_name(enc->input_format),
+          sbs_colorimetry_name(enc->colorimetry),
           enc->outbuf_size / 1024u);
     return enc;
 }
@@ -969,21 +1014,22 @@ int sbs_direct_venc_submit_dmabuf(sbs_direct_venc_t *enc,
 
     if (msg->drm_format != 0) {
         bool msg_is_p010 = (msg->drm_format == DRM_FORMAT_P010);
-        if (msg_is_p010 != enc->input_hdr10) {
-            LOG_W("dropping dmabuf frame: format mismatch (msg_drm=0x%x input_hdr10_expected=%d output_hdr10=%d)",
+        bool expect_p010 = enc->input_format == SBS_PIXEL_FORMAT_P010;
+        if (msg_is_p010 != expect_p010) {
+            LOG_W("dropping dmabuf frame: format mismatch (msg_drm=0x%x input_format_expected=%s colorimetry=%s)",
                   (unsigned)msg->drm_format,
-                  enc->input_hdr10 ? 1 : 0,
-                  enc->hdr10 ? 1 : 0);
+                  sbs_pixel_format_name(enc->input_format),
+                  sbs_colorimetry_name(enc->colorimetry));
             return SBS_ERR_INVAL;
         }
     }
 
     memset(&inbuf, 0, sizeof(inbuf));
     inbuf.buf_type = DMA_TYPE;
-    inbuf.buf_fmt = enc->input_hdr10 ? IMG_FMT_P010 : IMG_FMT_NV21;
+    inbuf.buf_fmt = enc->input_format == SBS_PIXEL_FORMAT_P010 ? IMG_FMT_P010 : IMG_FMT_NV21;
     inbuf.buf_stride = (int)(msg->plane_stride[0] > 0
         ? msg->plane_stride[0]
-        : (enc->input_hdr10 ? msg->width * 2u : msg->width));
+        : (enc->input_format == SBS_PIXEL_FORMAT_P010 ? msg->width * 2u : msg->width));
     inbuf.buf_info.dma_info.shared_fd[0] = dmabuf_fd;
     /* Native SDR/HDR export uses one contiguous codecmm DMA-BUF with Y
      * followed by interleaved UV. libvpcodec's DMA path accepts this as a

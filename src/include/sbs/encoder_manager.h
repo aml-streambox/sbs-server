@@ -40,7 +40,9 @@ typedef struct sbs_encoder_config {
     int32_t     gop_pattern;
     int32_t     rc_mode;        /* 0=VBR (default), 1=CBR */
     const char *encoder;
-    bool        hdr10;
+    sbs_pixel_format_t pixel_format;
+    sbs_colorimetry_t colorimetry;
+    bool        hdr10;          /* Legacy: maps to P010 + BT.2020 PQ when used alone. */
 } sbs_encoder_config_t;
 
 /* ── Sink Branch Configuration ────────────────────────────────── */
@@ -173,11 +175,12 @@ void sbs_encoder_manager_get_config(const sbs_encoder_manager_t *mgr,
                                      sbs_encoder_config_t *out_config);
 
 int sbs_encoder_manager_reconfigure_video(sbs_encoder_manager_t *mgr,
-                                           uint32_t width,
-                                           uint32_t height,
-                                           uint32_t fps_num,
-                                           uint32_t fps_den,
-                                           bool hdr10);
+                                            uint32_t width,
+                                            uint32_t height,
+                                            uint32_t fps_num,
+                                            uint32_t fps_den,
+                                            sbs_pixel_format_t pixel_format,
+                                            sbs_colorimetry_t colorimetry);
 
 /**
  * Get the video resolution/fps being used.

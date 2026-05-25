@@ -39,7 +39,9 @@ typedef struct sbs_canvas_state {
     uint32_t height;
     uint32_t fps_num;
     uint32_t fps_den;
-    sbs_scene_color_mode_t color_mode;
+    sbs_pixel_format_t pixel_format;
+    sbs_colorimetry_t colorimetry;
+    sbs_scene_color_mode_t color_mode; /* Legacy alias derived from pixel_format. */
     char background_color[16];
 } sbs_canvas_state_t;
 

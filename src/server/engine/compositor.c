@@ -45,6 +45,7 @@ static const VkApplicationInfo app_info = {
 #define SBS_HDR_LUT_SIZE 33u
 #define SBS_LUT_MAX_SIZE 65u
 #define SBS_NATIVE_PREVIEW_ENTRY_INDEX_BASE SBS_NATIVE_CANVAS_RING_SIZE
+#define SBS_NATIVE_PREVIEW_RING_SIZE 4u
 #define SBS_NATIVE_TOTAL_ENTRY_COUNT (SBS_NATIVE_CANVAS_RING_SIZE * 2u)
 #define SBS_NATIVE_TIMING_QUERY_MARKS (SBS_NATIVE_TIMING_MAX_LAYERS + 4u)
 #define SBS_NATIVE_YUV_PC_SIZE 96u
@@ -55,6 +56,9 @@ static const VkApplicationInfo app_info = {
 #define SBS_NATIVE_ROTATION_MASK (3u << SBS_NATIVE_ROTATION_SHIFT)
 #define SBS_NATIVE_FLIP_HORIZONTAL (1u << 10u)
 #define SBS_NATIVE_FLIP_VERTICAL (1u << 11u)
+#if SBS_NATIVE_PREVIEW_RING_SIZE > SBS_NATIVE_CANVAS_RING_SIZE
+#error "SBS_NATIVE_PREVIEW_RING_SIZE must fit in native_preview.entries"
+#endif
 #ifndef SBS_DRM_FORMAT_AMLY
 #define SBS_DRM_FORMAT_AMLY 0x594c4d41u
 #endif
@@ -681,11 +685,12 @@ static void destroy_native_canvas_ring(sbs_compositor_t *comp)
 }
 
 static int allocate_native_canvas_entry(sbs_compositor_t *comp,
-                                        sbs_native_canvas_entry_t *entry,
-                                        uint32_t index,
-                                        sbs_export_color_mode_t color_mode,
-                                        uint32_t width,
-                                        uint32_t height);
+                                         sbs_native_canvas_entry_t *entry,
+                                         uint32_t index,
+                                         sbs_export_color_mode_t color_mode,
+                                         uint32_t width,
+                                         uint32_t height,
+                                         bool require_vpu_heap);
 static int create_native_encoder_buffer(sbs_compositor_t *comp,
                                         sbs_native_canvas_entry_t *entry,
                                         VkDeviceSize size);
@@ -766,7 +771,7 @@ static int create_native_preview_ring(sbs_compositor_t *comp,
         return -1;
     }
 
-    for (uint32_t i = 0; i < SBS_NATIVE_CANVAS_RING_SIZE; i++) {
+    for (uint32_t i = 0; i < SBS_NATIVE_PREVIEW_RING_SIZE; i++) {
         sbs_native_canvas_entry_t *entry = &comp->native_preview.entries[i];
         VkCommandBuffer cmd_buffer = entry->cmd_buffer;
         memset(entry, 0, sizeof(*entry));
@@ -787,8 +792,8 @@ static int create_native_preview_ring(sbs_compositor_t *comp,
         }
 
         if (allocate_native_canvas_entry(comp, entry, i,
-                                         color_mode,
-                                         width, height) != 0) {
+                                          color_mode,
+                                          width, height, true) != 0) {
             destroy_native_preview_ring(comp);
             return -1;
         }
@@ -805,7 +810,7 @@ static int create_native_preview_ring(sbs_compositor_t *comp,
     comp->native_preview.initialized = true;
     LOG_I("native preview GPU ring initialized: %ux%u mode=%s entries=%u interval=%u",
           width, height, native_canvas_color_name(color_mode),
-          SBS_NATIVE_CANVAS_RING_SIZE,
+          SBS_NATIVE_PREVIEW_RING_SIZE,
           comp->native_preview.frame_interval);
     return 0;
 }
@@ -1105,6 +1110,19 @@ static const char *native_canvas_color_name(sbs_export_color_mode_t color_mode)
     return color_mode == SBS_EXPORT_COLOR_HDR10 ? "HDR10" : "SDR";
 }
 
+static const char *native_canvas_heap_name(sbs_dmabuf_heap_kind_t heap)
+{
+    switch (heap) {
+    case SBS_DMABUF_HEAP_CODECMM: return "codecmm";
+    case SBS_DMABUF_HEAP_CACHED_CODECMM: return "cached_codecmm";
+    case SBS_DMABUF_HEAP_GFX: return "gfx";
+    case SBS_DMABUF_HEAP_LINUX_CMA: return "linux_cma";
+    case SBS_DMABUF_HEAP_SYSTEM: return "system";
+    case SBS_DMABUF_HEAP_MEMFD: return "memfd";
+    default: return "unknown";
+    }
+}
+
 typedef struct sbs_native_canvas_layout {
     uint32_t width;
     uint32_t height;
@@ -1160,11 +1178,12 @@ static int native_canvas_compute_layout(const sbs_compositor_t *comp,
 }
 
 static int allocate_native_canvas_entry(sbs_compositor_t *comp,
-                                        sbs_native_canvas_entry_t *entry,
-                                        uint32_t index,
-                                        sbs_export_color_mode_t color_mode,
-                                        uint32_t width,
-                                        uint32_t height)
+                                         sbs_native_canvas_entry_t *entry,
+                                         uint32_t index,
+                                         sbs_export_color_mode_t color_mode,
+                                         uint32_t width,
+                                         uint32_t height,
+                                         bool require_vpu_heap)
 {
     sbs_dmabuf_alloc_t alloc;
     sbs_dmabuf_buffer_t backing = { .fd = -1 };
@@ -1185,9 +1204,24 @@ static int allocate_native_canvas_entry(sbs_compositor_t *comp,
     }
 
     int alloc_rc = SBS_ERR_IO;
-    if (color_mode == SBS_EXPORT_COLOR_HDR10) {
+    if (require_vpu_heap) {
         alloc_rc = sbs_dmabuf_alloc_buffer_from_heap(
             &alloc, SBS_DMABUF_HEAP_CODECMM, layout.total_size, 0, &backing);
+        if (alloc_rc != SBS_OK) {
+            alloc_rc = sbs_dmabuf_alloc_buffer_from_heap(
+                &alloc, SBS_DMABUF_HEAP_CACHED_CODECMM, layout.total_size, 0, &backing);
+        }
+        if (alloc_rc != SBS_OK) {
+            alloc_rc = sbs_dmabuf_alloc_buffer_from_heap(
+                &alloc, SBS_DMABUF_HEAP_LINUX_CMA, layout.total_size, 0, &backing);
+        }
+    } else if (color_mode == SBS_EXPORT_COLOR_HDR10) {
+        alloc_rc = sbs_dmabuf_alloc_buffer_from_heap(
+            &alloc, SBS_DMABUF_HEAP_CODECMM, layout.total_size, 0, &backing);
+        if (alloc_rc != SBS_OK) {
+            alloc_rc = sbs_dmabuf_alloc_buffer_from_heap(
+                &alloc, SBS_DMABUF_HEAP_CACHED_CODECMM, layout.total_size, 0, &backing);
+        }
         if (alloc_rc != SBS_OK) {
             alloc_rc = sbs_dmabuf_alloc_buffer_from_heap(
                 &alloc, SBS_DMABUF_HEAP_LINUX_CMA, layout.total_size, 0, &backing);
@@ -1203,12 +1237,17 @@ static int allocate_native_canvas_entry(sbs_compositor_t *comp,
     } else {
         alloc_rc = sbs_dmabuf_alloc_buffer_from_heap(
             &alloc, SBS_DMABUF_HEAP_CODECMM, layout.total_size, 0, &backing);
+        if (alloc_rc != SBS_OK) {
+            alloc_rc = sbs_dmabuf_alloc_buffer_from_heap(
+                &alloc, SBS_DMABUF_HEAP_CACHED_CODECMM, layout.total_size, 0, &backing);
+        }
     }
-    if (alloc_rc != SBS_OK) {
+    if (alloc_rc != SBS_OK && !require_vpu_heap) {
         alloc_rc = sbs_dmabuf_alloc_buffer(&alloc, layout.total_size, 0, &backing);
     }
     if (alloc_rc != SBS_OK || backing.fd < 0) {
-        LOG_E("native canvas %s[%u] backing allocation failed", mode_name, index);
+        LOG_E("native canvas %s[%u] backing allocation failed%s",
+              mode_name, index, require_vpu_heap ? " (VPU-safe heaps only)" : "");
         sbs_dmabuf_alloc_close(&alloc);
         return -1;
     }
@@ -1255,11 +1294,12 @@ static int allocate_native_canvas_entry(sbs_compositor_t *comp,
     }
 
     entry->allocated = true;
-    LOG_I("native canvas %s[%u] %ux%u fd=%d size=%lu y_stride=%lu uv_stride=%lu uv_offset=%lu",
-           mode_name, index, width, height, entry->backing_fd,
-           (unsigned long)entry->backing_size,
-           (unsigned long)entry->y.stride,
-           (unsigned long)entry->uv.stride,
+    LOG_I("native canvas %s[%u] %ux%u fd=%d heap=%s size=%lu y_stride=%lu uv_stride=%lu uv_offset=%lu",
+            mode_name, index, width, height, entry->backing_fd,
+            native_canvas_heap_name(backing.heap),
+            (unsigned long)entry->backing_size,
+            (unsigned long)entry->y.stride,
+            (unsigned long)entry->uv.stride,
           (unsigned long)entry->uv.offset);
     return 0;
 }
@@ -1271,7 +1311,7 @@ static int allocate_native_canvas_entries(sbs_compositor_t *comp,
         if (allocate_native_canvas_entry(comp,
                                          &comp->native_canvas.entries[i],
                                          i, color_mode,
-                                         comp->width, comp->height) != 0) {
+                                         comp->width, comp->height, false) != 0) {
             destroy_native_canvas_ring(comp);
             return -1;
         }

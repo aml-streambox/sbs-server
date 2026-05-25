@@ -15,6 +15,7 @@ typedef enum sbs_dmabuf_heap_kind {
     SBS_DMABUF_HEAP_LINUX_CMA,
     SBS_DMABUF_HEAP_SYSTEM,
     SBS_DMABUF_HEAP_MEMFD,
+    SBS_DMABUF_HEAP_CACHED_CODECMM,
 } sbs_dmabuf_heap_kind_t;
 
 typedef enum sbs_dmabuf_sync_direction {
@@ -25,6 +26,7 @@ typedef enum sbs_dmabuf_sync_direction {
 
 typedef struct sbs_dmabuf_alloc {
     int codecmm_fd;
+    int cached_codecmm_fd;
     int gfx_fd;
     int linux_cma_fd;
     int system_fd;

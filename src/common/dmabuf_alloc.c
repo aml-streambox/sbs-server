@@ -30,6 +30,7 @@ static const char *heap_name(sbs_dmabuf_heap_kind_t heap)
 {
     switch (heap) {
     case SBS_DMABUF_HEAP_CODECMM: return "codecmm";
+    case SBS_DMABUF_HEAP_CACHED_CODECMM: return "cached_codecmm";
     case SBS_DMABUF_HEAP_GFX:     return "gfx";
     case SBS_DMABUF_HEAP_LINUX_CMA: return "linux_cma";
     case SBS_DMABUF_HEAP_SYSTEM:  return "system";
@@ -53,14 +54,17 @@ int sbs_dmabuf_alloc_open(sbs_dmabuf_alloc_t *alloc)
 
     memset(alloc, 0, sizeof(*alloc));
     alloc->codecmm_fd = -1;
+    alloc->cached_codecmm_fd = -1;
     alloc->gfx_fd = -1;
     alloc->linux_cma_fd = -1;
     alloc->system_fd = -1;
     alloc->codecmm_fd = open_heap("/dev/dma_heap/heap-codecmm");
+    alloc->cached_codecmm_fd = open_heap("/dev/dma_heap/heap-cached-codecmm");
     alloc->gfx_fd = open_heap("/dev/dma_heap/heap-gfx");
     alloc->linux_cma_fd = open_heap("/dev/dma_heap/linux,cma");
     alloc->system_fd = open_heap("/dev/dma_heap/system");
-    alloc->available = alloc->codecmm_fd >= 0 || alloc->gfx_fd >= 0 ||
+    alloc->available = alloc->codecmm_fd >= 0 || alloc->cached_codecmm_fd >= 0 ||
+                       alloc->gfx_fd >= 0 ||
                        alloc->linux_cma_fd >= 0 || alloc->system_fd >= 0;
     return SBS_OK;
 }
@@ -71,6 +75,8 @@ void sbs_dmabuf_alloc_close(sbs_dmabuf_alloc_t *alloc)
         return;
     if (alloc->codecmm_fd >= 0)
         close(alloc->codecmm_fd);
+    if (alloc->cached_codecmm_fd >= 0)
+        close(alloc->cached_codecmm_fd);
     if (alloc->gfx_fd >= 0)
         close(alloc->gfx_fd);
     if (alloc->linux_cma_fd >= 0)
@@ -78,6 +84,7 @@ void sbs_dmabuf_alloc_close(sbs_dmabuf_alloc_t *alloc)
     if (alloc->system_fd >= 0)
         close(alloc->system_fd);
     alloc->codecmm_fd = -1;
+    alloc->cached_codecmm_fd = -1;
     alloc->gfx_fd = -1;
     alloc->linux_cma_fd = -1;
     alloc->system_fd = -1;
@@ -127,6 +134,15 @@ int sbs_dmabuf_alloc_buffer(sbs_dmabuf_alloc_t *alloc,
         buffer->fd = fd;
         buffer->size = size;
         buffer->heap = SBS_DMABUF_HEAP_CODECMM;
+        LOG_I("DMA-BUF allocated %zu bytes from %s heap", size, heap_name(buffer->heap));
+        return SBS_OK;
+    }
+
+    fd = alloc_from_heap(alloc->cached_codecmm_fd, size, flags);
+    if (fd >= 0) {
+        buffer->fd = fd;
+        buffer->size = size;
+        buffer->heap = SBS_DMABUF_HEAP_CACHED_CODECMM;
         LOG_I("DMA-BUF allocated %zu bytes from %s heap", size, heap_name(buffer->heap));
         return SBS_OK;
     }
@@ -186,6 +202,7 @@ int sbs_dmabuf_alloc_buffer_from_heap(sbs_dmabuf_alloc_t *alloc,
 
     switch (heap) {
     case SBS_DMABUF_HEAP_CODECMM: heap_fd = alloc->codecmm_fd; break;
+    case SBS_DMABUF_HEAP_CACHED_CODECMM: heap_fd = alloc->cached_codecmm_fd; break;
     case SBS_DMABUF_HEAP_GFX: heap_fd = alloc->gfx_fd; break;
     case SBS_DMABUF_HEAP_LINUX_CMA: heap_fd = alloc->linux_cma_fd; break;
     case SBS_DMABUF_HEAP_SYSTEM: heap_fd = alloc->system_fd; break;

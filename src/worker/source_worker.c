@@ -2000,49 +2000,74 @@ static gboolean on_vfmcap_frame_timeout(gpointer user_data)
         return G_SOURCE_CONTINUE;
     }
 
-    vfmcap_frame_t frame;
-    int64_t acquire_start_us = g_get_monotonic_time();
-    state->vfmcap_acquire_attempts++;
-    int rc = vfmcap_acquire_frame(state->vfmcap_ctx, &frame,
-                                  SBS_VFMCAP_ACQUIRE_TIMEOUT_MS);
-    int64_t acquire_end_us = g_get_monotonic_time();
-    uint64_t acquire_us = (uint64_t)(acquire_end_us - acquire_start_us);
-    state->vfmcap_acquire_total_us += acquire_us;
-    if (acquire_us > state->vfmcap_acquire_max_us)
-        state->vfmcap_acquire_max_us = acquire_us;
+    vfmcap_frame_t frame = {0};
+    bool have_frame = false;
+    bool saw_reconfigured = false;
 
-    if (rc == VFMCAP_ERR_TIMEOUT || rc == VFMCAP_ERR_NOSIG) {
-        if (rc == VFMCAP_ERR_TIMEOUT) {
-            state->vfmcap_acquire_timeouts++;
-            state->vfmcap_consecutive_nosig = 0;
-        } else {
-            state->vfmcap_acquire_nosig++;
-            state->vfmcap_consecutive_nosig++;
-            if (state->vfmcap_consecutive_nosig >= SBS_VFMCAP_NOSIG_RECOVER_THRESHOLD) {
-                state->vfmcap_frame_timer = 0;
-                source_worker_vfmcap_begin_recovery(state, "sustained NOSIG");
-                return G_SOURCE_REMOVE;
+    for (uint32_t drained = 0; drained < SBS_VFMCAP_BUFFER_COUNT; drained++) {
+        vfmcap_frame_t next_frame;
+        int timeout_ms = have_frame ? 0 : SBS_VFMCAP_ACQUIRE_TIMEOUT_MS;
+        int64_t acquire_start_us = g_get_monotonic_time();
+        state->vfmcap_acquire_attempts++;
+        int rc = vfmcap_acquire_frame(state->vfmcap_ctx, &next_frame, timeout_ms);
+        int64_t acquire_end_us = g_get_monotonic_time();
+        uint64_t acquire_us = (uint64_t)(acquire_end_us - acquire_start_us);
+        state->vfmcap_acquire_total_us += acquire_us;
+        if (acquire_us > state->vfmcap_acquire_max_us)
+            state->vfmcap_acquire_max_us = acquire_us;
+
+        if (rc == VFMCAP_ERR_TIMEOUT || rc == VFMCAP_ERR_NOSIG) {
+            if (rc == VFMCAP_ERR_TIMEOUT) {
+                state->vfmcap_acquire_timeouts++;
+                state->vfmcap_consecutive_nosig = 0;
+            } else {
+                state->vfmcap_acquire_nosig++;
+                state->vfmcap_consecutive_nosig++;
+                if (state->vfmcap_consecutive_nosig >= SBS_VFMCAP_NOSIG_RECOVER_THRESHOLD) {
+                    if (have_frame)
+                        vfmcap_release_frame(state->vfmcap_ctx, &frame);
+                    state->vfmcap_frame_timer = 0;
+                    source_worker_vfmcap_begin_recovery(state, "sustained NOSIG");
+                    return G_SOURCE_REMOVE;
+                }
             }
+            if (have_frame)
+                break;
+            return G_SOURCE_CONTINUE;
         }
+        if (rc < 0 && rc != VFMCAP_RECONFIGURED) {
+            state->vfmcap_acquire_errors++;
+            LOG_W("vfmcap_acquire_frame failed: %d (%s)", rc, vfmcap_last_error(state->vfmcap_ctx));
+            if (have_frame)
+                break;
+            return G_SOURCE_CONTINUE;
+        }
+
+        state->vfmcap_acquire_ok++;
+        state->vfmcap_consecutive_nosig = 0;
+        if (rc == VFMCAP_RECONFIGURED) {
+            state->vfmcap_acquire_reconfigured++;
+            saw_reconfigured = true;
+        }
+        if (state->vfmcap_last_success_us > 0) {
+            uint64_t gap_us = (uint64_t)(acquire_end_us - state->vfmcap_last_success_us);
+            state->vfmcap_success_intervals++;
+            state->vfmcap_success_interval_total_us += gap_us;
+            if (gap_us > state->vfmcap_success_interval_max_us)
+                state->vfmcap_success_interval_max_us = gap_us;
+        }
+        state->vfmcap_last_success_us = acquire_end_us;
+
+        if (have_frame) {
+            state->frames_dropped++;
+            vfmcap_release_frame(state->vfmcap_ctx, &frame);
+        }
+        frame = next_frame;
+        have_frame = true;
+    }
+
+    if (!have_frame)
         return G_SOURCE_CONTINUE;
-    }
-    if (rc < 0 && rc != VFMCAP_RECONFIGURED) {
-        state->vfmcap_acquire_errors++;
-        LOG_W("vfmcap_acquire_frame failed: %d (%s)", rc, vfmcap_last_error(state->vfmcap_ctx));
-        return G_SOURCE_CONTINUE;
-    }
-    state->vfmcap_acquire_ok++;
-    state->vfmcap_consecutive_nosig = 0;
-    if (rc == VFMCAP_RECONFIGURED)
-        state->vfmcap_acquire_reconfigured++;
-    if (state->vfmcap_last_success_us > 0) {
-        uint64_t gap_us = (uint64_t)(acquire_end_us - state->vfmcap_last_success_us);
-        state->vfmcap_success_intervals++;
-        state->vfmcap_success_interval_total_us += gap_us;
-        if (gap_us > state->vfmcap_success_interval_max_us)
-            state->vfmcap_success_interval_max_us = gap_us;
-    }
-    state->vfmcap_last_success_us = acquire_end_us;
 
     if (frame.dmabuf_fd < 0) {
         state->vfmcap_no_fd_drops++;
@@ -2174,7 +2199,7 @@ static gboolean on_vfmcap_frame_timeout(gpointer user_data)
         state->frame_counter++;
     }
 
-    if (rc == VFMCAP_RECONFIGURED) {
+    if (saw_reconfigured) {
         LOG_I("vfmcap dynamic reconfiguration detected");
     }
 

@@ -49,10 +49,9 @@ static uint32_t encoder_num(GHashTable *encoder, const char *key, uint32_t fallb
 static const char *resolve_shared_codec_for_sink(const char *sink_type,
                                                  const char *requested_codec)
 {
+    (void)sink_type;
     if (requested_codec && *requested_codec)
         return requested_codec;
-    if (g_strcmp0(sink_type, "rtmp") == 0)
-        return "h264";
     return NULL;
 }
 

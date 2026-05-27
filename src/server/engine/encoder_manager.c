@@ -2239,9 +2239,9 @@ static GstElement *create_muxer(const char *codec, const char *sink_type,
                                  const char *file_container,
                                  const char **out_format)
 {
+    (void)codec;
     bool is_rtmp = (sink_type && strcmp(sink_type, "rtmp") == 0);
     bool is_file = (sink_type && strcmp(sink_type, "file") == 0);
-    bool is_h264 = (codec && strcmp(codec, "h264") == 0);
 
     *out_format = "mpegts";
     GstElement *muxer;
@@ -2272,7 +2272,7 @@ static GstElement *create_muxer(const char *codec, const char *sink_type,
             }
             *out_format = "mpegts";
         }
-    } else if (is_rtmp && is_h264) {
+    } else if (is_rtmp) {
         muxer = gst_element_factory_make("flvmux", NULL);
         if (muxer) {
             g_object_set(muxer,
@@ -2281,10 +2281,6 @@ static GstElement *create_muxer(const char *codec, const char *sink_type,
                 NULL);
         }
         *out_format = "flv";
-    } else if (is_rtmp) {
-        LOG_E("RTMP output requires H.264 because the available RTMP sinks accept FLV only (codec=%s)",
-              codec ? codec : "h265");
-        return NULL;
     } else {
         muxer = gst_element_factory_make("mpegtsmux", NULL);
         if (muxer) {
@@ -2692,7 +2688,7 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
 
     if (flv_muxer) {
         GstCaps *vcaps;
-        vparser = gst_element_factory_make("h264parse", NULL);
+        vparser = gst_element_factory_make(mgr->is_h265 ? "h265parse" : "h264parse", NULL);
         vcapsfilter = gst_element_factory_make("capsfilter", NULL);
         if (vparser) {
             g_object_set(vparser,
@@ -2700,10 +2696,17 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
                 "disable-passthrough", TRUE,
                 NULL);
         }
-        vcaps = gst_caps_new_simple("video/x-h264",
-            "stream-format", G_TYPE_STRING, "avc",
-            "alignment",     G_TYPE_STRING, "au",
-            NULL);
+        if (mgr->is_h265) {
+            vcaps = gst_caps_new_simple("video/x-h265",
+                "stream-format", G_TYPE_STRING, "hvc1",
+                "alignment",     G_TYPE_STRING, "au",
+                NULL);
+        } else {
+            vcaps = gst_caps_new_simple("video/x-h264",
+                "stream-format", G_TYPE_STRING, "avc",
+                "alignment",     G_TYPE_STRING, "au",
+                NULL);
+        }
         if (vcapsfilter)
             g_object_set(vcapsfilter, "caps", vcaps, NULL);
         gst_caps_unref(vcaps);

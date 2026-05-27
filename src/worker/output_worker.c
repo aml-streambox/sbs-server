@@ -381,7 +381,6 @@ static GstElement *build_output_pipeline(sbs_worker_config_t *config)
     /* Create muxer */
     bool is_rtmp = (config->output.sink_type && strcmp(config->output.sink_type, "rtmp") == 0);
     bool is_file = (config->output.sink_type && strcmp(config->output.sink_type, "file") == 0);
-    bool is_h264 = (codec && strcmp(codec, "h264") == 0);
     const char *file_container = normalized_file_container(config->output.file_container);
     GstElement *muxer = NULL;
     if (is_file && strcmp(file_container, "mkv") == 0) {
@@ -390,7 +389,7 @@ static GstElement *build_output_pipeline(sbs_worker_config_t *config)
         muxer = gst_element_factory_make("flvmux", "mux");
     } else if (is_file && strcmp(file_container, "mp4") == 0) {
         muxer = gst_element_factory_make("mp4mux", "mux");
-    } else if (is_rtmp && is_h264) {
+    } else if (is_rtmp) {
         muxer = gst_element_factory_make("flvmux", "mux");
     } else {
         muxer = gst_element_factory_make("mpegtsmux", "mux");

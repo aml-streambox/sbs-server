@@ -735,7 +735,7 @@ static int apply_scene_graph_bundle(sbs_api_server_t *server, cJSON *bundle)
             load_audio_binding(audio_obj, &source->audio, create.kind == SBS_SOURCE_KIND_ALSA_AUDIO);
             if (create.kind == SBS_SOURCE_KIND_ALSA_AUDIO && !source->audio.device) {
                 const char *device = source->config ? g_hash_table_lookup(source->config, "device") : NULL;
-                source->audio.device = g_strdup(device && device[0] ? device : "hw:0,2");
+                source->audio.device = g_strdup(device && device[0] ? device : "hdmi_auto");
             }
         }
     }

@@ -136,8 +136,8 @@ static cJSON *create_source_kind_json(sbs_source_kind_t kind, bool include_field
         break;
     case SBS_SOURCE_KIND_VFMCAP:
         cJSON_AddStringToObject(obj, "id", "vfmcap");
-        cJSON_AddStringToObject(obj, "name", "VFM Capture");
-        cJSON_AddStringToObject(obj, "summary", "Direct libvfmcap HDMI capture passthrough");
+        cJSON_AddStringToObject(obj, "name", "HDMI in capture");
+        cJSON_AddStringToObject(obj, "summary", "Board HDMI input video capture");
         cJSON_AddBoolToObject(obj, "pausable", false);
         cJSON_AddItemToArray(fields, source_field_string("device", "Device Path", "/dev/video_cap"));
         cJSON_AddItemToArray(fields, source_field_select("output_format", "Output Format", "raw", vfmcap_formats));
@@ -147,7 +147,7 @@ static cJSON *create_source_kind_json(sbs_source_kind_t kind, bool include_field
         cJSON_AddStringToObject(obj, "name", "ALSA Audio Input");
         cJSON_AddStringToObject(obj, "summary", "Audio-only input from an ALSA PCM device");
         cJSON_AddBoolToObject(obj, "pausable", false);
-        cJSON_AddItemToArray(fields, source_field_string("device", "ALSA Device", "hw:0,2"));
+        cJSON_AddItemToArray(fields, source_field_string("device", "ALSA Device", "hdmi_auto"));
         break;
     default:
         cJSON_Delete(fields);
@@ -201,7 +201,7 @@ static void sync_alsa_audio_source_config(sbs_source_state_t *source)
         g_free(source->audio.device);
         source->audio.device = g_strdup(device);
     } else if (!source->audio.device) {
-        source->audio.device = g_strdup("hw:0,2");
+        source->audio.device = g_strdup("hdmi_auto");
     }
     if (source->audio.volume < 0.0) {
         source->audio.volume = 1.0;
@@ -214,9 +214,9 @@ static void sync_alsa_audio_source_config(sbs_source_state_t *source)
     }
 }
 
-static char *read_alsa_card_id(uint32_t card)
+static char *read_alsa_card_file(uint32_t card, const char *name)
 {
-    char *path = g_strdup_printf("/proc/asound/card%u/id", card);
+    char *path = g_strdup_printf("/proc/asound/card%u/%s", card, name);
     gchar *contents = NULL;
     gsize length = 0;
 
@@ -229,12 +229,86 @@ static char *read_alsa_card_id(uint32_t card)
     return contents;
 }
 
+static char *read_alsa_card_id(uint32_t card)
+{
+    return read_alsa_card_file(card, "id");
+}
+
+static char *read_trimmed_file(const char *path)
+{
+    gchar *contents = NULL;
+
+    if (!path || !g_file_get_contents(path, &contents, NULL, NULL)) {
+        return NULL;
+    }
+    g_strstrip(contents);
+    return contents;
+}
+
+static bool text_is_truthy(const char *text)
+{
+    return text && text[0] &&
+           g_ascii_strcasecmp(text, "0") != 0 &&
+           g_ascii_strcasecmp(text, "false") != 0 &&
+           g_ascii_strcasecmp(text, "no") != 0;
+}
+
+static bool hdmitx_mode_enabled(const char *mode)
+{
+    return mode && mode[0] &&
+           g_ascii_strcasecmp(mode, "0") != 0 &&
+           g_ascii_strcasecmp(mode, "null") != 0 &&
+           g_ascii_strcasecmp(mode, "invalid") != 0;
+}
+
+static bool systemd_service_active(const char *service)
+{
+    char *systemctl = g_find_program_in_path("systemctl");
+    gint status = 0;
+    gboolean ok;
+
+    if (!systemctl || !service || !service[0]) {
+        g_free(systemctl);
+        return false;
+    }
+
+    gchar *argv[] = { systemctl, "is-active", "--quiet", (gchar *)service, NULL };
+    ok = g_spawn_sync(NULL, argv, NULL,
+                      G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
+                      NULL, NULL, NULL, NULL, &status, NULL);
+    g_free(systemctl);
+    return ok && status == 0;
+}
+
+static cJSON *discover_hdmi_audio_status(void)
+{
+    char *ready = read_trimmed_file("/sys/class/amhdmitx/amhdmitx0/ready");
+    char *mode = read_trimmed_file("/sys/class/amhdmitx/amhdmitx0/disp_mode");
+    bool streambox_tv_active = systemd_service_active("streambox-tv.service");
+    bool tvserver_active = systemd_service_active("tvserver.service");
+    bool hdmitx_ready = text_is_truthy(ready);
+    bool hdmitx_enabled = hdmitx_mode_enabled(mode);
+    cJSON *obj = cJSON_CreateObject();
+
+    cJSON_AddBoolToObject(obj, "streambox_tv_active", streambox_tv_active);
+    cJSON_AddBoolToObject(obj, "tvserver_active", tvserver_active);
+    cJSON_AddBoolToObject(obj, "hdmitx_ready", hdmitx_ready);
+    cJSON_AddBoolToObject(obj, "hdmitx_enabled", hdmitx_enabled);
+    cJSON_AddBoolToObject(obj, "hdmitx_passthrough", hdmitx_ready && hdmitx_enabled && (streambox_tv_active || tvserver_active));
+    cJSON_AddStringToObject(obj, "hdmitx_mode", mode ? mode : "");
+
+    g_free(mode);
+    g_free(ready);
+    return obj;
+}
+
 static void add_alsa_capture_device(cJSON *devices,
                                     uint32_t card,
                                     uint32_t device,
                                     const char *name)
 {
     char *card_id = read_alsa_card_id(card);
+    char *usb_id = read_alsa_card_file(card, "usbid");
     char *hw_device = g_strdup_printf("hw:%u,%u", card, device);
     char *pcm_device = card_id && card_id[0]
         ? g_strdup_printf("plughw:%s,%u", card_id, device)
@@ -244,6 +318,7 @@ static void add_alsa_capture_device(cJSON *devices,
                                     name && name[0] ? name : "ALSA Capture",
                                     pcm_device);
     cJSON *obj = cJSON_CreateObject();
+    cJSON *hints = cJSON_CreateArray();
 
     cJSON_AddStringToObject(obj, "id", id);
     cJSON_AddNumberToObject(obj, "card", card);
@@ -253,12 +328,19 @@ static void add_alsa_capture_device(cJSON *devices,
     cJSON_AddStringToObject(obj, "display_name", display);
     cJSON_AddStringToObject(obj, "device", pcm_device);
     cJSON_AddStringToObject(obj, "hw_device", hw_device);
+    cJSON_AddStringToObject(obj, "usb_id", usb_id ? usb_id : "");
+    cJSON_AddBoolToObject(obj, "usb", usb_id && usb_id[0]);
+    if (usb_id && usb_id[0]) {
+        cJSON_AddItemToArray(hints, cJSON_CreateString("usb"));
+    }
+    cJSON_AddItemToObject(obj, "type_hints", hints);
     cJSON_AddItemToArray(devices, obj);
 
     g_free(display);
     g_free(id);
     g_free(pcm_device);
     g_free(hw_device);
+    g_free(usb_id);
     g_free(card_id);
 }
 
@@ -404,6 +486,7 @@ int sbs_api_handle_source_discover_alsa(sbs_api_server_t *server, sbs_api_client
 
     *result = cJSON_CreateObject();
     cJSON_AddItemToObject(*result, "devices", discover_alsa_capture_devices());
+    cJSON_AddItemToObject(*result, "hdmi", discover_hdmi_audio_status());
     return SBS_OK;
 }
 

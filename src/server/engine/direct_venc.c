@@ -15,7 +15,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
-#include <sys/mman.h>
 #include <unistd.h>
 
 #ifndef DRM_FORMAT_NV21
@@ -404,17 +403,6 @@ static uint64_t calculate_frame_duration_ns(uint32_t fps_num, uint32_t fps_den)
         fps_den = 1;
 
     return (1000000000ull * (uint64_t)fps_den) / (uint64_t)fps_num;
-}
-
-static void p010_pre_byteswap(uint8_t *data, size_t size)
-{
-    size_t even_size = size & ~(size_t)1;
-
-    for (size_t i = 0; i < even_size; i += 2) {
-        uint8_t tmp = data[i];
-        data[i] = data[i + 1];
-        data[i + 1] = tmp;
-    }
 }
 
 static size_t visible_frame_size_from_msg(const sbs_video_frame_msg_t *msg,
@@ -1018,10 +1006,8 @@ int sbs_direct_venc_submit_dmabuf(sbs_direct_venc_t *enc,
                                    sbs_direct_venc_packet_t *packet)
 {
     vl_buffer_info_t inbuf;
-    void *mapped;
-    uint8_t *owned_input;
-    size_t submit_size;
-    int rc;
+
+    (void)size;
 
     if (!enc || !msg || dmabuf_fd < 0)
         return SBS_ERR_INVAL;
@@ -1038,46 +1024,22 @@ int sbs_direct_venc_submit_dmabuf(sbs_direct_venc_t *enc,
         }
     }
 
-    submit_size = size;
-    if (submit_size == 0)
-        submit_size = visible_frame_size_from_msg(msg, enc->input_hdr10);
-    if (submit_size == 0)
-        return SBS_ERR_INVAL;
-
-    sync_dmabuf_write_end(dmabuf_fd);
-    sync_dmabuf_read(dmabuf_fd, true);
-    mapped = mmap(NULL, submit_size, PROT_READ, MAP_SHARED, dmabuf_fd, 0);
-    if (mapped == MAP_FAILED) {
-        sync_dmabuf_read(dmabuf_fd, false);
-        LOG_E("dmabuf mmap for VMALLOC submit failed: %s", g_strerror(errno));
-        return SBS_ERR_IO;
-    }
-
-    owned_input = g_malloc(submit_size);
-    if (!owned_input) {
-        munmap(mapped, submit_size);
-        sync_dmabuf_read(dmabuf_fd, false);
-        return SBS_ERR_NOMEM;
-    }
-    memcpy(owned_input, mapped, submit_size);
-    munmap(mapped, submit_size);
-    sync_dmabuf_read(dmabuf_fd, false);
-    if (enc->input_format == SBS_PIXEL_FORMAT_P010)
-        p010_pre_byteswap(owned_input, submit_size);
-
     memset(&inbuf, 0, sizeof(inbuf));
-    inbuf.buf_type = VMALLOC_TYPE;
+    inbuf.buf_type = DMA_TYPE;
     inbuf.buf_fmt = enc->input_format == SBS_PIXEL_FORMAT_P010 ? IMG_FMT_P010 : IMG_FMT_NV21;
     inbuf.buf_stride = (int)(msg->plane_stride[0] > 0
         ? msg->plane_stride[0]
         : (enc->input_format == SBS_PIXEL_FORMAT_P010 ? msg->width * 2u : msg->width));
-    inbuf.buf_info.in_ptr[0] = (unsigned long)owned_input;
-    inbuf.buf_info.in_ptr[1] = 0;
-    inbuf.buf_info.in_ptr[2] = 0;
+    inbuf.buf_info.dma_info.shared_fd[0] = dmabuf_fd;
+    /* Native SDR/HDR export uses one contiguous codecmm DMA-BUF with Y
+     * followed by interleaved UV. libvpcodec's DMA path accepts this as a
+     * single-plane YUV buffer and resolves chroma addresses from stride/format. */
+    inbuf.buf_info.dma_info.shared_fd[1] = -1;
+    inbuf.buf_info.dma_info.shared_fd[2] = -1;
+    inbuf.buf_info.dma_info.num_planes = 1u;
 
-    log_input_contract(enc, "dmabuf-vmalloc", msg, &inbuf, submit_size);
+    log_input_contract(enc, "dmabuf", msg, &inbuf, size);
 
-    rc = submit_common(enc, msg, &inbuf, -1, owned_input, submit_size,
-                       force_idr, packet);
-    return rc;
+    return submit_common(enc, msg, &inbuf, dmabuf_fd, NULL, 0,
+                         force_idr, packet);
 }

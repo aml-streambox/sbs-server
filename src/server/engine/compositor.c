@@ -793,7 +793,7 @@ static int create_native_preview_ring(sbs_compositor_t *comp,
 
         if (allocate_native_canvas_entry(comp, entry, i,
                                           color_mode,
-                                          width, height, true) != 0) {
+                                          width, height, false) != 0) {
             destroy_native_preview_ring(comp);
             return -1;
         }

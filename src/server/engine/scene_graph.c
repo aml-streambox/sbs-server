@@ -924,6 +924,19 @@ static cJSON *output_encoder_to_public_json(GHashTable *map)
                                   value && ((const char *)value)[0] != '\0');
             continue;
         }
+        if (g_strcmp0((const char *)key, "srt_stream_key") == 0 ||
+            g_strcmp0((const char *)key, "srt_stream_id") == 0) {
+            cJSON_AddBoolToObject(obj, "srt_stream_key_set",
+                                  value && ((const char *)value)[0] != '\0');
+            cJSON_AddBoolToObject(obj, "srt_stream_id_set",
+                                  value && ((const char *)value)[0] != '\0');
+            continue;
+        }
+        if (g_strcmp0((const char *)key, "srt_passphrase") == 0) {
+            cJSON_AddBoolToObject(obj, "srt_passphrase_set",
+                                  value && ((const char *)value)[0] != '\0');
+            continue;
+        }
         if (g_strcmp0((const char *)key, "remote_password") == 0) {
             cJSON_AddBoolToObject(obj, "remote_password_set",
                                   value && ((const char *)value)[0] != '\0');

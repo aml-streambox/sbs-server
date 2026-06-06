@@ -50,6 +50,20 @@ static gboolean    on_frame_received(gint fd, GIOCondition cond, gpointer user_d
 static gboolean    on_bus_message(GstBus *bus, GstMessage *msg, gpointer user_data);
 static gboolean    on_heartbeat(gpointer user_data);
 
+static bool srt_mode_is_caller(const char *mode)
+{
+    return mode &&
+           (g_ascii_strcasecmp(mode, "caller") == 0 ||
+            g_ascii_strcasecmp(mode, "client") == 0);
+}
+
+static bool srt_mode_is_listener(const char *mode)
+{
+    return !mode || !*mode ||
+           g_ascii_strcasecmp(mode, "listener") == 0 ||
+           g_ascii_strcasecmp(mode, "server") == 0;
+}
+
 /* ── Encoder Element Selection ────────────────────────────────── */
 
 /**
@@ -424,19 +438,43 @@ static GstElement *build_output_pipeline(sbs_worker_config_t *config)
     GstElement *sink  = NULL;
     const char *sink_type = config->output.sink_type;
     const char *srt_uri   = config->output.srt_uri;
+    const char *srt_mode  = config->output.srt_mode;
+    const char *srt_stream_key = config->output.srt_stream_key;
+    const char *srt_passphrase = config->output.srt_passphrase;
     const char *rtmp_uri  = config->output.rtmp_uri;
     const char *rtmp_passcode = config->output.rtmp_passcode;
     const char *file_path = config->output.file_path;
 
     if ((!sink_type || strcmp(sink_type, "srt") == 0) && srt_uri && strlen(srt_uri) > 0) {
+        gint mode = 2;
+        if (srt_mode_is_caller(srt_mode)) {
+            mode = 1;
+        } else if (!srt_mode_is_listener(srt_mode)) {
+            LOG_E("SRT sink requested with unsupported srt_mode='%s'", srt_mode ? srt_mode : "<null>");
+            return NULL;
+        }
         sink = gst_element_factory_make("srtsink", "sink");
         if (sink) {
             g_object_set(sink,
                 "uri",                 srt_uri,
+                "mode",                mode,
                 "wait-for-connection", FALSE,
                 "sync",               FALSE,
                 NULL);
-            LOG_I("SRT sink: %s", srt_uri);
+            if (srt_stream_key && *srt_stream_key &&
+                g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "streamid")) {
+                g_object_set(sink, "streamid", srt_stream_key, NULL);
+            }
+            if (srt_passphrase && *srt_passphrase) {
+                if (g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "pbkeylen"))
+                    g_object_set(sink, "pbkeylen", (gint)16, NULL);
+                if (g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "passphrase"))
+                    g_object_set(sink, "passphrase", srt_passphrase, NULL);
+            }
+            LOG_I("SRT sink: mode=%s streamid=%s passphrase=%s",
+                  mode == 1 ? "caller" : "listener",
+                  srt_stream_key && *srt_stream_key ? "set" : "not-set",
+                  srt_passphrase && *srt_passphrase ? "set" : "not-set");
         }
     } else if (sink_type && strcmp(sink_type, "rtmp") == 0 && rtmp_uri && strlen(rtmp_uri) > 0) {
         char *location = build_rtmp_location(rtmp_uri, rtmp_passcode);
@@ -448,6 +486,7 @@ static GstElement *build_output_pipeline(sbs_worker_config_t *config)
             g_object_set(sink,
                 "location", location ? location : rtmp_uri,
                 "sync",     FALSE,
+                "async",    FALSE,
                 NULL);
             LOG_I("RTMP sink: %s%s", rtmp_uri,
                   rtmp_passcode && *rtmp_passcode ? " (stream key set)" : "");
@@ -492,6 +531,21 @@ static GstElement *build_output_pipeline(sbs_worker_config_t *config)
         if (aenc) gst_object_unref(aenc);
         if (aparse) gst_object_unref(aparse);
         return NULL;
+    }
+
+    if (is_rtmp) {
+        g_object_set(q2,
+            "max-size-buffers", (guint)8,
+            "max-size-time",    (guint64)(250 * GST_MSECOND),
+            "max-size-bytes",   (guint)0,
+            "leaky",            2,
+            NULL);
+        g_object_set(aq1,
+            "max-size-buffers", (guint)0,
+            "max-size-time",    (guint64)(250 * GST_MSECOND),
+            "max-size-bytes",   (guint)0,
+            "leaky",            2,
+            NULL);
     }
 
     /* Add all elements to the pipeline */
@@ -851,12 +905,13 @@ int output_worker_run(sbs_worker_ctx_t *ctx)
         .io_watch_id     = 0,
     };
 
-    LOG_I("building output pipeline: %ux%u@%u/%u codec=%s bitrate=%u srt=%s",
+    LOG_I("building output pipeline: %ux%u@%u/%u codec=%s bitrate=%u sink=%s srt_mode=%s",
           ctx->config.width, ctx->config.height,
           ctx->config.framerate_num, ctx->config.framerate_den,
           ctx->config.output.codec ? ctx->config.output.codec : "h265",
           ctx->config.output.bitrate,
-          ctx->config.output.srt_uri ? ctx->config.output.srt_uri : "(none)");
+          ctx->config.output.sink_type ? ctx->config.output.sink_type : "srt",
+          ctx->config.output.srt_mode ? ctx->config.output.srt_mode : "listener");
 
     /* Build the GStreamer pipeline.
      * With the ION allocator fix (heap type 16 patch in gstamlionallocator.c),

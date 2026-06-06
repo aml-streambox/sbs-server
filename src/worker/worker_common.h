@@ -49,6 +49,9 @@ typedef struct sbs_output_config {
     uint32_t  bitrate;          /* Target bitrate in kbps */
     char     *sink_type;        /* "srt", "rtmp", "file", "fakesink" */
     char     *srt_uri;          /* SRT listener/caller URI */
+    char     *srt_mode;         /* "listener"/"server" or "caller"/"client" */
+    char     *srt_stream_key;   /* Optional SRT streamid/stream key */
+    char     *srt_passphrase;   /* Optional SRT encryption passphrase */
     uint32_t  srt_latency_ms;  /* SRT latency (default: 600) */
     char     *rtmp_uri;         /* RTMP URI (e.g. "rtmp://server/live/key") */
     char     *rtmp_passcode;    /* Optional RTMP stream key */

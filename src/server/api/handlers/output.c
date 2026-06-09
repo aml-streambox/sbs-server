@@ -285,6 +285,9 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
         const char *rtmp_passcode = json_str_alias(params, "rtmp_stream_key", "rtmp_passcode");
         sink_cfg.rtmp_passcode = rtmp_passcode ? rtmp_passcode : encoder_str(output->encoder, "rtmp_passcode", NULL);
 
+        const char *rtmp_plugin = json_str(params, "rtmp_plugin");
+        sink_cfg.rtmp_plugin = rtmp_plugin ? rtmp_plugin : encoder_str(output->encoder, "rtmp_plugin", NULL);
+
         const char *rtmp_flv_mode = json_str(params, "rtmp_flv_mode");
         sink_cfg.rtmp_flv_mode = rtmp_flv_mode ? rtmp_flv_mode : encoder_str(output->encoder, "rtmp_flv_mode", NULL);
 
@@ -335,6 +338,8 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
             g_hash_table_insert(output->encoder, g_strdup("rtmp_uri"), g_strdup(sink_cfg.rtmp_uri));
         if (sink_cfg.rtmp_passcode)
             g_hash_table_insert(output->encoder, g_strdup("rtmp_passcode"), g_strdup(sink_cfg.rtmp_passcode));
+        if (sink_cfg.rtmp_plugin)
+            g_hash_table_insert(output->encoder, g_strdup("rtmp_plugin"), g_strdup(sink_cfg.rtmp_plugin));
         if (sink_cfg.rtmp_flv_mode)
             g_hash_table_insert(output->encoder, g_strdup("rtmp_flv_mode"), g_strdup(sink_cfg.rtmp_flv_mode));
         if (resolved_codec && *resolved_codec)
@@ -387,6 +392,9 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
         const char *rtmp_passcode = json_str_alias(params, "rtmp_stream_key", "rtmp_passcode");
         cfg.rtmp_passcode = rtmp_passcode ? rtmp_passcode : encoder_str(output->encoder, "rtmp_passcode", NULL);
 
+        const char *rtmp_plugin = json_str(params, "rtmp_plugin");
+        cfg.rtmp_plugin = rtmp_plugin ? rtmp_plugin : encoder_str(output->encoder, "rtmp_plugin", NULL);
+
         const char *file_path = json_str(params, "file_path");
         cfg.file_path = file_path ? file_path : encoder_str(output->encoder, "file_path", NULL);
 
@@ -430,6 +438,8 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
             g_hash_table_insert(output->encoder, g_strdup("rtmp_uri"), g_strdup(cfg.rtmp_uri));
         if (cfg.rtmp_passcode)
             g_hash_table_insert(output->encoder, g_strdup("rtmp_passcode"), g_strdup(cfg.rtmp_passcode));
+        if (cfg.rtmp_plugin)
+            g_hash_table_insert(output->encoder, g_strdup("rtmp_plugin"), g_strdup(cfg.rtmp_plugin));
         if (cfg.file_path)
             g_hash_table_insert(output->encoder, g_strdup("file_path"), g_strdup(cfg.file_path));
         if (cfg.file_path_mode)
@@ -524,6 +534,7 @@ int sbs_api_handle_output_update(sbs_api_server_t *server, sbs_api_client_t *cli
             sink_cfg.srt_latency_ms = encoder_num(output->encoder, "srt_latency_ms", 600);
             sink_cfg.rtmp_uri = encoder_str(output->encoder, "rtmp_uri", NULL);
             sink_cfg.rtmp_passcode = encoder_str(output->encoder, "rtmp_passcode", NULL);
+            sink_cfg.rtmp_plugin = encoder_str(output->encoder, "rtmp_plugin", NULL);
             sink_cfg.rtmp_flv_mode = encoder_str(output->encoder, "rtmp_flv_mode", NULL);
             sink_cfg.file_path = encoder_str(output->encoder, "file_path", NULL);
             sink_cfg.file_path_mode = encoder_str(output->encoder, "file_path_mode", "file");
@@ -573,6 +584,7 @@ int sbs_api_handle_output_update(sbs_api_server_t *server, sbs_api_client_t *cli
             cfg.srt_latency_ms = encoder_num(output->encoder, "srt_latency_ms", 600);
             cfg.rtmp_uri = encoder_str(output->encoder, "rtmp_uri", NULL);
             cfg.rtmp_passcode = encoder_str(output->encoder, "rtmp_passcode", NULL);
+            cfg.rtmp_plugin = encoder_str(output->encoder, "rtmp_plugin", NULL);
             cfg.file_path = encoder_str(output->encoder, "file_path", NULL);
             cfg.file_path_mode = encoder_str(output->encoder, "file_path_mode", "file");
             cfg.file_prefix = encoder_str(output->encoder, "file_prefix", "stream");

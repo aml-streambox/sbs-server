@@ -149,6 +149,7 @@ typedef struct sink_branch {
 
     /* Deep-copied config for potential restart */
     char       *sink_type;
+    char       *rtmp_plugin;
     char       *rtmp_flv_mode;
     char       *srt_uri;
     char       *srt_mode;
@@ -3042,6 +3043,7 @@ static void sink_branch_free(gpointer data)
     g_free(branch->srt_passphrase);
     g_free(branch->rtmp_uri);
     g_free(branch->rtmp_passcode);
+    g_free(branch->rtmp_plugin);
     g_free(branch->rtmp_flv_mode);
     g_free(branch->file_path);
     g_free(branch->file_path_mode);
@@ -3124,6 +3126,23 @@ static const char *normalized_rtmp_flv_mode(const char *mode)
     return "enhanced";
 }
 
+static const char *normalized_rtmp_plugin(const char *plugin)
+{
+    const char *value = (plugin && *plugin) ? plugin : getenv("SBS_RTMP_PLUGIN");
+    if (!value || !*value)
+        return "streambox";
+    if (g_ascii_strcasecmp(value, "legacy") == 0 ||
+        g_ascii_strcasecmp(value, "stock") == 0 ||
+        g_ascii_strcasecmp(value, "rtmpsink") == 0)
+        return "legacy";
+    return "streambox";
+}
+
+static bool rtmp_plugin_is_legacy(const char *plugin)
+{
+    return strcmp(normalized_rtmp_plugin(plugin), "legacy") == 0;
+}
+
 static char *sanitize_file_prefix(const char *prefix)
 {
     char *safe = g_strdup((prefix && *prefix) ? prefix : "stream");
@@ -3167,8 +3186,9 @@ static char *resolve_file_location(const sbs_sink_branch_config_t *config)
 }
 
 static GstElement *create_muxer(const char *codec, const char *sink_type,
-                                 const char *file_container,
-                                 const char **out_format)
+                                  const char *file_container,
+                                  const char *rtmp_plugin,
+                                  const char **out_format)
 {
     (void)codec;
     bool is_rtmp = (sink_type && strcmp(sink_type, "rtmp") == 0);
@@ -3182,7 +3202,9 @@ static GstElement *create_muxer(const char *codec, const char *sink_type,
             muxer = gst_element_factory_make("matroskamux", NULL);
             *out_format = "mkv";
         } else if (strcmp(container, "flv") == 0) {
-            muxer = gst_element_factory_make("flvmux", NULL);
+            muxer = gst_element_factory_make("sflvmux", NULL);
+            if (!muxer)
+                muxer = gst_element_factory_make("flvmux", NULL);
             if (muxer) {
                 g_object_set(muxer,
                     "streamable", TRUE,
@@ -3204,13 +3226,15 @@ static GstElement *create_muxer(const char *codec, const char *sink_type,
             *out_format = "mpegts";
         }
     } else if (is_rtmp) {
-        muxer = gst_element_factory_make("flvmux", NULL);
+        bool legacy_plugin = rtmp_plugin_is_legacy(rtmp_plugin);
+        muxer = gst_element_factory_make(legacy_plugin ? "flvmux" : "sflvmux", NULL);
         if (muxer) {
             g_object_set(muxer,
                 "streamable", TRUE,
                 "latency",    (guint64)100000000,
                 NULL);
         }
+        LOG_I("RTMP muxer plugin: %s", legacy_plugin ? "legacy flvmux" : "streambox sflvmux");
         *out_format = "flv";
     } else {
         muxer = gst_element_factory_make("mpegtsmux", NULL);
@@ -3287,9 +3311,9 @@ static GstElement *create_sink(const sbs_sink_branch_config_t *config,
         }
     } else if (strcmp(sink_type, "rtmp") == 0) {
         if (config->rtmp_uri && strlen(config->rtmp_uri) > 0) {
+            bool legacy_plugin = rtmp_plugin_is_legacy(config->rtmp_plugin);
             char *location = build_rtmp_location(config->rtmp_uri, config->rtmp_passcode);
-            sink = gst_element_factory_make("rtmp2sink", NULL);
-            if (!sink) sink = gst_element_factory_make("rtmpsink", NULL);
+            sink = gst_element_factory_make(legacy_plugin ? "rtmpsink" : "srtmpsink", NULL);
             if (sink) {
                 g_object_set(sink,
                     "location", location ? location : config->rtmp_uri,
@@ -3298,6 +3322,7 @@ static GstElement *create_sink(const sbs_sink_branch_config_t *config,
                     NULL);
                 LOG_I("RTMP sink: %s%s", config->rtmp_uri,
                       config->rtmp_passcode && *config->rtmp_passcode ? " (stream key set)" : "");
+                LOG_I("RTMP sink plugin: %s", legacy_plugin ? "legacy rtmpsink" : "streambox srtmpsink");
             }
             g_free(location);
         } else {
@@ -3366,7 +3391,7 @@ static int start_srt_session(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
         audio_encoder = gst_element_factory_make("avenc_mp2fixed", NULL);
     audio_parser = gst_element_factory_make("mpegaudioparse", NULL);
     audio_capsfilter = gst_element_factory_make("capsfilter", NULL);
-    muxer = create_muxer(mgr->codec, "srt", NULL, &muxer_format);
+    muxer = create_muxer(mgr->codec, "srt", NULL, NULL, &muxer_format);
 
     sink = gst_element_factory_make("appsink", NULL);
 
@@ -3621,7 +3646,8 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
     GstElement *vpacer = gst_element_factory_make("identity", NULL);
     GstElement *aqueue = gst_element_factory_make("queue", NULL);
     const char *muxer_format = NULL;
-    GstElement *muxer  = create_muxer(mgr->codec, branch->sink_type, branch->file_container, &muxer_format);
+    GstElement *muxer  = create_muxer(mgr->codec, branch->sink_type, branch->file_container,
+                                      branch->rtmp_plugin, &muxer_format);
     GstElement *acapsfilter = NULL;
     GstElement *branch_audio_src = NULL;
     GstElement *branch_audio_convert = NULL;
@@ -3641,6 +3667,7 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
         .srt_latency_ms = branch->srt_latency_ms,
         .rtmp_uri     = branch->rtmp_uri,
         .rtmp_passcode = branch->rtmp_passcode,
+        .rtmp_plugin  = branch->rtmp_plugin,
         .rtmp_flv_mode = branch->rtmp_flv_mode,
         .file_path    = branch->file_path,
         .file_path_mode = branch->file_path_mode,
@@ -3650,7 +3677,7 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
     GstElement *sink = create_sink(&cfg, muxer_format);
 
     if (sink && branch->sink_type && strcmp(branch->sink_type, "rtmp") == 0 &&
-        (mgr->is_h265 || mgr->hdr10)) {
+        !rtmp_plugin_is_legacy(branch->rtmp_plugin) && (mgr->is_h265 || mgr->hdr10)) {
         const char *enhanced_codecs = mgr->is_h265 ? "hvc1" : "avc1";
         if (g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "enhanced-codecs")) {
             g_object_set(sink, "enhanced-codecs", enhanced_codecs, NULL);
@@ -4402,6 +4429,7 @@ int sbs_encoder_manager_update_config(sbs_encoder_manager_t *mgr,
         copy->srt_latency_ms = branch->srt_latency_ms;
         copy->rtmp_uri     = g_strdup(branch->rtmp_uri);
         copy->rtmp_passcode = g_strdup(branch->rtmp_passcode);
+        copy->rtmp_plugin = g_strdup(branch->rtmp_plugin);
         copy->rtmp_flv_mode = g_strdup(branch->rtmp_flv_mode);
         copy->file_path    = g_strdup(branch->file_path);
         copy->file_path_mode = g_strdup(branch->file_path_mode);
@@ -4468,6 +4496,7 @@ int sbs_encoder_manager_update_config(sbs_encoder_manager_t *mgr,
             .srt_latency_ms = saved->srt_latency_ms,
             .rtmp_uri     = saved->rtmp_uri,
             .rtmp_passcode = saved->rtmp_passcode,
+            .rtmp_plugin  = saved->rtmp_plugin,
             .rtmp_flv_mode = saved->rtmp_flv_mode,
             .file_path    = saved->file_path,
             .file_path_mode = saved->file_path_mode,
@@ -4700,6 +4729,7 @@ int sbs_encoder_manager_add_sink(sbs_encoder_manager_t *mgr,
         branch->srt_callers = g_hash_table_new(g_direct_hash, g_direct_equal);
     branch->rtmp_uri     = g_strdup(config->rtmp_uri);
     branch->rtmp_passcode = g_strdup(config->rtmp_passcode);
+    branch->rtmp_plugin = g_strdup(normalized_rtmp_plugin(config->rtmp_plugin));
     branch->rtmp_flv_mode = g_strdup(normalized_rtmp_flv_mode(config->rtmp_flv_mode));
     branch->flv_hevc_legacy_mode = strcmp(branch->rtmp_flv_mode, "legacy") == 0;
     flv_hevc_cache_hdr_metadata_values(branch, mgr);

@@ -481,6 +481,7 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
             const char *lat_str   = enc ? g_hash_table_lookup(enc, "srt_latency_ms") : NULL;
             const char *rtmp_uri  = enc ? g_hash_table_lookup(enc, "rtmp_uri")  : NULL;
             const char *rtmp_passcode = enc ? g_hash_table_lookup(enc, "rtmp_passcode") : NULL;
+            const char *rtmp_plugin = enc ? g_hash_table_lookup(enc, "rtmp_plugin") : NULL;
             const char *rtmp_flv_mode = enc ? g_hash_table_lookup(enc, "rtmp_flv_mode") : NULL;
             const char *file_path = enc ? g_hash_table_lookup(enc, "file_path") : NULL;
             const char *file_path_mode = enc ? g_hash_table_lookup(enc, "file_path_mode") : NULL;
@@ -503,6 +504,7 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
                 sink_cfg.srt_latency_ms = srt_latency;
                 sink_cfg.rtmp_uri       = rtmp_uri;
                 sink_cfg.rtmp_passcode  = rtmp_passcode;
+                sink_cfg.rtmp_plugin    = rtmp_plugin;
                 sink_cfg.rtmp_flv_mode  = rtmp_flv_mode;
                 sink_cfg.file_path      = file_path;
                 sink_cfg.file_path_mode = file_path_mode;

@@ -57,6 +57,7 @@ typedef struct sbs_sink_branch_config {
     uint32_t    srt_latency_ms;  /* SRT latency (default: 600) */
     const char *rtmp_uri;        /* RTMP URI */
     const char *rtmp_passcode;   /* Optional RTMP stream key */
+    const char *rtmp_plugin;     /* "streambox" (default) or "legacy" for stock flvmux+rtmpsink */
     const char *rtmp_flv_mode;   /* "enhanced" (default) or "legacy" for HEVC RTMP */
     const char *file_path;       /* File output path */
     const char *file_path_mode;  /* "file" or "directory" */

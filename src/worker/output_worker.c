@@ -16,6 +16,7 @@
 #include "sbs/log.h"
 
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -253,6 +254,23 @@ static const char *normalized_file_container(const char *container)
     return "ts";
 }
 
+static const char *normalized_rtmp_plugin(const char *plugin)
+{
+    const char *value = (plugin && *plugin) ? plugin : getenv("SBS_RTMP_PLUGIN");
+    if (!value || !*value)
+        return "streambox";
+    if (g_ascii_strcasecmp(value, "legacy") == 0 ||
+        g_ascii_strcasecmp(value, "stock") == 0 ||
+        g_ascii_strcasecmp(value, "rtmpsink") == 0)
+        return "legacy";
+    return "streambox";
+}
+
+static bool rtmp_plugin_is_legacy(const char *plugin)
+{
+    return strcmp(normalized_rtmp_plugin(plugin), "legacy") == 0;
+}
+
 static char *sanitize_file_prefix(const char *prefix)
 {
     char *safe = g_strdup((prefix && *prefix) ? prefix : "stream");
@@ -395,16 +413,19 @@ static GstElement *build_output_pipeline(sbs_worker_config_t *config)
     /* Create muxer */
     bool is_rtmp = (config->output.sink_type && strcmp(config->output.sink_type, "rtmp") == 0);
     bool is_file = (config->output.sink_type && strcmp(config->output.sink_type, "file") == 0);
+    bool legacy_rtmp_plugin = is_rtmp && rtmp_plugin_is_legacy(config->output.rtmp_plugin);
     const char *file_container = normalized_file_container(config->output.file_container);
     GstElement *muxer = NULL;
     if (is_file && strcmp(file_container, "mkv") == 0) {
         muxer = gst_element_factory_make("matroskamux", "mux");
     } else if (is_file && strcmp(file_container, "flv") == 0) {
-        muxer = gst_element_factory_make("flvmux", "mux");
+        muxer = gst_element_factory_make("sflvmux", "mux");
+        if (!muxer)
+            muxer = gst_element_factory_make("flvmux", "mux");
     } else if (is_file && strcmp(file_container, "mp4") == 0) {
         muxer = gst_element_factory_make("mp4mux", "mux");
     } else if (is_rtmp) {
-        muxer = gst_element_factory_make("flvmux", "mux");
+        muxer = gst_element_factory_make(legacy_rtmp_plugin ? "flvmux" : "sflvmux", "mux");
     } else {
         muxer = gst_element_factory_make("mpegtsmux", "mux");
     }
@@ -478,18 +499,24 @@ static GstElement *build_output_pipeline(sbs_worker_config_t *config)
         }
     } else if (sink_type && strcmp(sink_type, "rtmp") == 0 && rtmp_uri && strlen(rtmp_uri) > 0) {
         char *location = build_rtmp_location(rtmp_uri, rtmp_passcode);
-        sink = gst_element_factory_make("rtmp2sink", "sink");
-        if (!sink) {
-            sink = gst_element_factory_make("rtmpsink", "sink");
-        }
+        sink = gst_element_factory_make(legacy_rtmp_plugin ? "rtmpsink" : "srtmpsink", "sink");
         if (sink) {
             g_object_set(sink,
                 "location", location ? location : rtmp_uri,
                 "sync",     FALSE,
                 "async",    FALSE,
                 NULL);
+            if (!legacy_rtmp_plugin &&
+                g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "enhanced-codecs")) {
+                const char *enhanced_codecs = config->output.codec && strcmp(config->output.codec, "h264") == 0
+                    ? "avc1" : "hvc1";
+                g_object_set(sink, "enhanced-codecs", enhanced_codecs, NULL);
+            }
             LOG_I("RTMP sink: %s%s", rtmp_uri,
                   rtmp_passcode && *rtmp_passcode ? " (stream key set)" : "");
+            LOG_I("RTMP plugins: %s ! %s",
+                  legacy_rtmp_plugin ? "flvmux" : "sflvmux",
+                  legacy_rtmp_plugin ? "rtmpsink" : "srtmpsink");
         }
         g_free(location);
     } else if (sink_type && strcmp(sink_type, "file") == 0 && file_path && strlen(file_path) > 0) {

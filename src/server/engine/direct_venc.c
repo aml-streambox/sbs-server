@@ -623,7 +623,7 @@ static void log_h265_nal_summary(const uint8_t *data, size_t size)
     int off = 0;
     uint32_t count = 0;
 
-    if (!data || size == 0)
+    if (!sbs_log_profile_enabled() || !data || size == 0)
         return;
 
     summary[0] = '\0';
@@ -677,6 +677,8 @@ static void log_input_contract(const sbs_direct_venc_t *enc,
     size_t visible_size;
 
     if (!enc || !msg || !inbuf)
+        return;
+    if (!sbs_log_profile_enabled())
         return;
     if (enc->next_submit_id > 2 && !getenv("SBS_VENC_LOG_PARAMS"))
         return;
@@ -820,7 +822,7 @@ static int submit_common(sbs_direct_venc_t *enc,
     packet->dts_ns = UINT64_MAX;
     memset(&retbuf, 0, sizeof(retbuf));
 
-    if (enc->next_submit_id <= 2) {
+    if (sbs_log_profile_enabled() && enc->next_submit_id <= 2) {
         LOG_I("submit: buf_type=%d buf_fmt=%d stride=%d input_format=%s colorimetry=%s legacy_input_hdr10=%d legacy_hdr10=%d "
               "dma_fd=%d,%d planes=%u w=%u h=%u",
               inbuf->buf_type, inbuf->buf_fmt, inbuf->buf_stride,
@@ -894,7 +896,8 @@ static int submit_common(sbs_direct_venc_t *enc,
                            meta.extra.frame_type == FRAME_TYPE_IDR ||
                            meta.extra.frame_type == FRAME_TYPE_I;
 
-    if (enc->output_counter < 3 || packet->is_keyframe || getenv("SBS_VENC_LOG_PARAMS")) {
+    if (sbs_log_profile_enabled() &&
+        (enc->output_counter < 3 || packet->is_keyframe || getenv("SBS_VENC_LOG_PARAMS"))) {
         LOG_I("VENC OUTPUT CONTRACT: output=%lu request_idr=%d request_frame_type=%d meta={len=%d key=%d ts_us=%d input_frame_num=%d extra_type=%d qp=%d intra=%d merged=%d skipped=%d} retbuf={type=%s/%d fmt=%s/%d stride=%d ptr0=0x%lx dma_fd=%d,%d,%d dma_planes=%u} packet={size=%zu key=%d pts=%lu dts=%lu dur=%lu}",
               (unsigned long)enc->output_counter,
               request_idr,

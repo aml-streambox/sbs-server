@@ -1067,7 +1067,7 @@ static void fill_frame_from_caps(sbs_video_frame_msg_t *msg, GstCaps *caps)
         }
         {
             static uint32_t caps_log_counter = 0;
-            if (caps_log_counter++ % 60 == 0) {
+            if (sbs_log_profile_enabled() && caps_log_counter++ % 60 == 0) {
                 LOG_I("fill_frame_from_caps: fmt=%s drm_format=%.4s width=%u height=%u n_planes=%u stride0=%u stride1=%u offset0=%u offset1=%u",
                       gst_video_format_to_string(fmt),
                       (const char *)&msg->drm_format,
@@ -1172,7 +1172,8 @@ static GstFlowReturn on_new_sample(GstAppSink *appsink, gpointer user_data)
     msg.buffer_type = is_dmabuf ? SBS_FRAME_BUFFER_DMABUF : SBS_FRAME_BUFFER_MEMFD;
 
     /* Log buffer type on first frame, and every 60 frames thereafter */
-    if (state->frame_counter == 0 || state->frame_counter % 60 == 0) {
+    if (sbs_log_profile_enabled() &&
+        (state->frame_counter == 0 || state->frame_counter % 60 == 0)) {
         LOG_I("frame %lu exported as %s (fd=%d, %ux%u)",
               (unsigned long)state->frame_counter,
               is_dmabuf ? "DMA-BUF" : "memfd",
@@ -1289,7 +1290,8 @@ static gboolean on_text_frame_timeout(gpointer user_data)
     } else if (rc != SBS_OK) {
         LOG_W("text frame send failed: %d", rc);
         state->frames_dropped++;
-    } else if (state->frame_counter == 0 || state->frame_counter % 60 == 0) {
+    } else if (sbs_log_profile_enabled() &&
+               (state->frame_counter == 0 || state->frame_counter % 60 == 0)) {
         LOG_I("text frame %lu exported as %s (%ux%u font=%s size=%u)",
               (unsigned long)state->frame_counter,
               is_dmabuf ? "DMA-BUF" : "memfd",
@@ -1602,28 +1604,30 @@ static gboolean on_vfmcap_stats_timeout(gpointer user_data)
         expected_fps = (double)state->ctx->config.framerate_num / (double)den;
     }
 
-    LOG_I("vfmcap stats: sent=%lu %.1ffps expected=%.1f low=%u dropped=%lu leases=%u/%u max=%u "
-          "acq=%lu ok=%lu timeout=%lu nosig=%lu err=%lu reconfig=%lu "
-          "acq_ms=%.2f/%.2f gap_ms=%.2f/%.2f release=%lu unknown_release=%lu "
-          "send_block=%lu send_err=%lu no_lease=%lu no_fd=%lu split=%lu lease_full=%lu",
-          (unsigned long)sent, fps, expected_fps, state->vfmcap_low_fps_windows,
-          (unsigned long)dropped,
-          leases, SBS_VFMCAP_MAX_IN_FLIGHT, state->vfmcap_max_in_flight,
-          (unsigned long)state->vfmcap_acquire_attempts,
-          (unsigned long)state->vfmcap_acquire_ok,
-          (unsigned long)state->vfmcap_acquire_timeouts,
-          (unsigned long)state->vfmcap_acquire_nosig,
-          (unsigned long)state->vfmcap_acquire_errors,
-          (unsigned long)state->vfmcap_acquire_reconfigured,
-          avg_acquire_ms, max_acquire_ms, avg_gap_ms, max_gap_ms,
-          (unsigned long)state->vfmcap_release_acks,
-          (unsigned long)state->vfmcap_unknown_release_acks,
-          (unsigned long)state->vfmcap_send_would_block,
-          (unsigned long)state->vfmcap_send_errors,
-          (unsigned long)state->vfmcap_no_lease_skips,
-          (unsigned long)state->vfmcap_no_fd_drops,
-          (unsigned long)state->vfmcap_split_plane_drops,
-          (unsigned long)state->vfmcap_lease_full_drops);
+    if (sbs_log_profile_enabled()) {
+        LOG_I("vfmcap stats: sent=%lu %.1ffps expected=%.1f low=%u dropped=%lu leases=%u/%u max=%u "
+              "acq=%lu ok=%lu timeout=%lu nosig=%lu err=%lu reconfig=%lu "
+              "acq_ms=%.2f/%.2f gap_ms=%.2f/%.2f release=%lu unknown_release=%lu "
+              "send_block=%lu send_err=%lu no_lease=%lu no_fd=%lu split=%lu lease_full=%lu",
+              (unsigned long)sent, fps, expected_fps, state->vfmcap_low_fps_windows,
+              (unsigned long)dropped,
+              leases, SBS_VFMCAP_MAX_IN_FLIGHT, state->vfmcap_max_in_flight,
+              (unsigned long)state->vfmcap_acquire_attempts,
+              (unsigned long)state->vfmcap_acquire_ok,
+              (unsigned long)state->vfmcap_acquire_timeouts,
+              (unsigned long)state->vfmcap_acquire_nosig,
+              (unsigned long)state->vfmcap_acquire_errors,
+              (unsigned long)state->vfmcap_acquire_reconfigured,
+              avg_acquire_ms, max_acquire_ms, avg_gap_ms, max_gap_ms,
+              (unsigned long)state->vfmcap_release_acks,
+              (unsigned long)state->vfmcap_unknown_release_acks,
+              (unsigned long)state->vfmcap_send_would_block,
+              (unsigned long)state->vfmcap_send_errors,
+              (unsigned long)state->vfmcap_no_lease_skips,
+              (unsigned long)state->vfmcap_no_fd_drops,
+              (unsigned long)state->vfmcap_split_plane_drops,
+              (unsigned long)state->vfmcap_lease_full_drops);
+    }
 
     if (expected_fps >= 45.0 && fps < expected_fps * 0.75 &&
         leases < SBS_VFMCAP_MAX_IN_FLIGHT / 2 &&
@@ -2171,7 +2175,8 @@ static gboolean on_vfmcap_frame_timeout(gpointer user_data)
         msg.flags |= SBS_FRAME_FLAG_HDR;
     }
 
-    if (state->frame_counter == 0 || state->frame_counter % 60 == 0) {
+    if (sbs_log_profile_enabled() &&
+        (state->frame_counter == 0 || state->frame_counter % 60 == 0)) {
         LOG_I("vfmcap frame %lu %ux%u fmt=%s stride=%u off1=%u fd=%d fd2=%d",
               (unsigned long)state->frame_counter,
               msg.width, msg.height,

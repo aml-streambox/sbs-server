@@ -941,7 +941,8 @@ retire_done:
                              + (double)(ts_render_end.tv_nsec - ts_render_start.tv_nsec) / 1000000.0;
             ct->last_frame_ge2d = false;
 
-            if (ct->frame_count % 60 == 0 && (upload_ms > 10.0 || render_ms > 10.0)) {
+            if (sbs_log_profile_enabled() && ct->frame_count % 60 == 0 &&
+                (upload_ms > 10.0 || render_ms > 10.0)) {
                 LOG_I("render breakdown: frame=%lu upload=%.2fms render=%.2fms uploaded=%d ok=%d repeated=%d rc=%d",
                       (unsigned long)ct->frame_count, upload_ms, render_ms,
                       uploaded_count, uploaded_success_count,
@@ -1019,7 +1020,7 @@ retire_done:
         if (ct->last_loop_start_ns > 0) {
             double loop_ms = (double)(loop_start_ns - ct->last_loop_start_ns) / 1000000.0;
             ct->last_frame_interval_ms = loop_ms;
-            if (ct->frame_count % 60 == 0) {
+            if (sbs_log_profile_enabled() && ct->frame_count % 60 == 0) {
                 LOG_I("loop timing: frame=%lu render=%.2fms remain_ns=%ld loop_ms=%.2f",
                       (unsigned long)ct->frame_count, ct->last_frame_time_ms,
                       (long)remain_ns, loop_ms);

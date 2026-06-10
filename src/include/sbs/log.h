@@ -48,6 +48,12 @@ void sbs_log_set_level(sbs_log_level_t level);
 sbs_log_level_t sbs_log_get_level(void);
 
 /**
+ * Return true when high-frequency profiling logs are enabled.
+ * Disabled by default; set SBS_PROFILE_LOGS=1 to enable.
+ */
+bool sbs_log_profile_enabled(void);
+
+/**
  * Set file output. Pass NULL to disable file logging.
  */
 void sbs_log_set_file(FILE *fp);

@@ -466,7 +466,8 @@ static void *native_encoder_thread_func(void *arg)
         dropped_total = router->encoder_frames_dropped;
         pthread_mutex_unlock(&router->encoder_lock);
 
-        if (submitted && (elapsed > 30000 || submitted_total % 60 == 0)) {
+        if (sbs_log_profile_enabled() && submitted &&
+            (elapsed > 30000 || submitted_total % 60 == 0)) {
             LOG_I("NATIVE ENCODER frame=%lu total=%.1fms submitted=%lu dropped=%lu src=dmabuf",
                   (unsigned long)lease.frame_number,
                   elapsed / 1000.0,
@@ -579,7 +580,8 @@ static void *native_preview_thread_func(void *arg)
         dropped_total = router->preview_frames_dropped;
         pthread_mutex_unlock(&router->preview_lock);
 
-        if (submitted && (elapsed > 20000 || submitted_total % 60 == 0)) {
+        if (sbs_log_profile_enabled() && submitted &&
+            (elapsed > 20000 || submitted_total % 60 == 0)) {
             LOG_I("NATIVE PREVIEW frame=%lu push=%.1fms submitted=%lu dropped=%lu",
                   (unsigned long)lease.frame_number,
                   elapsed / 1000.0,
@@ -739,7 +741,8 @@ static void export_thread_process_frame(sbs_output_router_t *router,
                         native_encoder_content_already_queued(router, content_frame_number)) {
                         uint64_t skipped = native_encoder_note_duplicate_skipped(router);
                         delivered = true;
-                        if (skipped <= 5 || skipped % 60 == 0) {
+                        if (sbs_log_profile_enabled() &&
+                            (skipped <= 5 || skipped % 60 == 0)) {
                             LOG_I("NATIVE ENCODER duplicate skipped frame=%lu content=%lu skipped=%lu",
                                   (unsigned long)lease.frame_number,
                                   (unsigned long)content_frame_number,
@@ -1041,7 +1044,8 @@ audio_only:
     t_total = g_get_monotonic_time() - t_start;
 
     /* Log detailed timing every 60 frames (~1s) or when total > 20ms */
-    bool should_log = (latest_frame_number % 60 == 0) || (t_total > 20000);
+    bool should_log = sbs_log_profile_enabled() &&
+        ((latest_frame_number % 60 == 0) || (t_total > 20000));
     if (should_log) {
         LOG_I("TIMING frame=%lu total=%.1fms out_exp=%.1fms prev_exp=%.1fms "
               "prev_push=%.1fms enc_push=%.1fms prev=%s enc_sinks=%u dropped=%u "

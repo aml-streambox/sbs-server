@@ -93,6 +93,24 @@ sbs_log_level_t sbs_log_get_level(void)
     return g_logger.level;
 }
 
+static bool env_flag_enabled(const char *value)
+{
+    if (!value || !*value)
+        return false;
+    return strcmp(value, "1") == 0 ||
+           strcasecmp(value, "true") == 0 ||
+           strcasecmp(value, "yes") == 0 ||
+           strcasecmp(value, "on") == 0;
+}
+
+bool sbs_log_profile_enabled(void)
+{
+    const char *env = getenv("SBS_PROFILE_LOGS");
+    if (!env)
+        env = getenv("SBS_PROFILING_LOGS");
+    return env_flag_enabled(env);
+}
+
 void sbs_log_set_file(FILE *fp)
 {
     g_logger.file = fp;

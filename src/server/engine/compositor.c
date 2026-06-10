@@ -360,7 +360,7 @@ static int create_command_pool(sbs_compositor_t *comp)
 static int create_native_timing_query_pool(sbs_compositor_t *comp)
 {
     const char *env = getenv("SBS_NATIVE_GPU_TIMING");
-    if (!env || env[0] != '1')
+    if (!env || env[0] != '1' || !sbs_log_profile_enabled())
         return 0;
     const char *detail_env = getenv("SBS_NATIVE_GPU_TIMING_DETAIL");
     comp->native_timing_detail = detail_env && detail_env[0] == '1';
@@ -1680,6 +1680,11 @@ static void native_timing_read_and_log(sbs_compositor_t *comp,
         !comp->native_timing_available ||
         comp->native_timing_query_pool == VK_NULL_HANDLE)
         return;
+
+    if (!sbs_log_profile_enabled()) {
+        entry->timing_query_valid = false;
+        return;
+    }
 
     uint32_t mark_count = entry->timing_mark_count;
     if (mark_count < 4u || mark_count > SBS_NATIVE_TIMING_QUERY_MARKS)
@@ -3385,7 +3390,7 @@ int sbs_compositor_export_target_preview_ptr(sbs_compositor_t *comp,
     {
         static uint64_t _frame_ctr = 0;
         _frame_ctr++;
-        if (_frame_ctr % 60 == 0) {
+        if (sbs_log_profile_enabled() && _frame_ctr % 60 == 0) {
             struct timespec _ts_now;
             clock_gettime(CLOCK_MONOTONIC, &_ts_now);
             double ms = (_ts_now.tv_sec - _ts_begin.tv_sec) * 1000.0 +
@@ -5627,7 +5632,7 @@ static int export_target_nv21_compute(sbs_compositor_t *comp, uint32_t target_id
     {
         static uint64_t _frame_ctr = 0;
         _frame_ctr++;
-        if (_frame_ctr % 60 == 0) {
+        if (sbs_log_profile_enabled() && _frame_ctr % 60 == 0) {
             #define _TS_MS(a,b) (((b).tv_sec-(a).tv_sec)*1000.0 + ((b).tv_nsec-(a).tv_nsec)/1000000.0)
             LOG_I("COMPUTE_EXPORT fence=%.1fms dispatch=%.1fms gpu_wait=%.1fms memcpy=%.1fms total=%.1fms",
                   _TS_MS(_ts_begin, _ts_fence),
@@ -5785,7 +5790,7 @@ int sbs_compositor_export_target_nv21_ptr(sbs_compositor_t *comp,
     {
         static uint64_t _frame_ctr = 0;
         _frame_ctr++;
-        if (_frame_ctr % 60 == 0) {
+        if (sbs_log_profile_enabled() && _frame_ctr % 60 == 0) {
             #define _TS_MS(a,b) (((b).tv_sec-(a).tv_sec)*1000.0 + ((b).tv_nsec-(a).tv_nsec)/1000000.0)
             LOG_I("COMPUTE_PTR fence=%.1fms dispatch=%.1fms gpu_wait=%.1fms total=%.1fms",
                   _TS_MS(_ts_begin, _ts_fence),
@@ -6827,7 +6832,7 @@ static int import_dmabuf_source(sbs_compositor_t *comp, uint32_t slot,
         tex->dmabuf_buf_active_idx = target_idx;
         {
             static uint32_t ycbcr_log_counter = 0;
-            if (ycbcr_log_counter++ % 60 == 0) {
+            if (sbs_log_profile_enabled() && ycbcr_log_counter++ % 60 == 0) {
                 LOG_I("YCbCr NV12 import slot=%u cache[%d] %ux%u inode=%lu (zero compute!)",
                       slot, target_idx, width, height, (unsigned long)inode);
             }
@@ -6943,7 +6948,7 @@ try_compute_path:
     tex->upload_pending = true;
     {
         static uint32_t import_log_counter = 0;
-        if (import_log_counter++ % 60 == 0) {
+        if (sbs_log_profile_enabled() && import_log_counter++ % 60 == 0) {
             LOG_I("DMA-BUF import slot=%u cache[%d] %ux%u fmt=%.4s inode=%lu",
                   slot, target_idx, width, height, (const char *)&drm_format,
                   (unsigned long)inode);

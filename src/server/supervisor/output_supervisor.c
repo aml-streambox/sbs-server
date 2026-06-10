@@ -86,12 +86,8 @@ typedef struct sbs_output_entry {
     char        *cfg_encoder;
     char        *cfg_sink_type;
     char        *cfg_srt_uri;
-    char        *cfg_srt_mode;
-    char        *cfg_srt_stream_key;
-    char        *cfg_srt_passphrase;
     char        *cfg_rtmp_uri;
     char        *cfg_rtmp_passcode;
-    char        *cfg_rtmp_plugin;
     char        *cfg_file_path;
     char        *cfg_file_path_mode;
     char        *cfg_file_prefix;
@@ -260,12 +256,8 @@ int sbs_output_supervisor_start_output(sbs_output_supervisor_t *sup,
     entry->cfg_encoder   = config->encoder ? strdup(config->encoder) : NULL;
     entry->cfg_sink_type = config->sink_type ? strdup(config->sink_type) : NULL;
     entry->cfg_srt_uri   = config->srt_uri ? strdup(config->srt_uri) : NULL;
-    entry->cfg_srt_mode  = config->srt_mode ? strdup(config->srt_mode) : NULL;
-    entry->cfg_srt_stream_key = config->srt_stream_key ? strdup(config->srt_stream_key) : NULL;
-    entry->cfg_srt_passphrase = config->srt_passphrase ? strdup(config->srt_passphrase) : NULL;
     entry->cfg_rtmp_uri  = config->rtmp_uri ? strdup(config->rtmp_uri) : NULL;
     entry->cfg_rtmp_passcode = config->rtmp_passcode ? strdup(config->rtmp_passcode) : NULL;
-    entry->cfg_rtmp_plugin = config->rtmp_plugin ? strdup(config->rtmp_plugin) : NULL;
     entry->cfg_file_path = config->file_path ? strdup(config->file_path) : NULL;
     entry->cfg_file_path_mode = config->file_path_mode ? strdup(config->file_path_mode) : NULL;
     entry->cfg_file_prefix = config->file_prefix ? strdup(config->file_prefix) : NULL;
@@ -275,12 +267,8 @@ int sbs_output_supervisor_start_output(sbs_output_supervisor_t *sup,
     entry->config_copy.encoder   = entry->cfg_encoder;
     entry->config_copy.sink_type = entry->cfg_sink_type;
     entry->config_copy.srt_uri   = entry->cfg_srt_uri;
-    entry->config_copy.srt_mode  = entry->cfg_srt_mode;
-    entry->config_copy.srt_stream_key = entry->cfg_srt_stream_key;
-    entry->config_copy.srt_passphrase = entry->cfg_srt_passphrase;
     entry->config_copy.rtmp_uri  = entry->cfg_rtmp_uri;
     entry->config_copy.rtmp_passcode = entry->cfg_rtmp_passcode;
-    entry->config_copy.rtmp_plugin = entry->cfg_rtmp_plugin;
     entry->config_copy.file_path = entry->cfg_file_path;
     entry->config_copy.file_path_mode = entry->cfg_file_path_mode;
     entry->config_copy.file_prefix = entry->cfg_file_prefix;
@@ -605,12 +593,8 @@ static void output_entry_free(sbs_output_entry_t *entry)
     free(entry->cfg_encoder);
     free(entry->cfg_sink_type);
     free(entry->cfg_srt_uri);
-    free(entry->cfg_srt_mode);
-    free(entry->cfg_srt_stream_key);
-    free(entry->cfg_srt_passphrase);
     free(entry->cfg_rtmp_uri);
     free(entry->cfg_rtmp_passcode);
-    free(entry->cfg_rtmp_plugin);
     free(entry->cfg_file_path);
     free(entry->cfg_file_path_mode);
     free(entry->cfg_file_prefix);
@@ -658,15 +642,6 @@ static char *build_config_json(const sbs_output_entry_t *entry)
     if (cfg->srt_uri) {
         cJSON_AddStringToObject(obj, "srt_uri", cfg->srt_uri);
     }
-    if (cfg->srt_mode) {
-        cJSON_AddStringToObject(obj, "srt_mode", cfg->srt_mode);
-    }
-    if (cfg->srt_stream_key) {
-        cJSON_AddStringToObject(obj, "srt_stream_key", cfg->srt_stream_key);
-    }
-    if (cfg->srt_passphrase) {
-        cJSON_AddStringToObject(obj, "srt_passphrase", cfg->srt_passphrase);
-    }
     if (cfg->srt_latency_ms > 0) {
         cJSON_AddNumberToObject(obj, "srt_latency_ms", cfg->srt_latency_ms);
     }
@@ -675,9 +650,6 @@ static char *build_config_json(const sbs_output_entry_t *entry)
     }
     if (cfg->rtmp_passcode) {
         cJSON_AddStringToObject(obj, "rtmp_passcode", cfg->rtmp_passcode);
-    }
-    if (cfg->rtmp_plugin) {
-        cJSON_AddStringToObject(obj, "rtmp_plugin", cfg->rtmp_plugin);
     }
     if (cfg->file_path) {
         cJSON_AddStringToObject(obj, "file_path", cfg->file_path);

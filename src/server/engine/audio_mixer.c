@@ -28,62 +28,6 @@ static char *read_text_file_stripped(const char *path)
     return contents;
 }
 
-static bool audio_text_is_truthy(const char *text)
-{
-    return text && text[0] &&
-           g_ascii_strcasecmp(text, "0") != 0 &&
-           g_ascii_strcasecmp(text, "false") != 0 &&
-           g_ascii_strcasecmp(text, "no") != 0;
-}
-
-static bool audio_hdmitx_mode_enabled(const char *mode)
-{
-    return mode && mode[0] &&
-           g_ascii_strcasecmp(mode, "0") != 0 &&
-           g_ascii_strcasecmp(mode, "null") != 0 &&
-           g_ascii_strcasecmp(mode, "invalid") != 0;
-}
-
-static bool audio_systemd_service_active(const char *service)
-{
-    char *systemctl = g_find_program_in_path("systemctl");
-    gint status = 0;
-    gboolean ok;
-
-    if (!systemctl || !service || !service[0]) {
-        g_free(systemctl);
-        return false;
-    }
-
-    gchar *argv[] = { systemctl, "is-active", "--quiet", (gchar *)service, NULL };
-    ok = g_spawn_sync(NULL, argv, NULL,
-                      G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
-                      NULL, NULL, NULL, NULL, &status, NULL);
-    g_free(systemctl);
-    return ok && status == 0;
-}
-
-static bool audio_hdmi_passthrough_active(void)
-{
-    char *ready = read_text_file_stripped("/sys/class/amhdmitx/amhdmitx0/ready");
-    char *mode = read_text_file_stripped("/sys/class/amhdmitx/amhdmitx0/disp_mode");
-    bool active = audio_text_is_truthy(ready) &&
-                  audio_hdmitx_mode_enabled(mode) &&
-                  (audio_systemd_service_active("streambox-tv.service") ||
-                   audio_systemd_service_active("tvserver.service"));
-    g_free(mode);
-    g_free(ready);
-    return active;
-}
-
-static const char *audio_effective_alsa_device(const char *device)
-{
-    if (g_strcmp0(device, "hdmi_auto") == 0) {
-        return audio_hdmi_passthrough_active() ? "hw:0,6" : "hw:0,2";
-    }
-    return device && device[0] ? device : "hw:0,2";
-}
-
 static void add_device_node_status(cJSON *parent, const char *name, const char *path)
 {
     cJSON *obj = cJSON_CreateObject();
@@ -565,7 +509,6 @@ static sbs_audio_branch_t *add_branch_for_binding(sbs_audio_mixer_t *audio,
     GstCaps *caps;
     char *level_name;
     GstElement *last;
-    const char *alsa_device;
 
     branch = g_new0(sbs_audio_branch_t, 1);
     branch->source_id = g_strdup(source->id);
@@ -592,9 +535,8 @@ static sbs_audio_branch_t *add_branch_for_binding(sbs_audio_mixer_t *audio,
         return NULL;
     }
 
-    alsa_device = audio_effective_alsa_device(binding ? binding->device : NULL);
     g_object_set(branch->source,
-        "device", alsa_device,
+        "device", binding && binding->device ? binding->device : "hw:0,2",
         "buffer-time", (gint64)200000,
         "latency-time", (gint64)20000,
         "do-timestamp", TRUE,
@@ -680,7 +622,8 @@ static sbs_audio_branch_t *add_branch_for_binding(sbs_audio_mixer_t *audio,
     gst_element_sync_state_with_parent(branch->level);
 
     g_hash_table_insert(audio->branches, branch->source_id, branch);
-    LOG_I("audio branch added for source %s (%s)", source->id, alsa_device);
+    LOG_I("audio branch added for source %s (%s)", source->id,
+          binding && binding->device ? binding->device : "hw:0,2");
     return branch;
 }
 

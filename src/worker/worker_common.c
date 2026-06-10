@@ -130,17 +130,11 @@ static int parse_output_config(const cJSON *root, sbs_worker_config_t *config)
 
     out->codec         = json_get_string(root, "codec");
     out->srt_uri       = json_get_string(root, "srt_uri");
-    out->srt_mode      = json_get_string(root, "srt_mode");
-    out->srt_stream_key = json_get_string(root, "srt_stream_key");
-    if (!out->srt_stream_key)
-        out->srt_stream_key = json_get_string(root, "srt_stream_id");
-    out->srt_passphrase = json_get_string(root, "srt_passphrase");
     out->encoder       = json_get_string(root, "encoder");
     out->sink_type     = json_get_string(root, "sink_type");
     out->srt_latency_ms = json_get_uint32(root, "srt_latency_ms", 600);
     out->rtmp_uri      = json_get_string(root, "rtmp_uri");
     out->rtmp_passcode = json_get_string(root, "rtmp_passcode");
-    out->rtmp_plugin   = json_get_string(root, "rtmp_plugin");
     out->file_path     = json_get_string(root, "file_path");
     out->file_path_mode = json_get_string(root, "file_path_mode");
     out->file_prefix   = json_get_string(root, "file_prefix");
@@ -227,14 +221,10 @@ void sbs_worker_config_free(sbs_worker_config_t *config)
     /* Output fields */
     free(config->output.codec);
     free(config->output.srt_uri);
-    free(config->output.srt_mode);
-    free(config->output.srt_stream_key);
-    free(config->output.srt_passphrase);
     free(config->output.encoder);
     free(config->output.sink_type);
     free(config->output.rtmp_uri);
     free(config->output.rtmp_passcode);
-    free(config->output.rtmp_plugin);
     free(config->output.file_path);
     free(config->output.file_path_mode);
     free(config->output.file_prefix);

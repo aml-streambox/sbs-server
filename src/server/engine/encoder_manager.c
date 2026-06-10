@@ -22,10 +22,8 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
-#include <netdb.h>
 #include <netinet/in.h>
 #include <pthread.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -78,11 +76,7 @@ typedef struct sink_branch {
     uint64_t    direct_audio_buffers_pushed;
     uint64_t    direct_audio_push_failures;
     gulong      sink_probe_id;
-    gulong      flv_hevc_probe_id;
     gint        sink_buffers_seen;
-    uint64_t    sink_bytes_seen;
-    pthread_mutex_t sink_stats_mutex;
-    bool        sink_stats_initialized;
     gint        sink_warning_count;
     gint        sink_error_count;
 
@@ -135,26 +129,9 @@ typedef struct sink_branch {
     GQueue         *mux_video_queue;
     GQueue         *mux_audio_queue;
 
-    GByteArray    *flv_hevc_pending;
-    bool           flv_hevc_header_seen;
-    bool           flv_hevc_hdr_metadata_sent;
-    bool           flv_hevc_hdr_metadata_available;
-    int            flv_hevc_hdr_bit_depth;
-    int            flv_hevc_hdr_primaries;
-    int            flv_hevc_hdr_transfer;
-    int            flv_hevc_hdr_matrix;
-    int            flv_hevc_hdr_max_luminance;
-    bool           flv_hevc_legacy_mode;
-    uint64_t       flv_hevc_tags_rewritten;
-
     /* Deep-copied config for potential restart */
     char       *sink_type;
-    char       *rtmp_plugin;
-    char       *rtmp_flv_mode;
     char       *srt_uri;
-    char       *srt_mode;
-    char       *srt_stream_key;
-    char       *srt_passphrase;
     uint32_t    srt_latency_ms;
     char       *rtmp_uri;
     char       *rtmp_passcode;
@@ -672,692 +649,8 @@ static GstPadProbeReturn branch_sink_buffer_probe(GstPad *pad,
         return GST_PAD_PROBE_OK;
 
     sink_branch_t *branch = user_data;
-    if (branch) {
-        GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
-        if (branch->sink_stats_initialized)
-            pthread_mutex_lock(&branch->sink_stats_mutex);
-        branch->sink_buffers_seen++;
-        if (buffer)
-            branch->sink_bytes_seen += gst_buffer_get_size(buffer);
-        if (branch->sink_stats_initialized)
-            pthread_mutex_unlock(&branch->sink_stats_mutex);
-    }
-    return GST_PAD_PROBE_OK;
-}
-
-static guint32 flv_read_u24(const guint8 *p)
-{
-    return ((guint32)p[0] << 16) | ((guint32)p[1] << 8) | (guint32)p[2];
-}
-
-static void flv_append_u24(GByteArray *out, guint32 value)
-{
-    guint8 bytes[3] = {
-        (guint8)((value >> 16) & 0xffu),
-        (guint8)((value >> 8) & 0xffu),
-        (guint8)(value & 0xffu),
-    };
-    g_byte_array_append(out, bytes, sizeof(bytes));
-}
-
-static void flv_append_u16(GByteArray *out, guint16 value)
-{
-    guint8 bytes[2] = {
-        (guint8)((value >> 8) & 0xffu),
-        (guint8)(value & 0xffu),
-    };
-    g_byte_array_append(out, bytes, sizeof(bytes));
-}
-
-static void flv_append_u32(GByteArray *out, guint32 value)
-{
-    guint8 bytes[4] = {
-        (guint8)((value >> 24) & 0xffu),
-        (guint8)((value >> 16) & 0xffu),
-        (guint8)((value >> 8) & 0xffu),
-        (guint8)(value & 0xffu),
-    };
-    g_byte_array_append(out, bytes, sizeof(bytes));
-}
-
-static void flv_append_double(GByteArray *out, double value)
-{
-    guint64 bits = 0;
-    guint8 bytes[8];
-    memcpy(&bits, &value, sizeof(bits));
-    bytes[0] = (guint8)((bits >> 56) & 0xffu);
-    bytes[1] = (guint8)((bits >> 48) & 0xffu);
-    bytes[2] = (guint8)((bits >> 40) & 0xffu);
-    bytes[3] = (guint8)((bits >> 32) & 0xffu);
-    bytes[4] = (guint8)((bits >> 24) & 0xffu);
-    bytes[5] = (guint8)((bits >> 16) & 0xffu);
-    bytes[6] = (guint8)((bits >> 8) & 0xffu);
-    bytes[7] = (guint8)(bits & 0xffu);
-    g_byte_array_append(out, bytes, sizeof(bytes));
-}
-
-static void flv_append_amf_string(GByteArray *out, const char *value)
-{
-    size_t len = value ? strlen(value) : 0;
-    if (len > 65535)
-        len = 65535;
-    flv_append_u16(out, (guint16)len);
-    if (len > 0)
-        g_byte_array_append(out, (const guint8 *)value, (guint)len);
-}
-
-static void flv_append_amf_number_property(GByteArray *out,
-                                           const char *name,
-                                           double value)
-{
-    guint8 marker = 0x00; /* AMF0 number */
-    flv_append_amf_string(out, name);
-    g_byte_array_append(out, &marker, 1);
-    flv_append_double(out, value);
-}
-
-static void flv_append_amf_object_start_property(GByteArray *out,
-                                                 const char *name)
-{
-    guint8 marker = 0x03; /* AMF0 object */
-    flv_append_amf_string(out, name);
-    g_byte_array_append(out, &marker, 1);
-}
-
-static void flv_append_amf_object_end(GByteArray *out)
-{
-    guint8 end[3] = { 0x00, 0x00, 0x09 };
-    g_byte_array_append(out, end, sizeof(end));
-}
-
-static void flv_append_tag(GByteArray *out,
-                           const guint8 *tag,
-                           const guint8 *payload,
-                           guint32 payload_size)
-{
-    g_byte_array_append(out, tag, 1);
-    flv_append_u24(out, payload_size);
-    g_byte_array_append(out, tag + 4, 7);
-    if (payload_size > 0)
-        g_byte_array_append(out, payload, payload_size);
-    flv_append_u32(out, 11u + payload_size);
-}
-
-static bool flv_payload_has_h265_fourcc(const guint8 *payload, guint32 payload_size)
-{
-    return payload_size >= 5 &&
-           (payload[0] & 0x80u) != 0 &&
-           (memcmp(payload + 1, "hvc1", 4) == 0 ||
-            memcmp(payload + 1, "hev1", 4) == 0);
-}
-
-static bool flv_payload_is_avc_sequence_header(const guint8 *payload, guint32 payload_size)
-{
-    return payload_size >= 5 &&
-           (payload[0] & 0x0fu) == 7u &&
-           payload[1] == 0;
-}
-
-static bool flv_hevc_hdr_metadata_values_from_manager(const sbs_encoder_manager_t *mgr,
-                                                      int *bit_depth,
-                                                      int *primaries,
-                                                      int *transfer,
-                                                      int *matrix,
-                                                      int *max_luminance)
-{
-    if (!mgr)
-        return false;
-
-    if (mgr->colorimetry == SBS_COLORIMETRY_BT2020_PQ || mgr->hdr10) {
-        if (bit_depth) *bit_depth = mgr->pixel_format == SBS_PIXEL_FORMAT_P010 ? 10 : 8;
-        if (primaries) *primaries = 9;  /* BT.2020 */
-        if (transfer) *transfer = 16;   /* SMPTE ST 2084 / PQ */
-        if (matrix) *matrix = 9;        /* BT.2020 non-constant luminance */
-        if (max_luminance) *max_luminance = 1000;
-        return true;
-    }
-
-    if (mgr->colorimetry == SBS_COLORIMETRY_BT2100_HLG) {
-        if (bit_depth) *bit_depth = mgr->pixel_format == SBS_PIXEL_FORMAT_P010 ? 10 : 8;
-        if (primaries) *primaries = 9;  /* BT.2020 */
-        if (transfer) *transfer = 18;   /* ARIB STD-B67 / HLG */
-        if (matrix) *matrix = 9;        /* BT.2020 non-constant luminance */
-        if (max_luminance) *max_luminance = 1000;
-        return true;
-    }
-
-    return false;
-}
-
-static void flv_hevc_cache_hdr_metadata_values(sink_branch_t *branch,
-                                               const sbs_encoder_manager_t *mgr)
-{
-    int bit_depth = 10;
-    int primaries = 9;
-    int transfer = 16;
-    int matrix = 9;
-    int max_luminance = 1000;
-
-    if (!branch)
-        return;
-
-    branch->flv_hevc_hdr_metadata_available =
-        flv_hevc_hdr_metadata_values_from_manager(mgr, &bit_depth, &primaries,
-                                                  &transfer, &matrix, &max_luminance);
-    branch->flv_hevc_hdr_bit_depth = bit_depth;
-    branch->flv_hevc_hdr_primaries = primaries;
-    branch->flv_hevc_hdr_transfer = transfer;
-    branch->flv_hevc_hdr_matrix = matrix;
-    branch->flv_hevc_hdr_max_luminance = max_luminance;
-}
-
-static bool flv_hevc_hdr_metadata_values(const sink_branch_t *branch,
-                                         int *bit_depth,
-                                         int *primaries,
-                                         int *transfer,
-                                         int *matrix,
-                                         int *max_luminance)
-{
-    if (branch && branch->flv_hevc_hdr_metadata_available) {
-        if (bit_depth) *bit_depth = branch->flv_hevc_hdr_bit_depth;
-        if (primaries) *primaries = branch->flv_hevc_hdr_primaries;
-        if (transfer) *transfer = branch->flv_hevc_hdr_transfer;
-        if (matrix) *matrix = branch->flv_hevc_hdr_matrix;
-        if (max_luminance) *max_luminance = branch->flv_hevc_hdr_max_luminance;
-        return true;
-    }
-
-    return flv_hevc_hdr_metadata_values_from_manager(
-        branch ? branch->manager : NULL,
-        bit_depth, primaries, transfer, matrix, max_luminance);
-}
-
-static GByteArray *flv_create_hevc_hdr_metadata_payload(const sink_branch_t *branch)
-{
-    int bit_depth = 10;
-    int primaries = 9;
-    int transfer = 16;
-    int matrix = 9;
-    int max_luminance = 1000;
-    guint8 marker;
-    GByteArray *payload;
-
-    if (!flv_hevc_hdr_metadata_values(branch, &bit_depth, &primaries,
-                                      &transfer, &matrix, &max_luminance))
-        return NULL;
-
-    payload = g_byte_array_new();
-
-    marker = 0x02; /* AMF0 string */
-    g_byte_array_append(payload, &marker, 1);
-    flv_append_amf_string(payload, "colorInfo");
-
-    marker = 0x03; /* AMF0 object */
-    g_byte_array_append(payload, &marker, 1);
-
-    flv_append_amf_object_start_property(payload, "colorConfig");
-    flv_append_amf_number_property(payload, "bitDepth", bit_depth);
-    flv_append_amf_number_property(payload, "colorPrimaries", primaries);
-    flv_append_amf_number_property(payload, "transferCharacteristics", transfer);
-    flv_append_amf_number_property(payload, "matrixCoefficients", matrix);
-    flv_append_amf_object_end(payload);
-
-    if (max_luminance > 0) {
-        flv_append_amf_object_start_property(payload, "hdrMdcv");
-        flv_append_amf_number_property(payload, "maxLuminance", max_luminance);
-        flv_append_amf_number_property(payload, "minLuminance", 0);
-        flv_append_amf_object_end(payload);
-    }
-
-    flv_append_amf_object_end(payload);
-    return payload;
-}
-
-static void flv_append_hevc_hdr_metadata_tag(sink_branch_t *branch,
-                                              const guint8 *reference_tag,
-                                              GByteArray *out)
-{
-    GByteArray *metadata = flv_create_hevc_hdr_metadata_payload(branch);
-    GByteArray *payload;
-    guint8 ex_header[5] = { 0xd4, 'h', 'v', 'c', '1' };
-
-    if (!metadata)
-        return;
-
-    payload = g_byte_array_sized_new(metadata->len + sizeof(ex_header));
-    g_byte_array_append(payload, ex_header, sizeof(ex_header));
-    g_byte_array_append(payload, metadata->data, metadata->len);
-    flv_append_tag(out, reference_tag, payload->data, payload->len);
-
-    g_byte_array_free(payload, TRUE);
-    g_byte_array_free(metadata, TRUE);
-    if (branch) {
-        branch->flv_hevc_hdr_metadata_sent = true;
-        LOG_I("RTMP H.265 FLV HDR metadata injected for '%s'",
-              branch->output_id ? branch->output_id : "?");
-    }
-}
-
-static void flv_append_avc_hdr_metadata_tag(sink_branch_t *branch,
-                                            const guint8 *reference_tag,
-                                            GByteArray *out)
-{
-    GByteArray *metadata = flv_create_hevc_hdr_metadata_payload(branch);
-    GByteArray *payload;
-    guint8 ex_header[5] = { 0xd4, 'a', 'v', 'c', '1' };
-
-    if (!metadata)
-        return;
-
-    payload = g_byte_array_sized_new(metadata->len + sizeof(ex_header));
-    g_byte_array_append(payload, ex_header, sizeof(ex_header));
-    g_byte_array_append(payload, metadata->data, metadata->len);
-    flv_append_tag(out, reference_tag, payload->data, payload->len);
-
-    g_byte_array_free(payload, TRUE);
-    g_byte_array_free(metadata, TRUE);
-    if (branch) {
-        branch->flv_hevc_hdr_metadata_sent = true;
-        LOG_I("RTMP H.264 FLV HDR metadata injected for '%s'",
-              branch->output_id ? branch->output_id : "?");
-    }
-}
-
-static bool flv_patch_hevc_metadata(GByteArray *payload)
-{
-    static const guint8 key[] = {
-        0x00, 0x0c,
-        'v', 'i', 'd', 'e', 'o', 'c', 'o', 'd', 'e', 'c', 'i', 'd',
-        0x00,
-    };
-    static const guint8 hvc1_double[] = { 0x41, 0xda, 0x1d, 0x98, 0xcc, 0x40, 0x00, 0x00 };
-    static const guint8 hev1_double[] = { 0x41, 0xda, 0x19, 0x5d, 0x8c, 0x40, 0x00, 0x00 };
-    static const guint8 legacy_double[] = { 0x40, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-    bool patched = false;
-
-    if (!payload || payload->len < sizeof(key) + sizeof(legacy_double))
-        return false;
-
-    for (guint i = 0; i + sizeof(key) + sizeof(legacy_double) <= payload->len; i++) {
-        guint8 *value = payload->data + i + sizeof(key);
-        if (memcmp(payload->data + i, key, sizeof(key)) != 0)
-            continue;
-        if (memcmp(value, hvc1_double, sizeof(hvc1_double)) == 0 ||
-            memcmp(value, hev1_double, sizeof(hev1_double)) == 0) {
-            memcpy(value, legacy_double, sizeof(legacy_double));
-            patched = true;
-        }
-    }
-
-    return patched;
-}
-
-static bool flv_rewrite_hevc_video_tag_legacy(sink_branch_t *branch,
-                                              const guint8 *tag,
-                                              guint32 payload_size,
-                                              GByteArray *out)
-{
-    const guint8 *payload = tag + 11;
-    guint8 frame_type;
-    guint8 packet_type;
-    guint8 legacy_header;
-    GByteArray *converted;
-
-    if (!flv_payload_has_h265_fourcc(payload, payload_size))
-        return false;
-
-    frame_type = (payload[0] >> 4) & 0x07u;
-    packet_type = payload[0] & 0x0fu;
-    legacy_header = (guint8)((frame_type << 4) | 0x0cu);
-    converted = g_byte_array_sized_new(payload_size);
-
-    switch (packet_type) {
-    case 0: { /* SequenceStart: fourcc becomes PacketType + zero CTS. */
-        guint8 header[5] = { legacy_header, 0, 0, 0, 0 };
-        g_byte_array_append(converted, header, sizeof(header));
-        if (payload_size > 5)
-            g_byte_array_append(converted, payload + 5, payload_size - 5);
-        break;
-    }
-    case 1: /* CodedFrames: keep CTS, remove the fourcc. */
-        if (payload_size < 8) {
-            g_byte_array_free(converted, TRUE);
-            return false;
-        }
-        g_byte_array_append(converted, &legacy_header, 1);
-        {
-            guint8 legacy_packet_type = 1;
-            g_byte_array_append(converted, &legacy_packet_type, 1);
-        }
-        g_byte_array_append(converted, payload + 5, 3);
-        if (payload_size > 8)
-            g_byte_array_append(converted, payload + 8, payload_size - 8);
-        break;
-    case 2: { /* SequenceEnd */
-        guint8 header[5] = { legacy_header, 2, 0, 0, 0 };
-        g_byte_array_append(converted, header, sizeof(header));
-        if (payload_size > 5)
-            g_byte_array_append(converted, payload + 5, payload_size - 5);
-        break;
-    }
-    case 3: { /* CodedFramesX has no CTS; synthesize zero CTS for legacy FLV. */
-        guint8 header[5] = { legacy_header, 1, 0, 0, 0 };
-        g_byte_array_append(converted, header, sizeof(header));
-        if (payload_size > 5)
-            g_byte_array_append(converted, payload + 5, payload_size - 5);
-        break;
-    }
-    default:
-        g_byte_array_free(converted, TRUE);
-        return false;
-    }
-
-    flv_append_tag(out, tag, converted->data, converted->len);
     if (branch)
-        branch->flv_hevc_tags_rewritten++;
-    g_byte_array_free(converted, TRUE);
-    return true;
-}
-
-static bool flv_rewrite_hevc_video_tag_enhanced(sink_branch_t *branch,
-                                                const guint8 *tag,
-                                                guint32 payload_size,
-                                                GByteArray *out)
-{
-    const guint8 *payload = tag + 11;
-    guint8 packet_type;
-    guint8 converted_header;
-    GByteArray *converted;
-
-    if (!flv_payload_has_h265_fourcc(payload, payload_size))
-        return false;
-
-    packet_type = payload[0] & 0x0fu;
-    if (packet_type != 1 || payload_size < 8)
-        return false;
-
-    if (payload[5] != 0 || payload[6] != 0 || payload[7] != 0)
-        return false;
-
-    converted_header = (guint8)((payload[0] & 0xf0u) | 0x03u);
-    converted = g_byte_array_sized_new(payload_size - 3u);
-    g_byte_array_append(converted, &converted_header, 1);
-    g_byte_array_append(converted, payload + 1, 4);
-    if (payload_size > 8)
-        g_byte_array_append(converted, payload + 8, payload_size - 8);
-
-    flv_append_tag(out, tag, converted->data, converted->len);
-    if (branch)
-        branch->flv_hevc_tags_rewritten++;
-    g_byte_array_free(converted, TRUE);
-    return true;
-}
-
-static void flv_rewrite_complete_tag(sink_branch_t *branch,
-                                     const guint8 *tag,
-                                     guint32 payload_size,
-                                     GByteArray *out)
-{
-    guint8 tag_type = tag[0];
-    guint32 total_size = 11u + payload_size + 4u;
-
-    if (tag_type == 9) {
-        const guint8 *payload = tag + 11;
-        if (branch && !branch->flv_hevc_legacy_mode &&
-            !branch->flv_hevc_hdr_metadata_sent &&
-            flv_payload_is_avc_sequence_header(payload, payload_size)) {
-            flv_append_avc_hdr_metadata_tag(branch, tag, out);
-            g_byte_array_append(out, tag, total_size);
-            return;
-        }
-
-        if (!branch || !branch->flv_hevc_legacy_mode) {
-            if (flv_payload_has_h265_fourcc(payload, payload_size) &&
-                branch && !branch->flv_hevc_hdr_metadata_sent &&
-                (payload[0] & 0x0fu) == 0) {
-                g_byte_array_append(out, tag, total_size);
-                flv_append_hevc_hdr_metadata_tag(branch, tag, out);
-                return;
-            }
-            if (flv_rewrite_hevc_video_tag_enhanced(branch, tag, payload_size, out))
-                return;
-        } else if (flv_rewrite_hevc_video_tag_legacy(branch, tag, payload_size, out)) {
-            return;
-        }
-    }
-
-    if (branch && branch->flv_hevc_legacy_mode && tag_type == 18 && payload_size > 0) {
-        GByteArray *payload = g_byte_array_sized_new(payload_size);
-        g_byte_array_append(payload, tag + 11, payload_size);
-        if (flv_patch_hevc_metadata(payload)) {
-            flv_append_tag(out, tag, payload->data, payload->len);
-            g_byte_array_free(payload, TRUE);
-            return;
-        }
-        g_byte_array_free(payload, TRUE);
-    }
-
-    g_byte_array_append(out, tag, total_size);
-}
-
-static GByteArray *flv_rewrite_standalone_bytes(sink_branch_t *branch,
-                                                const guint8 *data,
-                                                gsize size)
-{
-    GByteArray *out;
-    gsize processed = 0;
-
-    if (!data || size == 0)
-        return NULL;
-
-    out = g_byte_array_sized_new(size + 256u);
-    if (size >= 13 && memcmp(data, "FLV", 3) == 0) {
-        g_byte_array_append(out, data, 13);
-        processed = 13;
-    }
-
-    while (processed + 11 <= size) {
-        const guint8 *tag = data + processed;
-        guint8 tag_type = tag[0];
-        guint32 payload_size;
-        guint32 total_size;
-
-        if (tag_type != 8 && tag_type != 9 && tag_type != 18)
-            break;
-
-        payload_size = flv_read_u24(tag + 1);
-        total_size = 11u + payload_size + 4u;
-        if (processed + total_size > size)
-            break;
-
-        flv_rewrite_complete_tag(branch, tag, payload_size, out);
-        processed += total_size;
-    }
-
-    if (processed < size)
-        g_byte_array_append(out, data + processed, size - processed);
-
-    return out;
-}
-
-static GstBuffer *flv_rewrite_standalone_buffer(sink_branch_t *branch,
-                                                GstBuffer *buffer)
-{
-    GstMapInfo map;
-    GByteArray *out;
-    GstBuffer *out_buffer;
-
-    if (!buffer || !gst_buffer_map(buffer, &map, GST_MAP_READ))
-        return buffer ? gst_buffer_ref(buffer) : NULL;
-
-    out = flv_rewrite_standalone_bytes(branch, map.data, map.size);
-    gst_buffer_unmap(buffer, &map);
-    if (!out)
-        return gst_buffer_ref(buffer);
-
-    out_buffer = gst_buffer_new_allocate(NULL, out->len, NULL);
-    if (!out_buffer) {
-        g_byte_array_free(out, TRUE);
-        return gst_buffer_ref(buffer);
-    }
-
-    gst_buffer_copy_into(out_buffer, buffer, GST_BUFFER_COPY_METADATA, 0, -1);
-    gst_buffer_fill(out_buffer, 0, out->data, out->len);
-    g_byte_array_free(out, TRUE);
-    return out_buffer;
-}
-
-static GstPadProbeReturn flv_hevc_rewrite_caps_event(sink_branch_t *branch,
-                                                     GstPadProbeInfo *info)
-{
-    GstEvent *event = GST_PAD_PROBE_INFO_EVENT(info);
-    GstCaps *caps = NULL;
-    GstCaps *new_caps;
-    GstStructure *structure;
-    const GValue *streamheader;
-    GValue rewritten = G_VALUE_INIT;
-    guint count;
-    bool changed = false;
-
-    if (!event || GST_EVENT_TYPE(event) != GST_EVENT_CAPS)
-        return GST_PAD_PROBE_OK;
-
-    gst_event_parse_caps(event, &caps);
-    if (!caps || gst_caps_is_empty(caps))
-        return GST_PAD_PROBE_OK;
-
-    structure = gst_caps_get_structure(caps, 0);
-    streamheader = gst_structure_get_value(structure, "streamheader");
-    if (!streamheader || !GST_VALUE_HOLDS_ARRAY(streamheader))
-        return GST_PAD_PROBE_OK;
-
-    count = gst_value_array_get_size(streamheader);
-    if (count == 0)
-        return GST_PAD_PROBE_OK;
-
-    g_value_init(&rewritten, GST_TYPE_ARRAY);
-    for (guint i = 0; i < count; i++) {
-        const GValue *entry = gst_value_array_get_value(streamheader, i);
-        GstBuffer *buffer = entry ? gst_value_get_buffer(entry) : NULL;
-        GstBuffer *rewritten_buffer = flv_rewrite_standalone_buffer(branch, buffer);
-        GValue rewritten_entry = G_VALUE_INIT;
-
-        if (!rewritten_buffer)
-            continue;
-        if (buffer)
-            changed = true;
-
-        g_value_init(&rewritten_entry, GST_TYPE_BUFFER);
-        gst_value_set_buffer(&rewritten_entry, rewritten_buffer);
-        gst_value_array_append_value(&rewritten, &rewritten_entry);
-        g_value_unset(&rewritten_entry);
-        gst_buffer_unref(rewritten_buffer);
-    }
-
-    if (!changed) {
-        g_value_unset(&rewritten);
-        return GST_PAD_PROBE_OK;
-    }
-
-    new_caps = gst_caps_copy(caps);
-    structure = gst_caps_get_structure(new_caps, 0);
-    gst_structure_set_value(structure, "streamheader", &rewritten);
-    g_value_unset(&rewritten);
-
-    GST_PAD_PROBE_INFO_DATA(info) = gst_event_new_caps(new_caps);
-    gst_event_unref(event);
-    gst_caps_unref(new_caps);
-    return GST_PAD_PROBE_OK;
-}
-
-static GstPadProbeReturn flv_hevc_probe(GstPad *pad,
-                                         GstPadProbeInfo *info,
-                                         gpointer user_data)
-{
-    (void)pad;
-
-    sink_branch_t *branch = user_data;
-    GstBuffer *buffer;
-    GstMapInfo map;
-    GByteArray *pending;
-    GByteArray *out;
-    guint processed = 0;
-
-    if (!branch)
-        return GST_PAD_PROBE_OK;
-
-    if ((info->type & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM) != 0)
-        return flv_hevc_rewrite_caps_event(branch, info);
-
-    if ((info->type & GST_PAD_PROBE_TYPE_BUFFER) == 0)
-        return GST_PAD_PROBE_OK;
-
-    buffer = GST_PAD_PROBE_INFO_BUFFER(info);
-    if (!buffer)
-        return GST_PAD_PROBE_OK;
-
-    if (!gst_buffer_map(buffer, &map, GST_MAP_READ))
-        return GST_PAD_PROBE_OK;
-
-    if (!branch->flv_hevc_pending)
-        branch->flv_hevc_pending = g_byte_array_new();
-    pending = branch->flv_hevc_pending;
-    g_byte_array_append(pending, map.data, map.size);
-    gst_buffer_unmap(buffer, &map);
-
-    out = g_byte_array_new();
-
-    if (!branch->flv_hevc_header_seen) {
-        if (pending->len < 13) {
-            g_byte_array_free(out, TRUE);
-            return GST_PAD_PROBE_DROP;
-        }
-
-        if (memcmp(pending->data, "FLV", 3) != 0) {
-            LOG_W("RTMP H.265 FLV adapter did not see FLV header for '%s'; passing through",
-                  branch->output_id ? branch->output_id : "?");
-            g_byte_array_append(out, pending->data, pending->len);
-            processed = pending->len;
-            branch->flv_hevc_header_seen = true;
-        } else {
-            g_byte_array_append(out, pending->data, 13);
-            processed = 13;
-            branch->flv_hevc_header_seen = true;
-        }
-    }
-
-    while (branch->flv_hevc_header_seen && processed + 11 <= pending->len) {
-        const guint8 *tag = pending->data + processed;
-        guint32 payload_size = flv_read_u24(tag + 1);
-        guint32 total_size = 11u + payload_size + 4u;
-
-        if (processed + total_size > pending->len)
-            break;
-
-        flv_rewrite_complete_tag(branch, tag, payload_size, out);
-        processed += total_size;
-    }
-
-    if (processed > 0)
-        g_byte_array_remove_range(pending, 0, processed);
-
-    if (out->len == 0) {
-        g_byte_array_free(out, TRUE);
-        return GST_PAD_PROBE_DROP;
-    }
-
-    GstBuffer *out_buffer = gst_buffer_new_allocate(NULL, out->len, NULL);
-    if (!out_buffer) {
-        g_byte_array_free(out, TRUE);
-        return GST_PAD_PROBE_DROP;
-    }
-
-    gst_buffer_copy_into(out_buffer, buffer, GST_BUFFER_COPY_METADATA, 0, -1);
-    gst_buffer_fill(out_buffer, 0, out->data, out->len);
-    g_byte_array_free(out, TRUE);
-
-    gst_buffer_unref(buffer);
-    GST_PAD_PROBE_INFO_DATA(info) = out_buffer;
+        g_atomic_int_inc(&branch->sink_buffers_seen);
     return GST_PAD_PROBE_OK;
 }
 
@@ -1426,94 +719,26 @@ static void ensure_srt_ready(void)
     }
 }
 
-static bool srt_mode_is_caller(const char *mode)
-{
-    return mode &&
-           (g_ascii_strcasecmp(mode, "caller") == 0 ||
-            g_ascii_strcasecmp(mode, "client") == 0);
-}
-
-static bool srt_mode_is_listener(const char *mode)
-{
-    return !mode || !*mode ||
-           g_ascii_strcasecmp(mode, "listener") == 0 ||
-           g_ascii_strcasecmp(mode, "server") == 0;
-}
-
-static bool parse_srt_uri_endpoint(const char *uri,
-                                   char *host,
-                                   size_t host_size,
-                                   uint16_t *port_out)
-{
-    const char *p;
-    const char *end;
-    const char *host_start;
-    const char *host_end;
-    const char *colon;
-    char *port_end = NULL;
-    long port;
-    size_t host_len;
-
-    if (!uri || !*uri || !port_out)
-        return false;
-
-    p = uri;
-    if (strncmp(p, "srt://", 6) == 0)
-        p += 6;
-
-    end = p;
-    while (*end && *end != '/' && *end != '?')
-        end++;
-    if (p == end)
-        return false;
-
-    if (*p == '[') {
-        host_start = p + 1;
-        host_end = memchr(host_start, ']', (size_t)(end - host_start));
-        if (!host_end || host_end + 1 >= end || host_end[1] != ':')
-            return false;
-        colon = host_end + 1;
-    } else {
-        colon = NULL;
-        for (const char *q = end; q > p; q--) {
-            if (q[-1] == ':') {
-                colon = q - 1;
-                break;
-            }
-        }
-        if (!colon)
-            return false;
-        host_start = p;
-        host_end = colon;
-    }
-
-    if (colon + 1 >= end)
-        return false;
-
-    port = strtol(colon + 1, &port_end, 10);
-    if (port <= 0 || port > 65535)
-        return false;
-    if (port_end != end)
-        return false;
-
-    host_len = (size_t)(host_end - host_start);
-    if (host && host_size > 0) {
-        if (host_len >= host_size)
-            return false;
-        memcpy(host, host_start, host_len);
-        host[host_len] = '\0';
-    }
-
-    *port_out = (uint16_t)port;
-    return true;
-}
-
 static uint16_t parse_srt_listen_port(const char *uri)
 {
-    uint16_t port = 0;
-    if (!parse_srt_uri_endpoint(uri, NULL, 0, &port))
+    const char *colon;
+    char *end = NULL;
+    long port;
+
+    if (!uri || !*uri)
         return 0;
-    return port;
+
+    colon = strrchr(uri, ':');
+    if (!colon || !colon[1])
+        return 0;
+
+    port = strtol(colon + 1, &end, 10);
+    if (port <= 0 || port > 65535)
+        return 0;
+    if (end && *end && *end != '/' && *end != '?')
+        return 0;
+
+    return (uint16_t)port;
 }
 
 static bool set_srt_sockopt(SRTSOCKET sock, SRT_SOCKOPT opt,
@@ -1527,39 +752,21 @@ static bool set_srt_sockopt(SRTSOCKET sock, SRT_SOCKOPT opt,
     return false;
 }
 
-static int configure_srt_sender_socket(SRTSOCKET sock,
-                                       uint32_t latency_ms,
-                                       const char *stream_key,
-                                       const char *passphrase,
-                                       bool set_stream_id)
+static void configure_srt_sender_socket(SRTSOCKET sock, uint32_t latency_ms)
 {
     SRT_TRANSTYPE transtype = SRTT_LIVE;
     int yes = 1;
     int payload = SRT_LIVE_DEF_PLSIZE;
     int timeout_ms = 20;
     int latency = latency_ms > 0 ? (int)latency_ms : 600;
-    bool ok = true;
 
-    ok &= set_srt_sockopt(sock, SRTO_TRANSTYPE, &transtype, sizeof(transtype), "SRTO_TRANSTYPE");
-    ok &= set_srt_sockopt(sock, SRTO_REUSEADDR, &yes, sizeof(yes), "SRTO_REUSEADDR");
-    ok &= set_srt_sockopt(sock, SRTO_SENDER, &yes, sizeof(yes), "SRTO_SENDER");
-    ok &= set_srt_sockopt(sock, SRTO_TSBPDMODE, &yes, sizeof(yes), "SRTO_TSBPDMODE");
-    ok &= set_srt_sockopt(sock, SRTO_PAYLOADSIZE, &payload, sizeof(payload), "SRTO_PAYLOADSIZE");
-    ok &= set_srt_sockopt(sock, SRTO_LATENCY, &latency, sizeof(latency), "SRTO_LATENCY");
-    ok &= set_srt_sockopt(sock, SRTO_SNDTIMEO, &timeout_ms, sizeof(timeout_ms), "SRTO_SNDTIMEO");
-
-    if (passphrase && *passphrase) {
-        int pbkeylen = 16;
-        ok &= set_srt_sockopt(sock, SRTO_PBKEYLEN, &pbkeylen, sizeof(pbkeylen), "SRTO_PBKEYLEN");
-        ok &= set_srt_sockopt(sock, SRTO_PASSPHRASE, passphrase,
-                              (int)strlen(passphrase), "SRTO_PASSPHRASE");
-    }
-    if (set_stream_id && stream_key && *stream_key) {
-        ok &= set_srt_sockopt(sock, SRTO_STREAMID, stream_key,
-                              (int)strlen(stream_key), "SRTO_STREAMID");
-    }
-
-    return ok ? SBS_OK : SBS_ERR_IO;
+    set_srt_sockopt(sock, SRTO_TRANSTYPE, &transtype, sizeof(transtype), "SRTO_TRANSTYPE");
+    set_srt_sockopt(sock, SRTO_REUSEADDR, &yes, sizeof(yes), "SRTO_REUSEADDR");
+    set_srt_sockopt(sock, SRTO_SENDER, &yes, sizeof(yes), "SRTO_SENDER");
+    set_srt_sockopt(sock, SRTO_TSBPDMODE, &yes, sizeof(yes), "SRTO_TSBPDMODE");
+    set_srt_sockopt(sock, SRTO_PAYLOADSIZE, &payload, sizeof(payload), "SRTO_PAYLOADSIZE");
+    set_srt_sockopt(sock, SRTO_LATENCY, &latency, sizeof(latency), "SRTO_LATENCY");
+    set_srt_sockopt(sock, SRTO_SNDTIMEO, &timeout_ms, sizeof(timeout_ms), "SRTO_SNDTIMEO");
 }
 
 static bool custom_srt_schedule_keyframe(sink_branch_t *branch,
@@ -1669,10 +876,21 @@ static void *custom_srt_accept_thread_main(void *data)
     return NULL;
 }
 
-static int init_custom_srt_sender_state(sink_branch_t *branch)
+static int start_custom_srt_sender(sink_branch_t *branch)
 {
+    struct sockaddr_in sa;
+    SRTSOCKET listener;
+    uint16_t port;
+
     if (!branch)
         return SBS_ERR_INVAL;
+
+    ensure_srt_ready();
+    port = parse_srt_listen_port(branch->srt_uri);
+    if (port == 0) {
+        LOG_E("custom SRT: invalid listen URI '%s'", branch->srt_uri ? branch->srt_uri : "<null>");
+        return SBS_ERR_INVAL;
+    }
 
     if (!branch->srt_sender_initialized) {
         pthread_mutex_init(&branch->srt_sender_mutex, NULL);
@@ -1680,154 +898,15 @@ static int init_custom_srt_sender_state(sink_branch_t *branch)
         branch->srt_ts_input = g_byte_array_new();
         branch->srt_video_ts_backlog = g_byte_array_new();
         branch->srt_send_payload = g_byte_array_new();
-        branch->srt_listener = SRT_INVALID_SOCK;
         branch->srt_sender_initialized = true;
     }
-
-    if (!branch->srt_clients || !branch->srt_ts_input ||
-        !branch->srt_video_ts_backlog || !branch->srt_send_payload)
-        return SBS_ERR_NOMEM;
-
-    return SBS_OK;
-}
-
-static void reset_custom_srt_sender_locked(sink_branch_t *branch)
-{
-    if (!branch)
-        return;
-
-    if (branch->srt_clients)
-        g_array_set_size(branch->srt_clients, 0);
-    if (branch->srt_video_ts_backlog)
-        g_byte_array_set_size(branch->srt_video_ts_backlog, 0);
-    if (branch->srt_ts_input)
-        g_byte_array_set_size(branch->srt_ts_input, 0);
-    if (branch->srt_send_payload)
-        g_byte_array_set_size(branch->srt_send_payload, 0);
-    branch->srt_sender_bytes_sent = 0;
-    branch->srt_sender_send_failures = 0;
-    branch->srt_sender_packets_sent = 0;
-    branch->srt_sender_packets_dropped = 0;
-}
-
-static int start_custom_srt_caller(sink_branch_t *branch)
-{
-    char host[256];
-    char port_str[16];
-    uint16_t port;
-    struct addrinfo hints;
-    struct addrinfo *results = NULL;
-    struct addrinfo *ai;
-    SRTSOCKET client = SRT_INVALID_SOCK;
-    SRTSOCKET connected_client;
-    guint caller_count = 0;
-    int rc;
-
-    if (!branch)
-        return SBS_ERR_INVAL;
-
-    if (!parse_srt_uri_endpoint(branch->srt_uri, host, sizeof(host), &port) || host[0] == '\0') {
-        LOG_E("custom SRT: invalid caller URI");
-        return SBS_ERR_INVAL;
-    }
-
-    ensure_srt_ready();
-    rc = init_custom_srt_sender_state(branch);
-    if (rc != SBS_OK)
-        return rc;
-
-    snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_DGRAM;
-    rc = getaddrinfo(host, port_str, &hints, &results);
-    if (rc != 0) {
-        LOG_E("custom SRT: unable to resolve caller endpoint: %s", gai_strerror(rc));
-        return SBS_ERR_IO;
-    }
-
-    for (ai = results; ai; ai = ai->ai_next) {
-        client = srt_create_socket();
-        if (client == SRT_INVALID_SOCK) {
-            LOG_E("custom SRT: create socket failed: %s", srt_getlasterror_str());
-            break;
-        }
-        rc = configure_srt_sender_socket(client, branch->srt_latency_ms,
-                                         branch->srt_stream_key,
-                                         branch->srt_passphrase,
-                                         true);
-        if (rc == SBS_OK && srt_connect(client, ai->ai_addr, ai->ai_addrlen) == 0)
-            break;
-
-        LOG_W("custom SRT: caller connect attempt failed: %s", srt_getlasterror_str());
-        srt_close(client);
-        client = SRT_INVALID_SOCK;
-    }
-    freeaddrinfo(results);
-
-    if (client == SRT_INVALID_SOCK) {
-        LOG_E("custom SRT: caller connect failed");
-        return SBS_ERR_IO;
-    }
-
-    connected_client = client;
-    pthread_mutex_lock(&branch->srt_sender_mutex);
-    reset_custom_srt_sender_locked(branch);
-    branch->srt_listener = SRT_INVALID_SOCK;
-    branch->srt_listen_port = 0;
-    branch->srt_sender_running = true;
-    branch->srt_accept_started = false;
-    g_array_append_val(branch->srt_clients, client);
-    caller_count = branch->srt_clients->len;
-    pthread_mutex_unlock(&branch->srt_sender_mutex);
-
-    custom_srt_client_connected(branch, connected_client, caller_count);
-    LOG_I("custom SRT sender connected in caller mode latency=%ums streamid=%s passphrase=%s",
-          branch->srt_latency_ms > 0 ? branch->srt_latency_ms : 600,
-          branch->srt_stream_key && *branch->srt_stream_key ? "set" : "not-set",
-          branch->srt_passphrase && *branch->srt_passphrase ? "set" : "not-set");
-    return SBS_OK;
-}
-
-static int start_custom_srt_sender(sink_branch_t *branch)
-{
-    struct sockaddr_in sa;
-    SRTSOCKET listener;
-    uint16_t port;
-    int rc;
-
-    if (!branch)
-        return SBS_ERR_INVAL;
-
-    if (srt_mode_is_caller(branch->srt_mode))
-        return start_custom_srt_caller(branch);
-    if (!srt_mode_is_listener(branch->srt_mode)) {
-        LOG_E("custom SRT: unsupported srt_mode='%s'", branch->srt_mode ? branch->srt_mode : "<null>");
-        return SBS_ERR_INVAL;
-    }
-
-    ensure_srt_ready();
-    port = parse_srt_listen_port(branch->srt_uri);
-    if (port == 0) {
-        LOG_E("custom SRT: invalid listener URI");
-        return SBS_ERR_INVAL;
-    }
-
-    rc = init_custom_srt_sender_state(branch);
-    if (rc != SBS_OK)
-        return rc;
 
     listener = srt_create_socket();
     if (listener == SRT_INVALID_SOCK) {
         LOG_E("custom SRT: create socket failed: %s", srt_getlasterror_str());
         return SBS_ERR_IO;
     }
-    rc = configure_srt_sender_socket(listener, branch->srt_latency_ms,
-                                     NULL, branch->srt_passphrase, false);
-    if (rc != SBS_OK) {
-        srt_close(listener);
-        return rc;
-    }
+    configure_srt_sender_socket(listener, branch->srt_latency_ms);
 
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
@@ -1845,11 +924,21 @@ static int start_custom_srt_sender(sink_branch_t *branch)
     }
 
     pthread_mutex_lock(&branch->srt_sender_mutex);
-    reset_custom_srt_sender_locked(branch);
+    g_array_set_size(branch->srt_clients, 0);
+    if (branch->srt_video_ts_backlog)
+        g_byte_array_set_size(branch->srt_video_ts_backlog, 0);
+    if (branch->srt_ts_input)
+        g_byte_array_set_size(branch->srt_ts_input, 0);
+    if (branch->srt_send_payload)
+        g_byte_array_set_size(branch->srt_send_payload, 0);
     branch->srt_listener = listener;
     branch->srt_listen_port = port;
     branch->srt_sender_running = true;
     branch->srt_accept_started = false;
+    branch->srt_sender_bytes_sent = 0;
+    branch->srt_sender_send_failures = 0;
+    branch->srt_sender_packets_sent = 0;
+    branch->srt_sender_packets_dropped = 0;
     pthread_mutex_unlock(&branch->srt_sender_mutex);
 
     if (pthread_create(&branch->srt_accept_thread, NULL,
@@ -1859,9 +948,8 @@ static int start_custom_srt_sender(sink_branch_t *branch)
         return SBS_ERR_IO;
     }
     branch->srt_accept_started = true;
-    LOG_I("custom SRT sender listening on port %u latency=%ums passphrase=%s", port,
-          branch->srt_latency_ms > 0 ? branch->srt_latency_ms : 600,
-          branch->srt_passphrase && *branch->srt_passphrase ? "set" : "not-set");
+    LOG_I("custom SRT sender listening on port %u latency=%ums", port,
+          branch->srt_latency_ms > 0 ? branch->srt_latency_ms : 600);
     return SBS_OK;
 }
 
@@ -3038,23 +2126,14 @@ static void sink_branch_free(gpointer data)
     g_free(branch->output_id);
     g_free(branch->sink_type);
     g_free(branch->srt_uri);
-    g_free(branch->srt_mode);
-    g_free(branch->srt_stream_key);
-    g_free(branch->srt_passphrase);
     g_free(branch->rtmp_uri);
     g_free(branch->rtmp_passcode);
-    g_free(branch->rtmp_plugin);
-    g_free(branch->rtmp_flv_mode);
     g_free(branch->file_path);
     g_free(branch->file_path_mode);
     g_free(branch->file_prefix);
     g_free(branch->file_container);
     if (branch->srt_callers)
         g_hash_table_destroy(branch->srt_callers);
-    if (branch->sink_stats_initialized)
-        pthread_mutex_destroy(&branch->sink_stats_mutex);
-    if (branch->flv_hevc_pending)
-        g_byte_array_free(branch->flv_hevc_pending, TRUE);
     stop_custom_srt_sender(branch);
     if (branch->srt_sender_initialized) {
         if (branch->srt_clients)
@@ -3114,35 +2193,6 @@ static const char *normalized_file_container(const char *container)
     return "ts";
 }
 
-static const char *normalized_rtmp_flv_mode(const char *mode)
-{
-    const char *value = (mode && *mode) ? mode : getenv("SBS_RTMP_HEVC_FLV_MODE");
-    if (!value || !*value)
-        return "enhanced";
-    if (g_ascii_strcasecmp(value, "legacy") == 0 ||
-        g_ascii_strcasecmp(value, "codec12") == 0 ||
-        g_ascii_strcasecmp(value, "x-hevc") == 0)
-        return "legacy";
-    return "enhanced";
-}
-
-static const char *normalized_rtmp_plugin(const char *plugin)
-{
-    const char *value = (plugin && *plugin) ? plugin : getenv("SBS_RTMP_PLUGIN");
-    if (!value || !*value)
-        return "streambox";
-    if (g_ascii_strcasecmp(value, "legacy") == 0 ||
-        g_ascii_strcasecmp(value, "stock") == 0 ||
-        g_ascii_strcasecmp(value, "rtmpsink") == 0)
-        return "legacy";
-    return "streambox";
-}
-
-static bool rtmp_plugin_is_legacy(const char *plugin)
-{
-    return strcmp(normalized_rtmp_plugin(plugin), "legacy") == 0;
-}
-
 static char *sanitize_file_prefix(const char *prefix)
 {
     char *safe = g_strdup((prefix && *prefix) ? prefix : "stream");
@@ -3186,13 +2236,12 @@ static char *resolve_file_location(const sbs_sink_branch_config_t *config)
 }
 
 static GstElement *create_muxer(const char *codec, const char *sink_type,
-                                  const char *file_container,
-                                  const char *rtmp_plugin,
-                                  const char **out_format)
+                                 const char *file_container,
+                                 const char **out_format)
 {
-    (void)codec;
     bool is_rtmp = (sink_type && strcmp(sink_type, "rtmp") == 0);
     bool is_file = (sink_type && strcmp(sink_type, "file") == 0);
+    bool is_h264 = (codec && strcmp(codec, "h264") == 0);
 
     *out_format = "mpegts";
     GstElement *muxer;
@@ -3202,9 +2251,7 @@ static GstElement *create_muxer(const char *codec, const char *sink_type,
             muxer = gst_element_factory_make("matroskamux", NULL);
             *out_format = "mkv";
         } else if (strcmp(container, "flv") == 0) {
-            muxer = gst_element_factory_make("sflvmux", NULL);
-            if (!muxer)
-                muxer = gst_element_factory_make("flvmux", NULL);
+            muxer = gst_element_factory_make("flvmux", NULL);
             if (muxer) {
                 g_object_set(muxer,
                     "streamable", TRUE,
@@ -3225,17 +2272,19 @@ static GstElement *create_muxer(const char *codec, const char *sink_type,
             }
             *out_format = "mpegts";
         }
-    } else if (is_rtmp) {
-        bool legacy_plugin = rtmp_plugin_is_legacy(rtmp_plugin);
-        muxer = gst_element_factory_make(legacy_plugin ? "flvmux" : "sflvmux", NULL);
+    } else if (is_rtmp && is_h264) {
+        muxer = gst_element_factory_make("flvmux", NULL);
         if (muxer) {
             g_object_set(muxer,
                 "streamable", TRUE,
                 "latency",    (guint64)100000000,
                 NULL);
         }
-        LOG_I("RTMP muxer plugin: %s", legacy_plugin ? "legacy flvmux" : "streambox sflvmux");
         *out_format = "flv";
+    } else if (is_rtmp) {
+        LOG_E("RTMP output requires H.264 because the available RTMP sinks accept FLV only (codec=%s)",
+              codec ? codec : "h265");
+        return NULL;
     } else {
         muxer = gst_element_factory_make("mpegtsmux", NULL);
         if (muxer) {
@@ -3264,16 +2313,6 @@ static GstElement *create_sink(const sbs_sink_branch_config_t *config,
         }
     } else if (!sink_type || strcmp(sink_type, "srt") == 0) {
         if (config->srt_uri && strlen(config->srt_uri) > 0) {
-            gint srt_mode;
-            if (srt_mode_is_caller(config->srt_mode)) {
-                srt_mode = 1;
-            } else if (srt_mode_is_listener(config->srt_mode)) {
-                srt_mode = 2;
-            } else {
-                LOG_E("SRT sink requested with unsupported srt_mode='%s'",
-                      config->srt_mode ? config->srt_mode : "<null>");
-                return NULL;
-            }
             sink = gst_element_factory_make("srtserversink", NULL);
             if (!sink)
                 sink = gst_element_factory_make("srtsink", NULL);
@@ -3282,7 +2321,7 @@ static GstElement *create_sink(const sbs_sink_branch_config_t *config,
                     ? config->srt_latency_ms : 600;
                 g_object_set(sink,
                     "uri",                 config->srt_uri,
-                    "mode",                srt_mode,
+                    "mode",                (gint)2,
                     "wait-for-connection", FALSE,
                     "poll-timeout",        (gint)100,
                     "latency",             (gint)latency_ms,
@@ -3290,39 +2329,20 @@ static GstElement *create_sink(const sbs_sink_branch_config_t *config,
                     "sync",                FALSE,
                     "async",               FALSE,
                     NULL);
-                if (config->srt_stream_key && *config->srt_stream_key &&
-                    g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "streamid")) {
-                    g_object_set(sink, "streamid", config->srt_stream_key, NULL);
-                }
-                if (config->srt_passphrase && *config->srt_passphrase) {
-                    if (g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "pbkeylen"))
-                        g_object_set(sink, "pbkeylen", (gint)16, NULL);
-                    if (g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "passphrase"))
-                        g_object_set(sink, "passphrase", config->srt_passphrase, NULL);
-                }
-                LOG_I("SRT sink: mode=%s latency=%ums sync=0 blocksize=1316 streamid=%s passphrase=%s",
-                      srt_mode == 1 ? "caller" : "listener",
-                      latency_ms,
-                      config->srt_stream_key && *config->srt_stream_key ? "set" : "not-set",
-                      config->srt_passphrase && *config->srt_passphrase ? "set" : "not-set");
+                LOG_I("SRT server sink: %s latency=%ums sync=0 blocksize=1316", config->srt_uri, latency_ms);
             }
         } else {
             LOG_E("SRT sink requested without srt_uri");
         }
     } else if (strcmp(sink_type, "rtmp") == 0) {
         if (config->rtmp_uri && strlen(config->rtmp_uri) > 0) {
-            bool legacy_plugin = rtmp_plugin_is_legacy(config->rtmp_plugin);
             char *location = build_rtmp_location(config->rtmp_uri, config->rtmp_passcode);
-            sink = gst_element_factory_make(legacy_plugin ? "rtmpsink" : "srtmpsink", NULL);
+            sink = gst_element_factory_make("rtmpsink", NULL);
+            if (!sink) sink = gst_element_factory_make("rtmp2sink", NULL);
             if (sink) {
-                g_object_set(sink,
-                    "location", location ? location : config->rtmp_uri,
-                    "sync",     FALSE,
-                    "async",    FALSE,
-                    NULL);
+                g_object_set(sink, "location", location ? location : config->rtmp_uri, "sync", FALSE, NULL);
                 LOG_I("RTMP sink: %s%s", config->rtmp_uri,
                       config->rtmp_passcode && *config->rtmp_passcode ? " (stream key set)" : "");
-                LOG_I("RTMP sink plugin: %s", legacy_plugin ? "legacy rtmpsink" : "streambox srtmpsink");
             }
             g_free(location);
         } else {
@@ -3391,7 +2411,7 @@ static int start_srt_session(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
         audio_encoder = gst_element_factory_make("avenc_mp2fixed", NULL);
     audio_parser = gst_element_factory_make("mpegaudioparse", NULL);
     audio_capsfilter = gst_element_factory_make("capsfilter", NULL);
-    muxer = create_muxer(mgr->codec, "srt", NULL, NULL, &muxer_format);
+    muxer = create_muxer(mgr->codec, "srt", NULL, &muxer_format);
 
     sink = gst_element_factory_make("appsink", NULL);
 
@@ -3646,8 +2666,7 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
     GstElement *vpacer = gst_element_factory_make("identity", NULL);
     GstElement *aqueue = gst_element_factory_make("queue", NULL);
     const char *muxer_format = NULL;
-    GstElement *muxer  = create_muxer(mgr->codec, branch->sink_type, branch->file_container,
-                                      branch->rtmp_plugin, &muxer_format);
+    GstElement *muxer  = create_muxer(mgr->codec, branch->sink_type, branch->file_container, &muxer_format);
     GstElement *acapsfilter = NULL;
     GstElement *branch_audio_src = NULL;
     GstElement *branch_audio_convert = NULL;
@@ -3661,14 +2680,9 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
         .output_id    = branch->output_id,
         .sink_type    = branch->sink_type,
         .srt_uri      = branch->srt_uri,
-        .srt_mode     = branch->srt_mode,
-        .srt_stream_key = branch->srt_stream_key,
-        .srt_passphrase = branch->srt_passphrase,
         .srt_latency_ms = branch->srt_latency_ms,
         .rtmp_uri     = branch->rtmp_uri,
         .rtmp_passcode = branch->rtmp_passcode,
-        .rtmp_plugin  = branch->rtmp_plugin,
-        .rtmp_flv_mode = branch->rtmp_flv_mode,
         .file_path    = branch->file_path,
         .file_path_mode = branch->file_path_mode,
         .file_prefix  = branch->file_prefix,
@@ -3676,20 +2690,9 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
     };
     GstElement *sink = create_sink(&cfg, muxer_format);
 
-    if (sink && branch->sink_type && strcmp(branch->sink_type, "rtmp") == 0 &&
-        !rtmp_plugin_is_legacy(branch->rtmp_plugin) && (mgr->is_h265 || mgr->hdr10)) {
-        const char *enhanced_codecs = mgr->is_h265 ? "hvc1" : "avc1";
-        if (g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "enhanced-codecs")) {
-            g_object_set(sink, "enhanced-codecs", enhanced_codecs, NULL);
-            LOG_I("RTMP Enhanced codec advertise enabled for '%s': %s",
-                  branch->output_id ? branch->output_id : "?",
-                  enhanced_codecs);
-        }
-    }
-
     if (flv_muxer) {
         GstCaps *vcaps;
-        vparser = gst_element_factory_make(mgr->is_h265 ? "h265parse" : "h264parse", NULL);
+        vparser = gst_element_factory_make("h264parse", NULL);
         vcapsfilter = gst_element_factory_make("capsfilter", NULL);
         if (vparser) {
             g_object_set(vparser,
@@ -3697,17 +2700,10 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
                 "disable-passthrough", TRUE,
                 NULL);
         }
-        if (mgr->is_h265) {
-            vcaps = gst_caps_new_simple("video/x-h265",
-                "stream-format", G_TYPE_STRING, "hvc1",
-                "alignment",     G_TYPE_STRING, "au",
-                NULL);
-        } else {
-            vcaps = gst_caps_new_simple("video/x-h264",
-                "stream-format", G_TYPE_STRING, "avc",
-                "alignment",     G_TYPE_STRING, "au",
-                NULL);
-        }
+        vcaps = gst_caps_new_simple("video/x-h264",
+            "stream-format", G_TYPE_STRING, "avc",
+            "alignment",     G_TYPE_STRING, "au",
+            NULL);
         if (vcapsfilter)
             g_object_set(vcapsfilter, "caps", vcaps, NULL);
         gst_caps_unref(vcaps);
@@ -3817,26 +2813,7 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
         }
     }
 
-    if (branch->sink_type && strcmp(branch->sink_type, "rtmp") == 0 &&
-        flv_muxer && (mgr->is_h265 || mgr->hdr10)) {
-        GstPad *mux_src_pad = gst_element_get_static_pad(muxer, "src");
-        if (mux_src_pad) {
-            branch->flv_hevc_pending = g_byte_array_new();
-            branch->flv_hevc_probe_id = gst_pad_add_probe(
-                mux_src_pad, GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
-                flv_hevc_probe, branch, NULL);
-            gst_object_unref(mux_src_pad);
-            LOG_I("RTMP FLV adapter enabled for '%s' (codec=%s mode=%s hdr10=%d)",
-                  branch->output_id ? branch->output_id : "?",
-                  mgr->is_h265 ? "h265" : "h264",
-                  branch->rtmp_flv_mode ? branch->rtmp_flv_mode : "enhanced",
-                  mgr->hdr10 ? 1 : 0);
-        }
-    }
-
-    if (branch->sink_type &&
-        (strcmp(branch->sink_type, "srt") == 0 ||
-         strcmp(branch->sink_type, "rtmp") == 0)) {
+    if (branch->sink_type && strcmp(branch->sink_type, "srt") == 0) {
         g_object_set(vqueue,
             "max-size-buffers", (guint)8,
             "max-size-time",    (guint64)(250 * GST_MSECOND),
@@ -3858,13 +2835,6 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
             "max-size-time",    (guint64)SBS_SRT_AUDIO_BUFFER_NS,
             "max-size-bytes",   (guint)0,
             "leaky",            0,
-            NULL);
-    } else if (branch->sink_type && strcmp(branch->sink_type, "rtmp") == 0) {
-        g_object_set(aqueue,
-            "max-size-buffers", (guint)0,
-            "max-size-time",    (guint64)(250 * GST_MSECOND),
-            "max-size-bytes",   (guint)0,
-            "leaky",            2,
             NULL);
     } else {
         g_object_set(aqueue,
@@ -4148,14 +3118,6 @@ static void unlink_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch
         }
         branch->sink_probe_id = 0;
     }
-    if (branch->muxer && branch->flv_hevc_probe_id != 0) {
-        GstPad *mux_src_pad = gst_element_get_static_pad(branch->muxer, "src");
-        if (mux_src_pad) {
-            gst_pad_remove_probe(mux_src_pad, branch->flv_hevc_probe_id);
-            gst_object_unref(mux_src_pad);
-        }
-        branch->flv_hevc_probe_id = 0;
-    }
     if (branch->audio_queue && branch->audio_gate_probe_id != 0) {
         GstPad *gate_pad = gst_element_get_static_pad(branch->audio_queue, "sink");
         if (gate_pad) {
@@ -4423,14 +3385,9 @@ int sbs_encoder_manager_update_config(sbs_encoder_manager_t *mgr,
         copy->output_id    = g_strdup(branch->output_id);
         copy->sink_type    = g_strdup(branch->sink_type);
         copy->srt_uri      = g_strdup(branch->srt_uri);
-        copy->srt_mode     = g_strdup(branch->srt_mode);
-        copy->srt_stream_key = g_strdup(branch->srt_stream_key);
-        copy->srt_passphrase = g_strdup(branch->srt_passphrase);
         copy->srt_latency_ms = branch->srt_latency_ms;
         copy->rtmp_uri     = g_strdup(branch->rtmp_uri);
         copy->rtmp_passcode = g_strdup(branch->rtmp_passcode);
-        copy->rtmp_plugin = g_strdup(branch->rtmp_plugin);
-        copy->rtmp_flv_mode = g_strdup(branch->rtmp_flv_mode);
         copy->file_path    = g_strdup(branch->file_path);
         copy->file_path_mode = g_strdup(branch->file_path_mode);
         copy->file_prefix  = g_strdup(branch->file_prefix);
@@ -4490,14 +3447,9 @@ int sbs_encoder_manager_update_config(sbs_encoder_manager_t *mgr,
             .output_id    = saved->output_id,
             .sink_type    = saved->sink_type,
             .srt_uri      = saved->srt_uri,
-            .srt_mode     = saved->srt_mode,
-            .srt_stream_key = saved->srt_stream_key,
-            .srt_passphrase = saved->srt_passphrase,
             .srt_latency_ms = saved->srt_latency_ms,
             .rtmp_uri     = saved->rtmp_uri,
             .rtmp_passcode = saved->rtmp_passcode,
-            .rtmp_plugin  = saved->rtmp_plugin,
-            .rtmp_flv_mode = saved->rtmp_flv_mode,
             .file_path    = saved->file_path,
             .file_path_mode = saved->file_path_mode,
             .file_prefix  = saved->file_prefix,
@@ -4568,14 +3520,6 @@ int sbs_encoder_manager_reconfigure_video(sbs_encoder_manager_t *mgr,
     if (mgr->gop_size == old_fps_num)
         mgr->gop_size = fps_num;
     mgr->force_next_idr = true;
-
-    {
-        GHashTableIter iter;
-        gpointer value;
-        g_hash_table_iter_init(&iter, mgr->branches);
-        while (g_hash_table_iter_next(&iter, NULL, &value))
-            flv_hevc_cache_hdr_metadata_values(value, mgr);
-    }
 
     pthread_mutex_unlock(&mgr->pipeline_mutex);
     return SBS_OK;
@@ -4721,24 +3665,15 @@ int sbs_encoder_manager_add_sink(sbs_encoder_manager_t *mgr,
     branch->output_id    = g_strdup(config->output_id);
     branch->sink_type    = g_strdup(config->sink_type ? config->sink_type : "srt");
     branch->srt_uri      = g_strdup(config->srt_uri);
-    branch->srt_mode     = g_strdup(config->srt_mode);
-    branch->srt_stream_key = g_strdup(config->srt_stream_key);
-    branch->srt_passphrase = g_strdup(config->srt_passphrase);
     branch->srt_latency_ms = config->srt_latency_ms;
     if (branch->sink_type && strcmp(branch->sink_type, "srt") == 0)
         branch->srt_callers = g_hash_table_new(g_direct_hash, g_direct_equal);
     branch->rtmp_uri     = g_strdup(config->rtmp_uri);
     branch->rtmp_passcode = g_strdup(config->rtmp_passcode);
-    branch->rtmp_plugin = g_strdup(normalized_rtmp_plugin(config->rtmp_plugin));
-    branch->rtmp_flv_mode = g_strdup(normalized_rtmp_flv_mode(config->rtmp_flv_mode));
-    branch->flv_hevc_legacy_mode = strcmp(branch->rtmp_flv_mode, "legacy") == 0;
-    flv_hevc_cache_hdr_metadata_values(branch, mgr);
     branch->file_path    = g_strdup(config->file_path);
     branch->file_path_mode = g_strdup(config->file_path_mode ? config->file_path_mode : "file");
     branch->file_prefix  = g_strdup(config->file_prefix ? config->file_prefix : "stream");
     branch->file_container = g_strdup(normalized_file_container(config->file_container));
-    pthread_mutex_init(&branch->sink_stats_mutex, NULL);
-    branch->sink_stats_initialized = true;
 
     if (branch->sink_type && strcmp(branch->sink_type, "srt") == 0)
         rc = start_srt_session(mgr, branch);
@@ -4843,8 +3778,7 @@ static cJSON *serialize_branch_health(sink_branch_t *branch)
 
     int warnings = branch ? g_atomic_int_get((gint *)&branch->sink_warning_count) : 0;
     int errors = branch ? g_atomic_int_get((gint *)&branch->sink_error_count) : 0;
-    int sink_buffers = 0;
-    uint64_t sink_bytes = 0;
+    int sink_buffers = branch ? g_atomic_int_get((gint *)&branch->sink_buffers_seen) : 0;
     int srt_callers = branch ? g_atomic_int_get((gint *)&branch->srt_caller_count) : 0;
     uint64_t srt_failures = branch
         ? branch->srt_sender_send_failures + branch->srt_video_push_failures +
@@ -4852,24 +3786,14 @@ static cJSON *serialize_branch_health(sink_branch_t *branch)
         : 0;
     uint64_t packets_sent = 0;
     uint64_t packets_dropped = 0;
-    bool srt_caller_mode = branch && srt_mode_is_caller(branch->srt_mode);
-
-    if (branch) {
-        if (branch->sink_stats_initialized)
-            pthread_mutex_lock(&branch->sink_stats_mutex);
-        sink_buffers = branch->sink_buffers_seen;
-        sink_bytes = branch->sink_bytes_seen;
-        if (branch->sink_stats_initialized)
-            pthread_mutex_unlock(&branch->sink_stats_mutex);
-    }
 
     if (g_strcmp0(sink_type, "srt") == 0) {
         packets_sent = branch ? branch->srt_sender_packets_sent : 0;
         packets_dropped = branch ? branch->srt_sender_packets_dropped : 0;
         if (!branch || !branch->srt_sender_running) {
-            reason = srt_caller_mode ? "SRT caller is not connected" : "SRT listener is not running";
+            reason = "SRT listener is not running";
         } else if (srt_callers <= 0) {
-            reason = srt_caller_mode ? "SRT caller disconnected" : "waiting for SRT caller";
+            reason = "waiting for SRT caller";
         } else if (srt_failures > 0) {
             status = "degraded";
             connected = true;
@@ -4878,7 +3802,7 @@ static cJSON *serialize_branch_health(sink_branch_t *branch)
         } else if (branch->srt_sender_bytes_sent > 0) {
             status = "connected";
             connected = true;
-            reason = "SRT stream active";
+            reason = "SRT caller streaming";
         } else {
             status = "degraded";
             connected = true;
@@ -4925,7 +3849,6 @@ static cJSON *serialize_branch_health(sink_branch_t *branch)
     cJSON_AddNumberToObject(obj, "warnings", warnings);
     cJSON_AddNumberToObject(obj, "errors", errors);
     cJSON_AddNumberToObject(obj, "sink_buffers", sink_buffers);
-    cJSON_AddNumberToObject(obj, "sink_bytes", (double)sink_bytes);
     cJSON_AddNumberToObject(obj, "packets_sent", (double)packets_sent);
     cJSON_AddNumberToObject(obj, "packets_dropped", (double)packets_dropped);
     cJSON_AddNumberToObject(obj, "packet_drop_rate",
@@ -4933,12 +3856,9 @@ static cJSON *serialize_branch_health(sink_branch_t *branch)
                                 ? (double)packets_dropped / (double)(packets_sent + packets_dropped)
                                 : 0.0);
     if (g_strcmp0(sink_type, "srt") == 0) {
-        cJSON_AddStringToObject(obj, "mode", srt_caller_mode ? "caller" : "listener");
         cJSON_AddNumberToObject(obj, "callers", srt_callers);
         cJSON_AddNumberToObject(obj, "bytes_sent", (double)(branch ? branch->srt_sender_bytes_sent : 0));
         cJSON_AddNumberToObject(obj, "send_failures", (double)srt_failures);
-    } else if (g_strcmp0(sink_type, "rtmp") == 0) {
-        cJSON_AddNumberToObject(obj, "bytes_sent", (double)sink_bytes);
     }
     return obj;
 }

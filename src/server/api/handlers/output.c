@@ -49,9 +49,10 @@ static uint32_t encoder_num(GHashTable *encoder, const char *key, uint32_t fallb
 static const char *resolve_shared_codec_for_sink(const char *sink_type,
                                                  const char *requested_codec)
 {
-    (void)sink_type;
     if (requested_codec && *requested_codec)
         return requested_codec;
+    if (g_strcmp0(sink_type, "rtmp") == 0)
+        return "h264";
     return NULL;
 }
 
@@ -100,34 +101,20 @@ static void output_replace_encoder_from_json(sbs_output_state_t *output, cJSON *
     cJSON *entry = NULL;
     cJSON *rtmp_passcode_item;
     cJSON *rtmp_stream_key_item;
-    cJSON *srt_stream_key_item;
-    cJSON *srt_stream_id_item;
-    cJSON *srt_passphrase_item;
     char *old_rtmp_passcode = NULL;
-    char *old_srt_stream_key = NULL;
-    char *old_srt_passphrase = NULL;
 
     if (!output || !cJSON_IsObject(encoder_obj)) return;
     if (output->encoder) {
         old_rtmp_passcode = g_strdup(g_hash_table_lookup(output->encoder, "rtmp_passcode"));
-        old_srt_stream_key = g_strdup(g_hash_table_lookup(output->encoder, "srt_stream_key"));
-        old_srt_passphrase = g_strdup(g_hash_table_lookup(output->encoder, "srt_passphrase"));
     }
     rtmp_passcode_item = cJSON_GetObjectItemCaseSensitive(encoder_obj, "rtmp_passcode");
     rtmp_stream_key_item = cJSON_GetObjectItemCaseSensitive(encoder_obj, "rtmp_stream_key");
-    srt_stream_key_item = cJSON_GetObjectItemCaseSensitive(encoder_obj, "srt_stream_key");
-    srt_stream_id_item = cJSON_GetObjectItemCaseSensitive(encoder_obj, "srt_stream_id");
-    srt_passphrase_item = cJSON_GetObjectItemCaseSensitive(encoder_obj, "srt_passphrase");
 
     if (output->encoder) g_hash_table_destroy(output->encoder);
     output->encoder = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
     for (entry = encoder_obj->child; entry; entry = entry->next) {
         if (cJSON_IsString(entry)) {
-            const char *key = entry->string;
-            if (g_strcmp0(key, "rtmp_stream_key") == 0)
-                key = "rtmp_passcode";
-            else if (g_strcmp0(key, "srt_stream_id") == 0)
-                key = "srt_stream_key";
+            const char *key = g_strcmp0(entry->string, "rtmp_stream_key") == 0 ? "rtmp_passcode" : entry->string;
             g_hash_table_insert(output->encoder, g_strdup(key),
                                 g_strdup(cJSON_GetStringValue(entry)));
         } else if (cJSON_IsNumber(entry)) {
@@ -141,18 +128,7 @@ static void output_replace_encoder_from_json(sbs_output_state_t *output, cJSON *
         g_hash_table_insert(output->encoder, g_strdup("rtmp_passcode"), old_rtmp_passcode);
         old_rtmp_passcode = NULL;
     }
-    if (!cJSON_IsString(srt_stream_key_item) && !cJSON_IsString(srt_stream_id_item) &&
-        old_srt_stream_key && *old_srt_stream_key) {
-        g_hash_table_insert(output->encoder, g_strdup("srt_stream_key"), old_srt_stream_key);
-        old_srt_stream_key = NULL;
-    }
-    if (!cJSON_IsString(srt_passphrase_item) && old_srt_passphrase && *old_srt_passphrase) {
-        g_hash_table_insert(output->encoder, g_strdup("srt_passphrase"), old_srt_passphrase);
-        old_srt_passphrase = NULL;
-    }
     g_free(old_rtmp_passcode);
-    g_free(old_srt_stream_key);
-    g_free(old_srt_passphrase);
 }
 
 int sbs_api_handle_output_list(sbs_api_server_t *server, sbs_api_client_t *client,
@@ -266,16 +242,6 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
         const char *srt_uri = json_str(params, "srt_uri");
         sink_cfg.srt_uri = srt_uri ? srt_uri : encoder_str(output->encoder, "srt_uri", "srt://:8888");
 
-        const char *srt_mode = json_str(params, "srt_mode");
-        sink_cfg.srt_mode = srt_mode ? srt_mode : encoder_str(output->encoder, "srt_mode", NULL);
-
-        const char *srt_stream_key = json_str_alias(params, "srt_stream_key", "srt_stream_id");
-        sink_cfg.srt_stream_key = srt_stream_key ? srt_stream_key :
-            encoder_str(output->encoder, "srt_stream_key", encoder_str(output->encoder, "srt_stream_id", NULL));
-
-        const char *srt_passphrase = json_str(params, "srt_passphrase");
-        sink_cfg.srt_passphrase = srt_passphrase ? srt_passphrase : encoder_str(output->encoder, "srt_passphrase", NULL);
-
         uint32_t srt_latency = (uint32_t)json_num_def(params, "srt_latency_ms", 0);
         sink_cfg.srt_latency_ms = srt_latency ? srt_latency : encoder_num(output->encoder, "srt_latency_ms", 600);
 
@@ -284,12 +250,6 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
 
         const char *rtmp_passcode = json_str_alias(params, "rtmp_stream_key", "rtmp_passcode");
         sink_cfg.rtmp_passcode = rtmp_passcode ? rtmp_passcode : encoder_str(output->encoder, "rtmp_passcode", NULL);
-
-        const char *rtmp_plugin = json_str(params, "rtmp_plugin");
-        sink_cfg.rtmp_plugin = rtmp_plugin ? rtmp_plugin : encoder_str(output->encoder, "rtmp_plugin", NULL);
-
-        const char *rtmp_flv_mode = json_str(params, "rtmp_flv_mode");
-        sink_cfg.rtmp_flv_mode = rtmp_flv_mode ? rtmp_flv_mode : encoder_str(output->encoder, "rtmp_flv_mode", NULL);
 
         const char *file_path = json_str(params, "file_path");
         sink_cfg.file_path = file_path ? file_path : encoder_str(output->encoder, "file_path", NULL);
@@ -323,12 +283,6 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
             g_strdup(sink_cfg.sink_type ? sink_cfg.sink_type : "srt"));
         g_hash_table_insert(output->encoder, g_strdup("srt_uri"),
             g_strdup(sink_cfg.srt_uri ? sink_cfg.srt_uri : "srt://:8888"));
-        if (sink_cfg.srt_mode)
-            g_hash_table_insert(output->encoder, g_strdup("srt_mode"), g_strdup(sink_cfg.srt_mode));
-        if (sink_cfg.srt_stream_key)
-            g_hash_table_insert(output->encoder, g_strdup("srt_stream_key"), g_strdup(sink_cfg.srt_stream_key));
-        if (sink_cfg.srt_passphrase)
-            g_hash_table_insert(output->encoder, g_strdup("srt_passphrase"), g_strdup(sink_cfg.srt_passphrase));
         {
             char buf[32];
             snprintf(buf, sizeof(buf), "%u", sink_cfg.srt_latency_ms);
@@ -338,10 +292,6 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
             g_hash_table_insert(output->encoder, g_strdup("rtmp_uri"), g_strdup(sink_cfg.rtmp_uri));
         if (sink_cfg.rtmp_passcode)
             g_hash_table_insert(output->encoder, g_strdup("rtmp_passcode"), g_strdup(sink_cfg.rtmp_passcode));
-        if (sink_cfg.rtmp_plugin)
-            g_hash_table_insert(output->encoder, g_strdup("rtmp_plugin"), g_strdup(sink_cfg.rtmp_plugin));
-        if (sink_cfg.rtmp_flv_mode)
-            g_hash_table_insert(output->encoder, g_strdup("rtmp_flv_mode"), g_strdup(sink_cfg.rtmp_flv_mode));
         if (resolved_codec && *resolved_codec)
             g_hash_table_insert(output->encoder, g_strdup("codec"), g_strdup(resolved_codec));
         if (sink_cfg.file_path)
@@ -373,16 +323,6 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
         const char *srt_uri = json_str(params, "srt_uri");
         cfg.srt_uri = srt_uri ? srt_uri : encoder_str(output->encoder, "srt_uri", "srt://:8888");
 
-        const char *srt_mode = json_str(params, "srt_mode");
-        cfg.srt_mode = srt_mode ? srt_mode : encoder_str(output->encoder, "srt_mode", NULL);
-
-        const char *srt_stream_key = json_str_alias(params, "srt_stream_key", "srt_stream_id");
-        cfg.srt_stream_key = srt_stream_key ? srt_stream_key :
-            encoder_str(output->encoder, "srt_stream_key", encoder_str(output->encoder, "srt_stream_id", NULL));
-
-        const char *srt_passphrase = json_str(params, "srt_passphrase");
-        cfg.srt_passphrase = srt_passphrase ? srt_passphrase : encoder_str(output->encoder, "srt_passphrase", NULL);
-
         uint32_t srt_latency = (uint32_t)json_num_def(params, "srt_latency_ms", 0);
         cfg.srt_latency_ms = srt_latency ? srt_latency : encoder_num(output->encoder, "srt_latency_ms", 600);
 
@@ -391,9 +331,6 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
 
         const char *rtmp_passcode = json_str_alias(params, "rtmp_stream_key", "rtmp_passcode");
         cfg.rtmp_passcode = rtmp_passcode ? rtmp_passcode : encoder_str(output->encoder, "rtmp_passcode", NULL);
-
-        const char *rtmp_plugin = json_str(params, "rtmp_plugin");
-        cfg.rtmp_plugin = rtmp_plugin ? rtmp_plugin : encoder_str(output->encoder, "rtmp_plugin", NULL);
 
         const char *file_path = json_str(params, "file_path");
         cfg.file_path = file_path ? file_path : encoder_str(output->encoder, "file_path", NULL);
@@ -423,12 +360,6 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
             g_strdup(cfg.sink_type ? cfg.sink_type : "srt"));
         g_hash_table_insert(output->encoder, g_strdup("srt_uri"),
             g_strdup(cfg.srt_uri ? cfg.srt_uri : "srt://:8888"));
-        if (cfg.srt_mode)
-            g_hash_table_insert(output->encoder, g_strdup("srt_mode"), g_strdup(cfg.srt_mode));
-        if (cfg.srt_stream_key)
-            g_hash_table_insert(output->encoder, g_strdup("srt_stream_key"), g_strdup(cfg.srt_stream_key));
-        if (cfg.srt_passphrase)
-            g_hash_table_insert(output->encoder, g_strdup("srt_passphrase"), g_strdup(cfg.srt_passphrase));
         {
             char buf[32];
             snprintf(buf, sizeof(buf), "%u", cfg.srt_latency_ms);
@@ -438,8 +369,6 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
             g_hash_table_insert(output->encoder, g_strdup("rtmp_uri"), g_strdup(cfg.rtmp_uri));
         if (cfg.rtmp_passcode)
             g_hash_table_insert(output->encoder, g_strdup("rtmp_passcode"), g_strdup(cfg.rtmp_passcode));
-        if (cfg.rtmp_plugin)
-            g_hash_table_insert(output->encoder, g_strdup("rtmp_plugin"), g_strdup(cfg.rtmp_plugin));
         if (cfg.file_path)
             g_hash_table_insert(output->encoder, g_strdup("file_path"), g_strdup(cfg.file_path));
         if (cfg.file_path_mode)
@@ -527,15 +456,9 @@ int sbs_api_handle_output_update(sbs_api_server_t *server, sbs_api_client_t *cli
             sink_cfg.output_id = output->id;
             sink_cfg.sink_type = encoder_str(output->encoder, "sink_type", "srt");
             sink_cfg.srt_uri = encoder_str(output->encoder, "srt_uri", "srt://:8888");
-            sink_cfg.srt_mode = encoder_str(output->encoder, "srt_mode", NULL);
-            sink_cfg.srt_stream_key = encoder_str(output->encoder, "srt_stream_key",
-                                                  encoder_str(output->encoder, "srt_stream_id", NULL));
-            sink_cfg.srt_passphrase = encoder_str(output->encoder, "srt_passphrase", NULL);
             sink_cfg.srt_latency_ms = encoder_num(output->encoder, "srt_latency_ms", 600);
             sink_cfg.rtmp_uri = encoder_str(output->encoder, "rtmp_uri", NULL);
             sink_cfg.rtmp_passcode = encoder_str(output->encoder, "rtmp_passcode", NULL);
-            sink_cfg.rtmp_plugin = encoder_str(output->encoder, "rtmp_plugin", NULL);
-            sink_cfg.rtmp_flv_mode = encoder_str(output->encoder, "rtmp_flv_mode", NULL);
             sink_cfg.file_path = encoder_str(output->encoder, "file_path", NULL);
             sink_cfg.file_path_mode = encoder_str(output->encoder, "file_path_mode", "file");
             sink_cfg.file_prefix = encoder_str(output->encoder, "file_prefix", "stream");
@@ -577,14 +500,9 @@ int sbs_api_handle_output_update(sbs_api_server_t *server, sbs_api_client_t *cli
             cfg.bitrate_kbps = encoder_num(output->encoder, "bitrate_kbps", 10000);
             cfg.sink_type = encoder_str(output->encoder, "sink_type", "srt");
             cfg.srt_uri = encoder_str(output->encoder, "srt_uri", "srt://:8888");
-            cfg.srt_mode = encoder_str(output->encoder, "srt_mode", NULL);
-            cfg.srt_stream_key = encoder_str(output->encoder, "srt_stream_key",
-                                             encoder_str(output->encoder, "srt_stream_id", NULL));
-            cfg.srt_passphrase = encoder_str(output->encoder, "srt_passphrase", NULL);
             cfg.srt_latency_ms = encoder_num(output->encoder, "srt_latency_ms", 600);
             cfg.rtmp_uri = encoder_str(output->encoder, "rtmp_uri", NULL);
             cfg.rtmp_passcode = encoder_str(output->encoder, "rtmp_passcode", NULL);
-            cfg.rtmp_plugin = encoder_str(output->encoder, "rtmp_plugin", NULL);
             cfg.file_path = encoder_str(output->encoder, "file_path", NULL);
             cfg.file_path_mode = encoder_str(output->encoder, "file_path_mode", "file");
             cfg.file_prefix = encoder_str(output->encoder, "file_prefix", "stream");

@@ -323,9 +323,10 @@ static void clear_scene_graph(sbs_scene_graph_t *graph)
 static const char *resolve_shared_codec_for_sink(const char *sink_type,
                                                  const char *requested_codec)
 {
-    (void)sink_type;
     if (requested_codec && *requested_codec)
         return requested_codec;
+    if (g_strcmp0(sink_type, "rtmp") == 0)
+        return "h264";
     return NULL;
 }
 
@@ -481,8 +482,6 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
             const char *lat_str   = enc ? g_hash_table_lookup(enc, "srt_latency_ms") : NULL;
             const char *rtmp_uri  = enc ? g_hash_table_lookup(enc, "rtmp_uri")  : NULL;
             const char *rtmp_passcode = enc ? g_hash_table_lookup(enc, "rtmp_passcode") : NULL;
-            const char *rtmp_plugin = enc ? g_hash_table_lookup(enc, "rtmp_plugin") : NULL;
-            const char *rtmp_flv_mode = enc ? g_hash_table_lookup(enc, "rtmp_flv_mode") : NULL;
             const char *file_path = enc ? g_hash_table_lookup(enc, "file_path") : NULL;
             const char *file_path_mode = enc ? g_hash_table_lookup(enc, "file_path_mode") : NULL;
             const char *file_prefix = enc ? g_hash_table_lookup(enc, "file_prefix") : NULL;
@@ -504,8 +503,6 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
                 sink_cfg.srt_latency_ms = srt_latency;
                 sink_cfg.rtmp_uri       = rtmp_uri;
                 sink_cfg.rtmp_passcode  = rtmp_passcode;
-                sink_cfg.rtmp_plugin    = rtmp_plugin;
-                sink_cfg.rtmp_flv_mode  = rtmp_flv_mode;
                 sink_cfg.file_path      = file_path;
                 sink_cfg.file_path_mode = file_path_mode;
                 sink_cfg.file_prefix    = file_prefix;
@@ -739,7 +736,7 @@ static int apply_scene_graph_bundle(sbs_api_server_t *server, cJSON *bundle)
             load_audio_binding(audio_obj, &source->audio, create.kind == SBS_SOURCE_KIND_ALSA_AUDIO);
             if (create.kind == SBS_SOURCE_KIND_ALSA_AUDIO && !source->audio.device) {
                 const char *device = source->config ? g_hash_table_lookup(source->config, "device") : NULL;
-                source->audio.device = g_strdup(device && device[0] ? device : "hdmi_auto");
+                source->audio.device = g_strdup(device && device[0] ? device : "hw:0,2");
             }
         }
     }

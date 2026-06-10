@@ -84,6 +84,23 @@ void decode_pair(uint pair_idx, out uint y0, out uint u, out uint y1, out uint v
     v = ((bs & 0x3u) << 8) | hi;
 }
 
+uint read_pair_luma_bits(uint pair_idx) {
+    uint byte_offset = pair_idx * 5u;
+    uint word_idx = byte_offset >> 2;
+    uint shift = (byte_offset & 3u) << 3;
+    uint w0 = corrected_word(word_idx);
+    if (shift == 0u)
+        return w0;
+    uint w1 = corrected_word(word_idx + 1u);
+    return (w0 >> shift) | (w1 << (32u - shift));
+}
+
+void decode_luma_pair(uint pair_idx, out uint y0, out uint y1) {
+    uint bs = bswap32(read_pair_luma_bits(pair_idx));
+    y0 = (bs >> 22) & 0x3FFu;
+    y1 = (bs >> 2) & 0x3FFu;
+}
+
 uint pairs_per_row() { return max(pc.src_w >> 1, 1u); }
 
 uint out_begin_for_src(uint s, float inv_scale) {
@@ -164,6 +181,16 @@ void write_chroma_rect(uint src_pair_x, uint src_y, vec2 vu) {
     }
 }
 
+bool direct_full_canvas_1to1(uint pair_x) {
+    return pc.dst_x == 0 && pc.dst_y == 0 &&
+        pc.dst_w == pc.canvas_width && pc.dst_h == pc.canvas_height &&
+        pc.src_w == pc.canvas_width && pc.src_h == pc.canvas_height &&
+        pc.src_pair_start == 0u && pc.src_pair_count == pairs_per_row() &&
+        pair_x < (pc.canvas_width >> 1) &&
+        abs(pc.y_scale_x - 1.0) < 0.0001 &&
+        abs(pc.y_scale_y - 1.0) < 0.0001;
+}
+
 void main() {
     uint local_pair = gl_GlobalInvocationID.x;
     uint local_y = gl_GlobalInvocationID.y;
@@ -207,9 +234,15 @@ void main() {
     if (pair_x >= pairs_per_row())
         return;
 
-    uint y0, u, y1, v;
-    decode_pair(src_y * pairs_per_row() + pair_x, y0, u, y1, v);
+    uint y0, y1;
+    decode_luma_pair(src_y * pairs_per_row() + pair_x, y0, y1);
+    if (direct_full_canvas_1to1(pair_x)) {
+        uint dst_x = pair_x * 2u;
+        imageStore(y_img, ivec2(dst_x, src_y), vec4(map_y10(y0), 0.0, 0.0, 1.0));
+        imageStore(y_img, ivec2(dst_x + 1u, src_y), vec4(map_y10(y1), 0.0, 0.0, 1.0));
+        return;
+    }
+
     write_luma_rect(pair_x * 2u, src_y, map_y10(y0));
     write_luma_rect(pair_x * 2u + 1u, src_y, map_y10(y1));
-    write_chroma_rect(pair_x, src_y, map_vu10(u, v));
 }

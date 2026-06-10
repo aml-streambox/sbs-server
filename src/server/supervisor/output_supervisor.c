@@ -88,6 +88,7 @@ typedef struct sbs_output_entry {
     char        *cfg_srt_uri;
     char        *cfg_rtmp_uri;
     char        *cfg_rtmp_passcode;
+    char        *cfg_rtmp_plugin;
     char        *cfg_file_path;
     char        *cfg_file_path_mode;
     char        *cfg_file_prefix;
@@ -258,6 +259,7 @@ int sbs_output_supervisor_start_output(sbs_output_supervisor_t *sup,
     entry->cfg_srt_uri   = config->srt_uri ? strdup(config->srt_uri) : NULL;
     entry->cfg_rtmp_uri  = config->rtmp_uri ? strdup(config->rtmp_uri) : NULL;
     entry->cfg_rtmp_passcode = config->rtmp_passcode ? strdup(config->rtmp_passcode) : NULL;
+    entry->cfg_rtmp_plugin = config->rtmp_plugin ? strdup(config->rtmp_plugin) : NULL;
     entry->cfg_file_path = config->file_path ? strdup(config->file_path) : NULL;
     entry->cfg_file_path_mode = config->file_path_mode ? strdup(config->file_path_mode) : NULL;
     entry->cfg_file_prefix = config->file_prefix ? strdup(config->file_prefix) : NULL;
@@ -269,6 +271,7 @@ int sbs_output_supervisor_start_output(sbs_output_supervisor_t *sup,
     entry->config_copy.srt_uri   = entry->cfg_srt_uri;
     entry->config_copy.rtmp_uri  = entry->cfg_rtmp_uri;
     entry->config_copy.rtmp_passcode = entry->cfg_rtmp_passcode;
+    entry->config_copy.rtmp_plugin = entry->cfg_rtmp_plugin;
     entry->config_copy.file_path = entry->cfg_file_path;
     entry->config_copy.file_path_mode = entry->cfg_file_path_mode;
     entry->config_copy.file_prefix = entry->cfg_file_prefix;
@@ -595,6 +598,7 @@ static void output_entry_free(sbs_output_entry_t *entry)
     free(entry->cfg_srt_uri);
     free(entry->cfg_rtmp_uri);
     free(entry->cfg_rtmp_passcode);
+    free(entry->cfg_rtmp_plugin);
     free(entry->cfg_file_path);
     free(entry->cfg_file_path_mode);
     free(entry->cfg_file_prefix);
@@ -650,6 +654,9 @@ static char *build_config_json(const sbs_output_entry_t *entry)
     }
     if (cfg->rtmp_passcode) {
         cJSON_AddStringToObject(obj, "rtmp_passcode", cfg->rtmp_passcode);
+    }
+    if (cfg->rtmp_plugin) {
+        cJSON_AddStringToObject(obj, "rtmp_plugin", cfg->rtmp_plugin);
     }
     if (cfg->file_path) {
         cJSON_AddStringToObject(obj, "file_path", cfg->file_path);

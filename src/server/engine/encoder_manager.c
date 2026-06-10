@@ -135,6 +135,7 @@ typedef struct sink_branch {
     uint32_t    srt_latency_ms;
     char       *rtmp_uri;
     char       *rtmp_passcode;
+    char       *rtmp_plugin;
     char       *file_path;
     char       *file_path_mode;
     char       *file_prefix;
@@ -2128,6 +2129,7 @@ static void sink_branch_free(gpointer data)
     g_free(branch->srt_uri);
     g_free(branch->rtmp_uri);
     g_free(branch->rtmp_passcode);
+    g_free(branch->rtmp_plugin);
     g_free(branch->file_path);
     g_free(branch->file_path_mode);
     g_free(branch->file_prefix);
@@ -2180,6 +2182,22 @@ static char *build_rtmp_location(const char *rtmp_uri, const char *rtmp_passcode
 
     const char *sep = rtmp_uri[strlen(rtmp_uri) - 1] == '/' ? "" : "/";
     return g_strconcat(rtmp_uri, sep, rtmp_passcode, NULL);
+}
+
+static const char *normalized_rtmp_plugin(const char *plugin)
+{
+    if (!plugin || !*plugin)
+        return "legacy";
+    if (g_ascii_strcasecmp(plugin, "streambox") == 0 ||
+        g_ascii_strcasecmp(plugin, "srtmp") == 0 ||
+        g_ascii_strcasecmp(plugin, "experimental") == 0)
+        return "streambox";
+    return "legacy";
+}
+
+static bool rtmp_uses_streambox(const char *plugin)
+{
+    return strcmp(normalized_rtmp_plugin(plugin), "streambox") == 0;
 }
 
 static const char *normalized_file_container(const char *container)
@@ -2237,11 +2255,13 @@ static char *resolve_file_location(const sbs_sink_branch_config_t *config)
 
 static GstElement *create_muxer(const char *codec, const char *sink_type,
                                  const char *file_container,
+                                 const char *rtmp_plugin,
                                  const char **out_format)
 {
     bool is_rtmp = (sink_type && strcmp(sink_type, "rtmp") == 0);
     bool is_file = (sink_type && strcmp(sink_type, "file") == 0);
     bool is_h264 = (codec && strcmp(codec, "h264") == 0);
+    bool streambox_rtmp = is_rtmp && rtmp_uses_streambox(rtmp_plugin);
 
     *out_format = "mpegts";
     GstElement *muxer;
@@ -2272,13 +2292,17 @@ static GstElement *create_muxer(const char *codec, const char *sink_type,
             }
             *out_format = "mpegts";
         }
-    } else if (is_rtmp && is_h264) {
-        muxer = gst_element_factory_make("flvmux", NULL);
+    } else if (is_rtmp && (is_h264 || streambox_rtmp)) {
+        const char *factory = streambox_rtmp ? "sflvmux" : "flvmux";
+        muxer = gst_element_factory_make(factory, NULL);
         if (muxer) {
-            g_object_set(muxer,
-                "streamable", TRUE,
-                "latency",    (guint64)100000000,
-                NULL);
+            if (g_object_class_find_property(G_OBJECT_GET_CLASS(muxer), "streamable"))
+                g_object_set(muxer, "streamable", TRUE, NULL);
+            if (g_object_class_find_property(G_OBJECT_GET_CLASS(muxer), "latency"))
+                g_object_set(muxer, "latency", (guint64)100000000, NULL);
+            LOG_I("RTMP muxer plugin: %s", factory);
+        } else if (streambox_rtmp) {
+            LOG_E("experimental RTMP requested but sflvmux is unavailable");
         }
         *out_format = "flv";
     } else if (is_rtmp) {
@@ -2337,12 +2361,19 @@ static GstElement *create_sink(const sbs_sink_branch_config_t *config,
     } else if (strcmp(sink_type, "rtmp") == 0) {
         if (config->rtmp_uri && strlen(config->rtmp_uri) > 0) {
             char *location = build_rtmp_location(config->rtmp_uri, config->rtmp_passcode);
-            sink = gst_element_factory_make("rtmpsink", NULL);
-            if (!sink) sink = gst_element_factory_make("rtmp2sink", NULL);
+            bool streambox_rtmp = rtmp_uses_streambox(config->rtmp_plugin);
+            sink = gst_element_factory_make(streambox_rtmp ? "srtmpsink" : "rtmpsink", NULL);
+            if (!sink && !streambox_rtmp)
+                sink = gst_element_factory_make("rtmp2sink", NULL);
             if (sink) {
                 g_object_set(sink, "location", location ? location : config->rtmp_uri, "sync", FALSE, NULL);
+                if (g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "async"))
+                    g_object_set(sink, "async", FALSE, NULL);
                 LOG_I("RTMP sink: %s%s", config->rtmp_uri,
                       config->rtmp_passcode && *config->rtmp_passcode ? " (stream key set)" : "");
+                LOG_I("RTMP sink plugin: %s", streambox_rtmp ? "srtmpsink" : GST_OBJECT_NAME(sink));
+            } else if (streambox_rtmp) {
+                LOG_E("experimental RTMP requested but srtmpsink is unavailable");
             }
             g_free(location);
         } else {
@@ -2411,7 +2442,7 @@ static int start_srt_session(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
         audio_encoder = gst_element_factory_make("avenc_mp2fixed", NULL);
     audio_parser = gst_element_factory_make("mpegaudioparse", NULL);
     audio_capsfilter = gst_element_factory_make("capsfilter", NULL);
-    muxer = create_muxer(mgr->codec, "srt", NULL, &muxer_format);
+    muxer = create_muxer(mgr->codec, "srt", NULL, NULL, &muxer_format);
 
     sink = gst_element_factory_make("appsink", NULL);
 
@@ -2666,7 +2697,8 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
     GstElement *vpacer = gst_element_factory_make("identity", NULL);
     GstElement *aqueue = gst_element_factory_make("queue", NULL);
     const char *muxer_format = NULL;
-    GstElement *muxer  = create_muxer(mgr->codec, branch->sink_type, branch->file_container, &muxer_format);
+    GstElement *muxer  = create_muxer(mgr->codec, branch->sink_type, branch->file_container,
+                                      branch->rtmp_plugin, &muxer_format);
     GstElement *acapsfilter = NULL;
     GstElement *branch_audio_src = NULL;
     GstElement *branch_audio_convert = NULL;
@@ -2683,6 +2715,7 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
         .srt_latency_ms = branch->srt_latency_ms,
         .rtmp_uri     = branch->rtmp_uri,
         .rtmp_passcode = branch->rtmp_passcode,
+        .rtmp_plugin  = branch->rtmp_plugin,
         .file_path    = branch->file_path,
         .file_path_mode = branch->file_path_mode,
         .file_prefix  = branch->file_prefix,
@@ -2690,9 +2723,17 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
     };
     GstElement *sink = create_sink(&cfg, muxer_format);
 
+    if (sink && branch->sink_type && strcmp(branch->sink_type, "rtmp") == 0 &&
+        rtmp_uses_streambox(branch->rtmp_plugin) && mgr->is_h265 &&
+        g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "enhanced-codecs")) {
+        g_object_set(sink, "enhanced-codecs", "hvc1", NULL);
+        LOG_I("RTMP Enhanced codec advertise enabled for '%s': hvc1",
+              branch->output_id ? branch->output_id : "?");
+    }
+
     if (flv_muxer) {
         GstCaps *vcaps;
-        vparser = gst_element_factory_make("h264parse", NULL);
+        vparser = gst_element_factory_make(mgr->is_h265 ? "h265parse" : "h264parse", NULL);
         vcapsfilter = gst_element_factory_make("capsfilter", NULL);
         if (vparser) {
             g_object_set(vparser,
@@ -2700,10 +2741,17 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
                 "disable-passthrough", TRUE,
                 NULL);
         }
-        vcaps = gst_caps_new_simple("video/x-h264",
-            "stream-format", G_TYPE_STRING, "avc",
-            "alignment",     G_TYPE_STRING, "au",
-            NULL);
+        if (mgr->is_h265) {
+            vcaps = gst_caps_new_simple("video/x-h265",
+                "stream-format", G_TYPE_STRING, "hvc1",
+                "alignment",     G_TYPE_STRING, "au",
+                NULL);
+        } else {
+            vcaps = gst_caps_new_simple("video/x-h264",
+                "stream-format", G_TYPE_STRING, "avc",
+                "alignment",     G_TYPE_STRING, "au",
+                NULL);
+        }
         if (vcapsfilter)
             g_object_set(vcapsfilter, "caps", vcaps, NULL);
         gst_caps_unref(vcaps);
@@ -3388,6 +3436,7 @@ int sbs_encoder_manager_update_config(sbs_encoder_manager_t *mgr,
         copy->srt_latency_ms = branch->srt_latency_ms;
         copy->rtmp_uri     = g_strdup(branch->rtmp_uri);
         copy->rtmp_passcode = g_strdup(branch->rtmp_passcode);
+        copy->rtmp_plugin = g_strdup(branch->rtmp_plugin);
         copy->file_path    = g_strdup(branch->file_path);
         copy->file_path_mode = g_strdup(branch->file_path_mode);
         copy->file_prefix  = g_strdup(branch->file_prefix);
@@ -3450,6 +3499,7 @@ int sbs_encoder_manager_update_config(sbs_encoder_manager_t *mgr,
             .srt_latency_ms = saved->srt_latency_ms,
             .rtmp_uri     = saved->rtmp_uri,
             .rtmp_passcode = saved->rtmp_passcode,
+            .rtmp_plugin  = saved->rtmp_plugin,
             .file_path    = saved->file_path,
             .file_path_mode = saved->file_path_mode,
             .file_prefix  = saved->file_prefix,
@@ -3670,6 +3720,7 @@ int sbs_encoder_manager_add_sink(sbs_encoder_manager_t *mgr,
         branch->srt_callers = g_hash_table_new(g_direct_hash, g_direct_equal);
     branch->rtmp_uri     = g_strdup(config->rtmp_uri);
     branch->rtmp_passcode = g_strdup(config->rtmp_passcode);
+    branch->rtmp_plugin = g_strdup(normalized_rtmp_plugin(config->rtmp_plugin));
     branch->file_path    = g_strdup(config->file_path);
     branch->file_path_mode = g_strdup(config->file_path_mode ? config->file_path_mode : "file");
     branch->file_prefix  = g_strdup(config->file_prefix ? config->file_prefix : "stream");
@@ -3859,6 +3910,9 @@ static cJSON *serialize_branch_health(sink_branch_t *branch)
         cJSON_AddNumberToObject(obj, "callers", srt_callers);
         cJSON_AddNumberToObject(obj, "bytes_sent", (double)(branch ? branch->srt_sender_bytes_sent : 0));
         cJSON_AddNumberToObject(obj, "send_failures", (double)srt_failures);
+    } else if (g_strcmp0(sink_type, "rtmp") == 0) {
+        cJSON_AddStringToObject(obj, "rtmp_plugin",
+                                branch && branch->rtmp_plugin ? branch->rtmp_plugin : "legacy");
     }
     return obj;
 }

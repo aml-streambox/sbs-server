@@ -228,6 +228,14 @@ static char *build_rtmp_location(const char *rtmp_uri, const char *rtmp_passcode
     return g_strconcat(rtmp_uri, sep, rtmp_passcode, NULL);
 }
 
+static bool rtmp_plugin_is_streambox(const char *plugin)
+{
+    return plugin &&
+        (g_ascii_strcasecmp(plugin, "streambox") == 0 ||
+         g_ascii_strcasecmp(plugin, "srtmp") == 0 ||
+         g_ascii_strcasecmp(plugin, "experimental") == 0);
+}
+
 static const char *normalized_file_container(const char *container)
 {
     if (container && (strcmp(container, "mkv") == 0 ||
@@ -382,16 +390,24 @@ static GstElement *build_output_pipeline(sbs_worker_config_t *config)
     bool is_rtmp = (config->output.sink_type && strcmp(config->output.sink_type, "rtmp") == 0);
     bool is_file = (config->output.sink_type && strcmp(config->output.sink_type, "file") == 0);
     bool is_h264 = (codec && strcmp(codec, "h264") == 0);
+    bool is_h265 = (codec && strcmp(codec, "h265") == 0);
+    bool streambox_rtmp = is_rtmp && rtmp_plugin_is_streambox(config->output.rtmp_plugin);
     const char *file_container = normalized_file_container(config->output.file_container);
     GstElement *muxer = NULL;
+    GstElement *vcapsfilter = NULL;
     if (is_file && strcmp(file_container, "mkv") == 0) {
         muxer = gst_element_factory_make("matroskamux", "mux");
     } else if (is_file && strcmp(file_container, "flv") == 0) {
         muxer = gst_element_factory_make("flvmux", "mux");
     } else if (is_file && strcmp(file_container, "mp4") == 0) {
         muxer = gst_element_factory_make("mp4mux", "mux");
-    } else if (is_rtmp && is_h264) {
-        muxer = gst_element_factory_make("flvmux", "mux");
+    } else if (is_rtmp && (is_h264 || streambox_rtmp)) {
+        muxer = gst_element_factory_make(streambox_rtmp ? "sflvmux" : "flvmux", "mux");
+        if (!muxer && streambox_rtmp)
+            LOG_E("experimental RTMP requested but sflvmux is unavailable");
+    } else if (is_rtmp) {
+        LOG_E("RTMP output requires H.264 unless rtmp_plugin=streambox (codec=%s)",
+              codec ? codec : "h265");
     } else {
         muxer = gst_element_factory_make("mpegtsmux", "mux");
     }
@@ -418,8 +434,27 @@ static GstElement *build_output_pipeline(sbs_worker_config_t *config)
             "latency",   (guint64)100000000,
             NULL);
     }
-    if (muxer && (is_rtmp || (is_file && strcmp(file_container, "flv") == 0))) {
+    if (muxer && (is_rtmp || (is_file && strcmp(file_container, "flv") == 0)) &&
+        g_object_class_find_property(G_OBJECT_GET_CLASS(muxer), "streamable")) {
         g_object_set(muxer, "streamable", TRUE, NULL);
+    }
+    if (muxer && is_rtmp) {
+        GstCaps *vcaps = NULL;
+        vcapsfilter = gst_element_factory_make("capsfilter", "vcaps");
+        if (is_h265) {
+            vcaps = gst_caps_new_simple("video/x-h265",
+                "stream-format", G_TYPE_STRING, "hvc1",
+                "alignment",     G_TYPE_STRING, "au",
+                NULL);
+        } else {
+            vcaps = gst_caps_new_simple("video/x-h264",
+                "stream-format", G_TYPE_STRING, "avc",
+                "alignment",     G_TYPE_STRING, "au",
+                NULL);
+        }
+        if (vcapsfilter)
+            g_object_set(vcapsfilter, "caps", vcaps, NULL);
+        gst_caps_unref(vcaps);
     }
 
     GstElement *sink  = NULL;
@@ -441,8 +476,8 @@ static GstElement *build_output_pipeline(sbs_worker_config_t *config)
         }
     } else if (sink_type && strcmp(sink_type, "rtmp") == 0 && rtmp_uri && strlen(rtmp_uri) > 0) {
         char *location = build_rtmp_location(rtmp_uri, rtmp_passcode);
-        sink = gst_element_factory_make("rtmp2sink", "sink");
-        if (!sink) {
+        sink = gst_element_factory_make(streambox_rtmp ? "srtmpsink" : "rtmp2sink", "sink");
+        if (!sink && !streambox_rtmp) {
             sink = gst_element_factory_make("rtmpsink", "sink");
         }
         if (sink) {
@@ -450,8 +485,16 @@ static GstElement *build_output_pipeline(sbs_worker_config_t *config)
                 "location", location ? location : rtmp_uri,
                 "sync",     FALSE,
                 NULL);
+            if (g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "async"))
+                g_object_set(sink, "async", FALSE, NULL);
+            if (streambox_rtmp && is_h265 &&
+                g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "enhanced-codecs"))
+                g_object_set(sink, "enhanced-codecs", "hvc1", NULL);
             LOG_I("RTMP sink: %s%s", rtmp_uri,
                   rtmp_passcode && *rtmp_passcode ? " (stream key set)" : "");
+            LOG_I("RTMP sink plugin: %s", streambox_rtmp ? "srtmpsink" : GST_OBJECT_NAME(sink));
+        } else if (streambox_rtmp) {
+            LOG_E("experimental RTMP requested but srtmpsink is unavailable");
         }
         g_free(location);
     } else if (sink_type && strcmp(sink_type, "file") == 0 && file_path && strlen(file_path) > 0) {
@@ -477,12 +520,14 @@ static GstElement *build_output_pipeline(sbs_worker_config_t *config)
         LOG_E("failed to create requested output sink '%s'", sink_type ? sink_type : "srt");
     }
 
-    if (!muxer || !sink || !q1 || !q2 || !aq1 || !aconv || !aresample || !aenc || !aparse) {
+    if (!muxer || !sink || !q1 || !q2 || !aq1 || !aconv || !aresample || !aenc || !aparse ||
+        (is_rtmp && !vcapsfilter)) {
         LOG_E("failed to create pipeline elements");
         gst_object_unref(pipeline);
         gst_object_unref(appsrc);
         gst_object_unref(encoder);
         gst_object_unref(parser);
+        if (vcapsfilter) gst_object_unref(vcapsfilter);
         if (muxer) gst_object_unref(muxer);
         if (sink) gst_object_unref(sink);
         if (q1) gst_object_unref(q1);
@@ -496,12 +541,21 @@ static GstElement *build_output_pipeline(sbs_worker_config_t *config)
     }
 
     /* Add all elements to the pipeline */
-    gst_bin_add_many(GST_BIN(pipeline), appsrc, q1, encoder, parser, q2,
-                     audio_appsrc, aq1, aconv, aresample, aenc, aparse,
-                     muxer, sink, NULL);
+    if (vcapsfilter) {
+        gst_bin_add_many(GST_BIN(pipeline), appsrc, q1, encoder, parser, vcapsfilter, q2,
+                         audio_appsrc, aq1, aconv, aresample, aenc, aparse,
+                         muxer, sink, NULL);
+    } else {
+        gst_bin_add_many(GST_BIN(pipeline), appsrc, q1, encoder, parser, q2,
+                         audio_appsrc, aq1, aconv, aresample, aenc, aparse,
+                         muxer, sink, NULL);
+    }
 
     /* Link: appsrc → q1 → encoder → parser → q2 → muxer → sink */
-    if (!gst_element_link_many(appsrc, q1, encoder, parser, q2, muxer, sink, NULL)) {
+    gboolean video_linked = vcapsfilter
+        ? gst_element_link_many(appsrc, q1, encoder, parser, vcapsfilter, q2, muxer, sink, NULL)
+        : gst_element_link_many(appsrc, q1, encoder, parser, q2, muxer, sink, NULL);
+    if (!video_linked) {
         LOG_E("failed to link output pipeline");
         gst_object_unref(pipeline);
         return NULL;

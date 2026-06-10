@@ -320,12 +320,21 @@ static void clear_scene_graph(sbs_scene_graph_t *graph)
     g_clear_pointer(&graph->transition_runtime.transition_id, g_free);
 }
 
+static bool rtmp_plugin_is_streambox(const char *plugin)
+{
+    return plugin &&
+        (g_ascii_strcasecmp(plugin, "streambox") == 0 ||
+         g_ascii_strcasecmp(plugin, "srtmp") == 0 ||
+         g_ascii_strcasecmp(plugin, "experimental") == 0);
+}
+
 static const char *resolve_shared_codec_for_sink(const char *sink_type,
+                                                 const char *rtmp_plugin,
                                                  const char *requested_codec)
 {
     if (requested_codec && *requested_codec)
         return requested_codec;
-    if (g_strcmp0(sink_type, "rtmp") == 0)
+    if (g_strcmp0(sink_type, "rtmp") == 0 && !rtmp_plugin_is_streambox(rtmp_plugin))
         return "h264";
     return NULL;
 }
@@ -333,9 +342,10 @@ static const char *resolve_shared_codec_for_sink(const char *sink_type,
 static int ensure_restore_encoder_codec(sbs_api_server_t *server,
                                         const char *output_id,
                                         const char *sink_type,
+                                        const char *rtmp_plugin,
                                         const char *requested_codec)
 {
-    const char *codec = resolve_shared_codec_for_sink(sink_type, requested_codec);
+    const char *codec = resolve_shared_codec_for_sink(sink_type, rtmp_plugin, requested_codec);
     sbs_encoder_config_t cfg = {0};
     const char *current_codec;
     uint32_t active_branches;
@@ -482,6 +492,7 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
             const char *lat_str   = enc ? g_hash_table_lookup(enc, "srt_latency_ms") : NULL;
             const char *rtmp_uri  = enc ? g_hash_table_lookup(enc, "rtmp_uri")  : NULL;
             const char *rtmp_passcode = enc ? g_hash_table_lookup(enc, "rtmp_passcode") : NULL;
+            const char *rtmp_plugin = enc ? g_hash_table_lookup(enc, "rtmp_plugin") : NULL;
             const char *file_path = enc ? g_hash_table_lookup(enc, "file_path") : NULL;
             const char *file_path_mode = enc ? g_hash_table_lookup(enc, "file_path_mode") : NULL;
             const char *file_prefix = enc ? g_hash_table_lookup(enc, "file_prefix") : NULL;
@@ -503,11 +514,13 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
                 sink_cfg.srt_latency_ms = srt_latency;
                 sink_cfg.rtmp_uri       = rtmp_uri;
                 sink_cfg.rtmp_passcode  = rtmp_passcode;
+                sink_cfg.rtmp_plugin    = rtmp_plugin;
                 sink_cfg.file_path      = file_path;
                 sink_cfg.file_path_mode = file_path_mode;
                 sink_cfg.file_prefix    = file_prefix;
                 sink_cfg.file_container = file_container;
-                rc = ensure_restore_encoder_codec(server, output->id, sink_type, codec_str);
+                rc = ensure_restore_encoder_codec(server, output->id, sink_type,
+                                                  rtmp_plugin, codec_str);
                 if (rc != SBS_OK) {
                     LOG_E("failed to prepare encoder for restored output '%s': %d", output->id, rc);
                     output->running = false;

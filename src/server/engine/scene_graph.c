@@ -918,10 +918,13 @@ static cJSON *output_encoder_to_public_json(GHashTable *map)
     g_hash_table_iter_init(&iter, map);
     while (g_hash_table_iter_next(&iter, &key, &value)) {
         if (g_strcmp0((const char *)key, "rtmp_passcode") == 0) {
-            cJSON_AddBoolToObject(obj, "rtmp_passcode_set",
-                                  value && ((const char *)value)[0] != '\0');
-            cJSON_AddBoolToObject(obj, "rtmp_stream_key_set",
-                                  value && ((const char *)value)[0] != '\0');
+            const char *secret = value ? (const char *)value : "";
+            bool secret_set = secret[0] != '\0';
+            double secret_len = secret_set ? (double)strlen(secret) : 0.0;
+            cJSON_AddBoolToObject(obj, "rtmp_passcode_set", secret_set);
+            cJSON_AddBoolToObject(obj, "rtmp_stream_key_set", secret_set);
+            cJSON_AddNumberToObject(obj, "rtmp_passcode_length", secret_len);
+            cJSON_AddNumberToObject(obj, "rtmp_stream_key_length", secret_len);
             continue;
         }
         if (g_strcmp0((const char *)key, "remote_password") == 0) {

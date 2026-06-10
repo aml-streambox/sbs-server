@@ -46,12 +46,21 @@ static uint32_t encoder_num(GHashTable *encoder, const char *key, uint32_t fallb
     return (uint32_t)strtoul(val, NULL, 10);
 }
 
+static bool rtmp_plugin_is_streambox(const char *plugin)
+{
+    return plugin &&
+        (g_ascii_strcasecmp(plugin, "streambox") == 0 ||
+         g_ascii_strcasecmp(plugin, "srtmp") == 0 ||
+         g_ascii_strcasecmp(plugin, "experimental") == 0);
+}
+
 static const char *resolve_shared_codec_for_sink(const char *sink_type,
+                                                 const char *rtmp_plugin,
                                                  const char *requested_codec)
 {
     if (requested_codec && *requested_codec)
         return requested_codec;
-    if (g_strcmp0(sink_type, "rtmp") == 0)
+    if (g_strcmp0(sink_type, "rtmp") == 0 && !rtmp_plugin_is_streambox(rtmp_plugin))
         return "h264";
     return NULL;
 }
@@ -59,11 +68,12 @@ static const char *resolve_shared_codec_for_sink(const char *sink_type,
 static int ensure_shared_encoder_codec(sbs_api_server_t *server,
                                        const char *output_id,
                                        const char *sink_type,
+                                       const char *rtmp_plugin,
                                        const char *requested_codec,
                                        const char **resolved_codec,
                                        cJSON **error)
 {
-    const char *codec = resolve_shared_codec_for_sink(sink_type, requested_codec);
+    const char *codec = resolve_shared_codec_for_sink(sink_type, rtmp_plugin, requested_codec);
     sbs_encoder_config_t cfg = {0};
     const char *current_codec;
     uint32_t active_branches;
@@ -251,6 +261,9 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
         const char *rtmp_passcode = json_str_alias(params, "rtmp_stream_key", "rtmp_passcode");
         sink_cfg.rtmp_passcode = rtmp_passcode ? rtmp_passcode : encoder_str(output->encoder, "rtmp_passcode", NULL);
 
+        const char *rtmp_plugin = json_str(params, "rtmp_plugin");
+        sink_cfg.rtmp_plugin = rtmp_plugin ? rtmp_plugin : encoder_str(output->encoder, "rtmp_plugin", NULL);
+
         const char *file_path = json_str(params, "file_path");
         sink_cfg.file_path = file_path ? file_path : encoder_str(output->encoder, "file_path", NULL);
 
@@ -265,6 +278,7 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
 
         const char *codec = json_str(params, "codec");
         rc = ensure_shared_encoder_codec(server, output->id, sink_cfg.sink_type,
+            sink_cfg.rtmp_plugin,
             codec ? codec : encoder_str(output->encoder, "codec", NULL),
             &resolved_codec, error);
         if (rc != SBS_OK)
@@ -292,6 +306,8 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
             g_hash_table_insert(output->encoder, g_strdup("rtmp_uri"), g_strdup(sink_cfg.rtmp_uri));
         if (sink_cfg.rtmp_passcode)
             g_hash_table_insert(output->encoder, g_strdup("rtmp_passcode"), g_strdup(sink_cfg.rtmp_passcode));
+        if (sink_cfg.rtmp_plugin)
+            g_hash_table_insert(output->encoder, g_strdup("rtmp_plugin"), g_strdup(sink_cfg.rtmp_plugin));
         if (resolved_codec && *resolved_codec)
             g_hash_table_insert(output->encoder, g_strdup("codec"), g_strdup(resolved_codec));
         if (sink_cfg.file_path)
@@ -332,6 +348,9 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
         const char *rtmp_passcode = json_str_alias(params, "rtmp_stream_key", "rtmp_passcode");
         cfg.rtmp_passcode = rtmp_passcode ? rtmp_passcode : encoder_str(output->encoder, "rtmp_passcode", NULL);
 
+        const char *rtmp_plugin = json_str(params, "rtmp_plugin");
+        cfg.rtmp_plugin = rtmp_plugin ? rtmp_plugin : encoder_str(output->encoder, "rtmp_plugin", NULL);
+
         const char *file_path = json_str(params, "file_path");
         cfg.file_path = file_path ? file_path : encoder_str(output->encoder, "file_path", NULL);
 
@@ -369,6 +388,8 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
             g_hash_table_insert(output->encoder, g_strdup("rtmp_uri"), g_strdup(cfg.rtmp_uri));
         if (cfg.rtmp_passcode)
             g_hash_table_insert(output->encoder, g_strdup("rtmp_passcode"), g_strdup(cfg.rtmp_passcode));
+        if (cfg.rtmp_plugin)
+            g_hash_table_insert(output->encoder, g_strdup("rtmp_plugin"), g_strdup(cfg.rtmp_plugin));
         if (cfg.file_path)
             g_hash_table_insert(output->encoder, g_strdup("file_path"), g_strdup(cfg.file_path));
         if (cfg.file_path_mode)
@@ -459,12 +480,14 @@ int sbs_api_handle_output_update(sbs_api_server_t *server, sbs_api_client_t *cli
             sink_cfg.srt_latency_ms = encoder_num(output->encoder, "srt_latency_ms", 600);
             sink_cfg.rtmp_uri = encoder_str(output->encoder, "rtmp_uri", NULL);
             sink_cfg.rtmp_passcode = encoder_str(output->encoder, "rtmp_passcode", NULL);
+            sink_cfg.rtmp_plugin = encoder_str(output->encoder, "rtmp_plugin", NULL);
             sink_cfg.file_path = encoder_str(output->encoder, "file_path", NULL);
             sink_cfg.file_path_mode = encoder_str(output->encoder, "file_path_mode", "file");
             sink_cfg.file_prefix = encoder_str(output->encoder, "file_prefix", "stream");
             sink_cfg.file_container = encoder_str(output->encoder, "file_container", "ts");
 
             int rc = ensure_shared_encoder_codec(server, output->id, sink_cfg.sink_type,
+                sink_cfg.rtmp_plugin,
                 encoder_str(output->encoder, "codec", NULL), NULL, NULL);
             if (rc != SBS_OK) {
                 LOG_W("failed to prepare encoder for output '%s' after config update: %d", id, rc);
@@ -503,6 +526,7 @@ int sbs_api_handle_output_update(sbs_api_server_t *server, sbs_api_client_t *cli
             cfg.srt_latency_ms = encoder_num(output->encoder, "srt_latency_ms", 600);
             cfg.rtmp_uri = encoder_str(output->encoder, "rtmp_uri", NULL);
             cfg.rtmp_passcode = encoder_str(output->encoder, "rtmp_passcode", NULL);
+            cfg.rtmp_plugin = encoder_str(output->encoder, "rtmp_plugin", NULL);
             cfg.file_path = encoder_str(output->encoder, "file_path", NULL);
             cfg.file_path_mode = encoder_str(output->encoder, "file_path_mode", "file");
             cfg.file_prefix = encoder_str(output->encoder, "file_prefix", "stream");

@@ -52,6 +52,7 @@ typedef struct sbs_output_config {
     uint32_t  srt_latency_ms;  /* SRT latency (default: 600) */
     char     *rtmp_uri;         /* RTMP URI (e.g. "rtmp://server/live/key") */
     char     *rtmp_passcode;    /* Optional RTMP stream key */
+    char     *rtmp_plugin;      /* "legacy" or experimental "streambox" */
     char     *file_path;        /* File output path (e.g. "/tmp/stream.ts") */
     char     *file_path_mode;   /* "file" or "directory" */
     char     *file_prefix;      /* Directory mode filename prefix */

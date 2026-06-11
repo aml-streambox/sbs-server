@@ -25,6 +25,14 @@ static const char *json_str_alias(cJSON *obj, const char *key, const char *alias
     return value ? value : json_str(obj, alias);
 }
 
+static const char *json_srt_stream_key(cJSON *obj)
+{
+    const char *value = json_str(obj, "srt_stream_key");
+    if (!value) value = json_str(obj, "srt_streamid");
+    if (!value) value = json_str(obj, "srt_stream_id");
+    return value;
+}
+
 static double json_num_def(cJSON *obj, const char *key, double fallback)
 {
     cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
@@ -52,6 +60,14 @@ static bool rtmp_plugin_is_streambox(const char *plugin)
         (g_ascii_strcasecmp(plugin, "streambox") == 0 ||
          g_ascii_strcasecmp(plugin, "srtmp") == 0 ||
          g_ascii_strcasecmp(plugin, "experimental") == 0);
+}
+
+static const char *normalize_srt_mode(const char *mode)
+{
+    if (mode && (g_ascii_strcasecmp(mode, "caller") == 0 ||
+                 g_ascii_strcasecmp(mode, "client") == 0))
+        return "caller";
+    return "listener";
 }
 
 static const char *resolve_shared_codec_for_sink(const char *sink_type,
@@ -111,22 +127,35 @@ static void output_replace_encoder_from_json(sbs_output_state_t *output, cJSON *
     cJSON *entry = NULL;
     cJSON *rtmp_passcode_item;
     cJSON *rtmp_stream_key_item;
+    cJSON *srt_stream_key_item;
+    cJSON *srt_streamid_item;
+    cJSON *srt_stream_id_item;
     char *old_rtmp_passcode = NULL;
+    char *old_srt_stream_key = NULL;
 
     if (!output || !cJSON_IsObject(encoder_obj)) return;
     if (output->encoder) {
         old_rtmp_passcode = g_strdup(g_hash_table_lookup(output->encoder, "rtmp_passcode"));
+        old_srt_stream_key = g_strdup(g_hash_table_lookup(output->encoder, "srt_stream_key"));
     }
     rtmp_passcode_item = cJSON_GetObjectItemCaseSensitive(encoder_obj, "rtmp_passcode");
     rtmp_stream_key_item = cJSON_GetObjectItemCaseSensitive(encoder_obj, "rtmp_stream_key");
+    srt_stream_key_item = cJSON_GetObjectItemCaseSensitive(encoder_obj, "srt_stream_key");
+    srt_streamid_item = cJSON_GetObjectItemCaseSensitive(encoder_obj, "srt_streamid");
+    srt_stream_id_item = cJSON_GetObjectItemCaseSensitive(encoder_obj, "srt_stream_id");
 
     if (output->encoder) g_hash_table_destroy(output->encoder);
     output->encoder = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
     for (entry = encoder_obj->child; entry; entry = entry->next) {
         if (cJSON_IsString(entry)) {
             const char *key = g_strcmp0(entry->string, "rtmp_stream_key") == 0 ? "rtmp_passcode" : entry->string;
+            const char *value = cJSON_GetStringValue(entry);
+            if (g_strcmp0(key, "srt_streamid") == 0 || g_strcmp0(key, "srt_stream_id") == 0)
+                key = "srt_stream_key";
+            if (g_strcmp0(key, "srt_mode") == 0)
+                value = normalize_srt_mode(value);
             g_hash_table_insert(output->encoder, g_strdup(key),
-                                g_strdup(cJSON_GetStringValue(entry)));
+                                g_strdup(value));
         } else if (cJSON_IsNumber(entry)) {
             char buf[32];
             snprintf(buf, sizeof(buf), "%u", (uint32_t)entry->valuedouble);
@@ -138,7 +167,13 @@ static void output_replace_encoder_from_json(sbs_output_state_t *output, cJSON *
         g_hash_table_insert(output->encoder, g_strdup("rtmp_passcode"), old_rtmp_passcode);
         old_rtmp_passcode = NULL;
     }
+    if (!cJSON_IsString(srt_stream_key_item) && !cJSON_IsString(srt_streamid_item) &&
+        !cJSON_IsString(srt_stream_id_item) && old_srt_stream_key && *old_srt_stream_key) {
+        g_hash_table_insert(output->encoder, g_strdup("srt_stream_key"), old_srt_stream_key);
+        old_srt_stream_key = NULL;
+    }
     g_free(old_rtmp_passcode);
+    g_free(old_srt_stream_key);
 }
 
 int sbs_api_handle_output_list(sbs_api_server_t *server, sbs_api_client_t *client,
@@ -252,6 +287,12 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
         const char *srt_uri = json_str(params, "srt_uri");
         sink_cfg.srt_uri = srt_uri ? srt_uri : encoder_str(output->encoder, "srt_uri", "srt://:8888");
 
+        const char *srt_mode = json_str(params, "srt_mode");
+        sink_cfg.srt_mode = normalize_srt_mode(srt_mode ? srt_mode : encoder_str(output->encoder, "srt_mode", "listener"));
+
+        const char *srt_stream_key = json_srt_stream_key(params);
+        sink_cfg.srt_stream_key = srt_stream_key ? srt_stream_key : encoder_str(output->encoder, "srt_stream_key", NULL);
+
         uint32_t srt_latency = (uint32_t)json_num_def(params, "srt_latency_ms", 0);
         sink_cfg.srt_latency_ms = srt_latency ? srt_latency : encoder_num(output->encoder, "srt_latency_ms", 600);
 
@@ -297,6 +338,10 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
             g_strdup(sink_cfg.sink_type ? sink_cfg.sink_type : "srt"));
         g_hash_table_insert(output->encoder, g_strdup("srt_uri"),
             g_strdup(sink_cfg.srt_uri ? sink_cfg.srt_uri : "srt://:8888"));
+        g_hash_table_insert(output->encoder, g_strdup("srt_mode"),
+            g_strdup(sink_cfg.srt_mode ? sink_cfg.srt_mode : "listener"));
+        if (sink_cfg.srt_stream_key)
+            g_hash_table_insert(output->encoder, g_strdup("srt_stream_key"), g_strdup(sink_cfg.srt_stream_key));
         {
             char buf[32];
             snprintf(buf, sizeof(buf), "%u", sink_cfg.srt_latency_ms);
@@ -339,6 +384,12 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
         const char *srt_uri = json_str(params, "srt_uri");
         cfg.srt_uri = srt_uri ? srt_uri : encoder_str(output->encoder, "srt_uri", "srt://:8888");
 
+        const char *srt_mode = json_str(params, "srt_mode");
+        cfg.srt_mode = normalize_srt_mode(srt_mode ? srt_mode : encoder_str(output->encoder, "srt_mode", "listener"));
+
+        const char *srt_stream_key = json_srt_stream_key(params);
+        cfg.srt_stream_key = srt_stream_key ? srt_stream_key : encoder_str(output->encoder, "srt_stream_key", NULL);
+
         uint32_t srt_latency = (uint32_t)json_num_def(params, "srt_latency_ms", 0);
         cfg.srt_latency_ms = srt_latency ? srt_latency : encoder_num(output->encoder, "srt_latency_ms", 600);
 
@@ -379,6 +430,10 @@ int sbs_api_handle_output_start(sbs_api_server_t *server, sbs_api_client_t *clie
             g_strdup(cfg.sink_type ? cfg.sink_type : "srt"));
         g_hash_table_insert(output->encoder, g_strdup("srt_uri"),
             g_strdup(cfg.srt_uri ? cfg.srt_uri : "srt://:8888"));
+        g_hash_table_insert(output->encoder, g_strdup("srt_mode"),
+            g_strdup(cfg.srt_mode ? cfg.srt_mode : "listener"));
+        if (cfg.srt_stream_key)
+            g_hash_table_insert(output->encoder, g_strdup("srt_stream_key"), g_strdup(cfg.srt_stream_key));
         {
             char buf[32];
             snprintf(buf, sizeof(buf), "%u", cfg.srt_latency_ms);
@@ -477,6 +532,8 @@ int sbs_api_handle_output_update(sbs_api_server_t *server, sbs_api_client_t *cli
             sink_cfg.output_id = output->id;
             sink_cfg.sink_type = encoder_str(output->encoder, "sink_type", "srt");
             sink_cfg.srt_uri = encoder_str(output->encoder, "srt_uri", "srt://:8888");
+            sink_cfg.srt_mode = normalize_srt_mode(encoder_str(output->encoder, "srt_mode", "listener"));
+            sink_cfg.srt_stream_key = encoder_str(output->encoder, "srt_stream_key", NULL);
             sink_cfg.srt_latency_ms = encoder_num(output->encoder, "srt_latency_ms", 600);
             sink_cfg.rtmp_uri = encoder_str(output->encoder, "rtmp_uri", NULL);
             sink_cfg.rtmp_passcode = encoder_str(output->encoder, "rtmp_passcode", NULL);
@@ -523,6 +580,8 @@ int sbs_api_handle_output_update(sbs_api_server_t *server, sbs_api_client_t *cli
             cfg.bitrate_kbps = encoder_num(output->encoder, "bitrate_kbps", 10000);
             cfg.sink_type = encoder_str(output->encoder, "sink_type", "srt");
             cfg.srt_uri = encoder_str(output->encoder, "srt_uri", "srt://:8888");
+            cfg.srt_mode = normalize_srt_mode(encoder_str(output->encoder, "srt_mode", "listener"));
+            cfg.srt_stream_key = encoder_str(output->encoder, "srt_stream_key", NULL);
             cfg.srt_latency_ms = encoder_num(output->encoder, "srt_latency_ms", 600);
             cfg.rtmp_uri = encoder_str(output->encoder, "rtmp_uri", NULL);
             cfg.rtmp_passcode = encoder_str(output->encoder, "rtmp_passcode", NULL);

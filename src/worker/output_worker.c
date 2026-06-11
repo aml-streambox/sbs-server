@@ -228,6 +228,113 @@ static char *build_rtmp_location(const char *rtmp_uri, const char *rtmp_passcode
     return g_strconcat(rtmp_uri, sep, rtmp_passcode, NULL);
 }
 
+static char *extract_srt_uri_path(const char *uri)
+{
+    const char *p;
+    const char *resource;
+    const char *query;
+
+    if (!uri || !*uri)
+        return NULL;
+
+    p = g_str_has_prefix(uri, "srt://") ? uri + strlen("srt://") : uri;
+    resource = strpbrk(p, "/?");
+    if (!resource || *resource != '/')
+        return NULL;
+
+    query = strchr(resource, '?');
+    if (query)
+        return g_strndup(resource, (gsize)(query - resource));
+    return g_strdup(resource);
+}
+
+static char *extract_srt_uri_host(const char *uri)
+{
+    const char *p;
+    const char *authority_end;
+    char *authority;
+    char *host = NULL;
+
+    if (!uri || !*uri)
+        return NULL;
+
+    p = g_str_has_prefix(uri, "srt://") ? uri + strlen("srt://") : uri;
+    authority_end = strpbrk(p, "/?");
+    authority = authority_end ? g_strndup(p, (gsize)(authority_end - p)) : g_strdup(p);
+    if (!authority || !*authority)
+        goto out;
+
+    if (authority[0] == '[') {
+        char *close = strchr(authority, ']');
+        if (close)
+            host = g_strndup(authority + 1, (gsize)(close - authority - 1));
+    } else {
+        char *colon = strrchr(authority, ':');
+        if (colon)
+            *colon = '\0';
+        host = *authority ? g_strdup(authority) : NULL;
+    }
+
+out:
+    g_free(authority);
+    return host;
+}
+
+static char *build_srt_stream_id(const char *srt_uri, const char *stream_key)
+{
+    char *host;
+    char *path;
+    char *resource = NULL;
+    char *stream_id;
+
+    if (!stream_key || !*stream_key)
+        return NULL;
+    if (g_str_has_prefix(stream_key, "#!::"))
+        return g_strdup(stream_key);
+
+    host = extract_srt_uri_host(srt_uri);
+    path = extract_srt_uri_path(srt_uri);
+    if (path && strcmp(path, "/") != 0 &&
+        (stream_key[0] == '?' || g_str_has_prefix(stream_key, "streamname="))) {
+        resource = stream_key[0] == '?'
+            ? g_strconcat(path, stream_key, NULL)
+            : g_strconcat(path, "?", stream_key, NULL);
+    }
+
+    if (host && resource) {
+        const char *publish_resource = resource[0] == '/' ? resource + 1 : resource;
+        stream_id = g_strdup_printf("#!::h=%s,r=%s,m=publish", host, publish_resource);
+    } else {
+        stream_id = g_strdup(stream_key);
+    }
+
+    g_free(host);
+    g_free(path);
+    g_free(resource);
+    return stream_id;
+}
+
+static char *build_srt_location(const char *srt_uri, const char *srt_stream_key)
+{
+    char *escaped;
+    char *stream_id;
+    const char *sep;
+    char *location;
+
+    if (!srt_uri || !*srt_uri)
+        return NULL;
+    if (!srt_stream_key || !*srt_stream_key || strstr(srt_uri, "streamid=") != NULL)
+        return g_strdup(srt_uri);
+
+    stream_id = build_srt_stream_id(srt_uri, srt_stream_key);
+    escaped = g_uri_escape_string(stream_id ? stream_id : srt_stream_key, NULL, FALSE);
+    sep = strchr(srt_uri, '?') ? "&" : "?";
+    location = g_strconcat(srt_uri, sep, "streamid=", escaped, NULL);
+    g_free(escaped);
+    g_free(stream_id);
+    return location;
+}
+
 static bool rtmp_plugin_is_streambox(const char *plugin)
 {
     return plugin &&
@@ -460,20 +567,29 @@ static GstElement *build_output_pipeline(sbs_worker_config_t *config)
     GstElement *sink  = NULL;
     const char *sink_type = config->output.sink_type;
     const char *srt_uri   = config->output.srt_uri;
+    const char *srt_mode  = config->output.srt_mode;
+    const char *srt_stream_key = config->output.srt_stream_key;
     const char *rtmp_uri  = config->output.rtmp_uri;
     const char *rtmp_passcode = config->output.rtmp_passcode;
     const char *file_path = config->output.file_path;
 
     if ((!sink_type || strcmp(sink_type, "srt") == 0) && srt_uri && strlen(srt_uri) > 0) {
+        bool caller_mode = srt_mode &&
+            (g_ascii_strcasecmp(srt_mode, "caller") == 0 ||
+             g_ascii_strcasecmp(srt_mode, "client") == 0);
+        char *srt_location = build_srt_location(srt_uri, caller_mode ? srt_stream_key : NULL);
         sink = gst_element_factory_make("srtsink", "sink");
         if (sink) {
             g_object_set(sink,
-                "uri",                 srt_uri,
+                "uri",                 srt_location ? srt_location : srt_uri,
+                "mode",                caller_mode ? 1 : 2,
                 "wait-for-connection", FALSE,
                 "sync",               FALSE,
                 NULL);
-            LOG_I("SRT sink: %s", srt_uri);
+            LOG_I("SRT sink: mode=%s%s", caller_mode ? "caller" : "listener",
+                  caller_mode && srt_stream_key && *srt_stream_key ? " stream_key=set" : "");
         }
+        g_free(srt_location);
     } else if (sink_type && strcmp(sink_type, "rtmp") == 0 && rtmp_uri && strlen(rtmp_uri) > 0) {
         char *location = build_rtmp_location(rtmp_uri, rtmp_passcode);
         sink = gst_element_factory_make(streambox_rtmp ? "srtmpsink" : "rtmp2sink", "sink");
@@ -906,12 +1022,12 @@ int output_worker_run(sbs_worker_ctx_t *ctx)
         .io_watch_id     = 0,
     };
 
-    LOG_I("building output pipeline: %ux%u@%u/%u codec=%s bitrate=%u srt=%s",
+    LOG_I("building output pipeline: %ux%u@%u/%u codec=%s bitrate=%u srt_mode=%s",
           ctx->config.width, ctx->config.height,
           ctx->config.framerate_num, ctx->config.framerate_den,
           ctx->config.output.codec ? ctx->config.output.codec : "h265",
           ctx->config.output.bitrate,
-          ctx->config.output.srt_uri ? ctx->config.output.srt_uri : "(none)");
+          ctx->config.output.srt_mode ? ctx->config.output.srt_mode : "listener");
 
     /* Build the GStreamer pipeline.
      * With the ION allocator fix (heap type 16 patch in gstamlionallocator.c),

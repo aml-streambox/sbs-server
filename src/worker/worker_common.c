@@ -130,6 +130,8 @@ static int parse_output_config(const cJSON *root, sbs_worker_config_t *config)
 
     out->codec         = json_get_string(root, "codec");
     out->srt_uri       = json_get_string(root, "srt_uri");
+    out->srt_mode      = json_get_string(root, "srt_mode");
+    out->srt_stream_key = json_get_string(root, "srt_stream_key");
     out->encoder       = json_get_string(root, "encoder");
     out->sink_type     = json_get_string(root, "sink_type");
     out->srt_latency_ms = json_get_uint32(root, "srt_latency_ms", 600);
@@ -222,6 +224,8 @@ void sbs_worker_config_free(sbs_worker_config_t *config)
     /* Output fields */
     free(config->output.codec);
     free(config->output.srt_uri);
+    free(config->output.srt_mode);
+    free(config->output.srt_stream_key);
     free(config->output.encoder);
     free(config->output.sink_type);
     free(config->output.rtmp_uri);

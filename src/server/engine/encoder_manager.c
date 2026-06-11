@@ -22,6 +22,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <string.h>
@@ -132,6 +133,8 @@ typedef struct sink_branch {
     /* Deep-copied config for potential restart */
     char       *sink_type;
     char       *srt_uri;
+    char       *srt_mode;
+    char       *srt_stream_key;
     uint32_t    srt_latency_ms;
     char       *rtmp_uri;
     char       *rtmp_passcode;
@@ -150,6 +153,7 @@ typedef struct sink_branch {
 #define SBS_TS_AUDIO_PID 0x101u
 #define SBS_SRT_VIDEO_BACKLOG_MAX_PACKETS 65536u
 #define SBS_SRT_VIDEO_DRAIN_AFTER_AUDIO_PACKETS 98u
+#define SBS_SRT_CALLER_DEFAULT_PORT 1935u
 
 static void set_appsrc_queue_limits(GstElement *appsrc,
                                     guint64 max_bytes,
@@ -720,26 +724,188 @@ static void ensure_srt_ready(void)
     }
 }
 
+static const char *normalized_srt_mode(const char *mode)
+{
+    if (mode && (g_ascii_strcasecmp(mode, "caller") == 0 ||
+                 g_ascii_strcasecmp(mode, "client") == 0))
+        return "caller";
+    return "listener";
+}
+
+static bool srt_mode_is_caller(const char *mode)
+{
+    return strcmp(normalized_srt_mode(mode), "caller") == 0;
+}
+
+static bool parse_srt_endpoint(const char *uri,
+                               bool require_host,
+                               uint16_t default_port,
+                               char **host_out,
+                               uint16_t *port_out)
+{
+    const char *p;
+    const char *authority_end;
+    char *authority = NULL;
+    char *host = NULL;
+    const char *port_str = NULL;
+    char *end = NULL;
+    long port = 0;
+    bool ok = false;
+
+    if (host_out)
+        *host_out = NULL;
+    if (port_out)
+        *port_out = 0;
+    if (!uri || !*uri || !port_out)
+        return false;
+
+    p = g_str_has_prefix(uri, "srt://") ? uri + strlen("srt://") : uri;
+    authority_end = strpbrk(p, "/?");
+    authority = authority_end ? g_strndup(p, (gsize)(authority_end - p)) : g_strdup(p);
+    if (!authority || !*authority)
+        goto out;
+
+    if (authority[0] == '[') {
+        char *close = strchr(authority, ']');
+        if (!close)
+            goto out;
+        host = g_strndup(authority + 1, (gsize)(close - authority - 1));
+        if (close[1] == ':' && close[2]) {
+            port_str = close + 2;
+        } else if (close[1] == '\0' && default_port > 0) {
+            port = default_port;
+        } else {
+            goto out;
+        }
+    } else {
+        char *colon = strrchr(authority, ':');
+        if (colon && colon[1]) {
+            *colon = '\0';
+            host = g_strdup(authority);
+            port_str = colon + 1;
+        } else if (!colon && default_port > 0) {
+            host = g_strdup(authority);
+            port = default_port;
+        } else {
+            goto out;
+        }
+    }
+
+    if (require_host && (!host || !*host))
+        goto out;
+
+    if (port_str) {
+        port = strtol(port_str, &end, 10);
+        if (port <= 0 || port > 65535 || !end || *end)
+            goto out;
+    }
+
+    *port_out = (uint16_t)port;
+    if (host_out) {
+        *host_out = host;
+        host = NULL;
+    }
+    ok = true;
+
+out:
+    g_free(host);
+    g_free(authority);
+    return ok;
+}
+
 static uint16_t parse_srt_listen_port(const char *uri)
 {
-    const char *colon;
-    char *end = NULL;
-    long port;
+    uint16_t port = 0;
+
+    if (!parse_srt_endpoint(uri, false, 0, NULL, &port))
+        return 0;
+    return port;
+}
+
+static char *extract_srt_uri_path(const char *uri)
+{
+    const char *p;
+    const char *resource;
+    const char *query;
 
     if (!uri || !*uri)
-        return 0;
+        return NULL;
 
-    colon = strrchr(uri, ':');
-    if (!colon || !colon[1])
-        return 0;
+    p = g_str_has_prefix(uri, "srt://") ? uri + strlen("srt://") : uri;
+    resource = strpbrk(p, "/?");
+    if (!resource || *resource != '/')
+        return NULL;
 
-    port = strtol(colon + 1, &end, 10);
-    if (port <= 0 || port > 65535)
-        return 0;
-    if (end && *end && *end != '/' && *end != '?')
-        return 0;
+    query = strchr(resource, '?');
+    if (query)
+        return g_strndup(resource, (gsize)(query - resource));
+    return g_strdup(resource);
+}
 
-    return (uint16_t)port;
+static char *extract_srt_uri_host(const char *uri)
+{
+    const char *p;
+    const char *authority_end;
+    char *authority;
+    char *host = NULL;
+
+    if (!uri || !*uri)
+        return NULL;
+
+    p = g_str_has_prefix(uri, "srt://") ? uri + strlen("srt://") : uri;
+    authority_end = strpbrk(p, "/?");
+    authority = authority_end ? g_strndup(p, (gsize)(authority_end - p)) : g_strdup(p);
+    if (!authority || !*authority)
+        goto out;
+
+    if (authority[0] == '[') {
+        char *close = strchr(authority, ']');
+        if (close)
+            host = g_strndup(authority + 1, (gsize)(close - authority - 1));
+    } else {
+        char *colon = strrchr(authority, ':');
+        if (colon)
+            *colon = '\0';
+        host = *authority ? g_strdup(authority) : NULL;
+    }
+
+out:
+    g_free(authority);
+    return host;
+}
+
+static char *build_srt_stream_id(const char *srt_uri, const char *stream_key)
+{
+    char *host;
+    char *path;
+    char *resource = NULL;
+    char *stream_id;
+
+    if (!stream_key || !*stream_key)
+        return NULL;
+    if (g_str_has_prefix(stream_key, "#!::"))
+        return g_strdup(stream_key);
+
+    host = extract_srt_uri_host(srt_uri);
+    path = extract_srt_uri_path(srt_uri);
+    if (path && strcmp(path, "/") != 0 &&
+        (stream_key[0] == '?' || g_str_has_prefix(stream_key, "streamname="))) {
+        resource = stream_key[0] == '?'
+            ? g_strconcat(path, stream_key, NULL)
+            : g_strconcat(path, "?", stream_key, NULL);
+    }
+
+    if (host && resource) {
+        const char *publish_resource = resource[0] == '/' ? resource + 1 : resource;
+        stream_id = g_strdup_printf("#!::h=%s,r=%s,m=publish", host, publish_resource);
+    } else {
+        stream_id = g_strdup(stream_key);
+    }
+
+    g_free(host);
+    g_free(path);
+    g_free(resource);
+    return stream_id;
 }
 
 static bool set_srt_sockopt(SRTSOCKET sock, SRT_SOCKOPT opt,
@@ -770,6 +936,14 @@ static void configure_srt_sender_socket(SRTSOCKET sock, uint32_t latency_ms)
     set_srt_sockopt(sock, SRTO_SNDTIMEO, &timeout_ms, sizeof(timeout_ms), "SRTO_SNDTIMEO");
 }
 
+static void configure_srt_stream_id(SRTSOCKET sock, const char *stream_id)
+{
+    if (!stream_id || !*stream_id)
+        return;
+
+    set_srt_sockopt(sock, SRTO_STREAMID, stream_id, (int)strlen(stream_id), "SRTO_STREAMID");
+}
+
 static bool custom_srt_schedule_keyframe(sink_branch_t *branch,
                                          int32_t *gop_pattern_out,
                                          uint64_t *frames_pushed_out)
@@ -798,7 +972,7 @@ static void custom_srt_client_connected(sink_branch_t *branch,
     int32_t gop_pattern = -1;
     uint64_t frames_pushed = 0;
     bool forced_idr = custom_srt_schedule_keyframe(branch, &gop_pattern, &frames_pushed);
-    LOG_I("custom SRT caller %d connected; callers=%u %s (gop_pattern=%d frames_pushed=%lu)",
+    LOG_I("custom SRT peer %d connected; peers=%u %s (gop_pattern=%d frames_pushed=%lu)",
           (int)client, caller_count,
           forced_idr ? "scheduled IDR" : "waiting for keyframe",
           gop_pattern, (unsigned long)frames_pushed);
@@ -824,7 +998,7 @@ static void custom_srt_clients_removed(sink_branch_t *branch,
         pthread_mutex_unlock(&branch->srt_sender_mutex);
         flush_srt_session(branch);
     }
-    LOG_I("custom SRT callers removed=%u callers=%u", removed, caller_count);
+    LOG_I("custom SRT peers removed=%u peers=%u", removed, caller_count);
 }
 
 static void *custom_srt_accept_thread_main(void *data)
@@ -877,7 +1051,44 @@ static void *custom_srt_accept_thread_main(void *data)
     return NULL;
 }
 
-static int start_custom_srt_sender(sink_branch_t *branch)
+static void ensure_custom_srt_sender_state(sink_branch_t *branch)
+{
+    if (!branch || branch->srt_sender_initialized)
+        return;
+
+    pthread_mutex_init(&branch->srt_sender_mutex, NULL);
+    branch->srt_clients = g_array_new(FALSE, FALSE, sizeof(SRTSOCKET));
+    branch->srt_ts_input = g_byte_array_new();
+    branch->srt_video_ts_backlog = g_byte_array_new();
+    branch->srt_send_payload = g_byte_array_new();
+    branch->srt_sender_initialized = true;
+}
+
+static void reset_custom_srt_sender_state_locked(sink_branch_t *branch,
+                                                 SRTSOCKET listener,
+                                                 uint16_t port)
+{
+    if (!branch)
+        return;
+
+    g_array_set_size(branch->srt_clients, 0);
+    if (branch->srt_video_ts_backlog)
+        g_byte_array_set_size(branch->srt_video_ts_backlog, 0);
+    if (branch->srt_ts_input)
+        g_byte_array_set_size(branch->srt_ts_input, 0);
+    if (branch->srt_send_payload)
+        g_byte_array_set_size(branch->srt_send_payload, 0);
+    branch->srt_listener = listener;
+    branch->srt_listen_port = port;
+    branch->srt_sender_running = true;
+    branch->srt_accept_started = false;
+    branch->srt_sender_bytes_sent = 0;
+    branch->srt_sender_send_failures = 0;
+    branch->srt_sender_packets_sent = 0;
+    branch->srt_sender_packets_dropped = 0;
+}
+
+static int start_custom_srt_listener(sink_branch_t *branch)
 {
     struct sockaddr_in sa;
     SRTSOCKET listener;
@@ -889,18 +1100,11 @@ static int start_custom_srt_sender(sink_branch_t *branch)
     ensure_srt_ready();
     port = parse_srt_listen_port(branch->srt_uri);
     if (port == 0) {
-        LOG_E("custom SRT: invalid listen URI '%s'", branch->srt_uri ? branch->srt_uri : "<null>");
+        LOG_E("custom SRT: invalid listener URI");
         return SBS_ERR_INVAL;
     }
 
-    if (!branch->srt_sender_initialized) {
-        pthread_mutex_init(&branch->srt_sender_mutex, NULL);
-        branch->srt_clients = g_array_new(FALSE, FALSE, sizeof(SRTSOCKET));
-        branch->srt_ts_input = g_byte_array_new();
-        branch->srt_video_ts_backlog = g_byte_array_new();
-        branch->srt_send_payload = g_byte_array_new();
-        branch->srt_sender_initialized = true;
-    }
+    ensure_custom_srt_sender_state(branch);
 
     listener = srt_create_socket();
     if (listener == SRT_INVALID_SOCK) {
@@ -925,21 +1129,7 @@ static int start_custom_srt_sender(sink_branch_t *branch)
     }
 
     pthread_mutex_lock(&branch->srt_sender_mutex);
-    g_array_set_size(branch->srt_clients, 0);
-    if (branch->srt_video_ts_backlog)
-        g_byte_array_set_size(branch->srt_video_ts_backlog, 0);
-    if (branch->srt_ts_input)
-        g_byte_array_set_size(branch->srt_ts_input, 0);
-    if (branch->srt_send_payload)
-        g_byte_array_set_size(branch->srt_send_payload, 0);
-    branch->srt_listener = listener;
-    branch->srt_listen_port = port;
-    branch->srt_sender_running = true;
-    branch->srt_accept_started = false;
-    branch->srt_sender_bytes_sent = 0;
-    branch->srt_sender_send_failures = 0;
-    branch->srt_sender_packets_sent = 0;
-    branch->srt_sender_packets_dropped = 0;
+    reset_custom_srt_sender_state_locked(branch, listener, port);
     pthread_mutex_unlock(&branch->srt_sender_mutex);
 
     if (pthread_create(&branch->srt_accept_thread, NULL,
@@ -952,6 +1142,91 @@ static int start_custom_srt_sender(sink_branch_t *branch)
     LOG_I("custom SRT sender listening on port %u latency=%ums", port,
           branch->srt_latency_ms > 0 ? branch->srt_latency_ms : 600);
     return SBS_OK;
+}
+
+static int start_custom_srt_caller(sink_branch_t *branch)
+{
+    char *host = NULL;
+    char port_str[16];
+    uint16_t port = 0;
+    struct addrinfo hints;
+    struct addrinfo *results = NULL;
+    struct addrinfo *ai;
+    char *stream_id = NULL;
+    SRTSOCKET client = SRT_INVALID_SOCK;
+    guint caller_count = 0;
+    int gai_rc;
+
+    if (!branch)
+        return SBS_ERR_INVAL;
+
+    ensure_srt_ready();
+    if (!parse_srt_endpoint(branch->srt_uri, true, SBS_SRT_CALLER_DEFAULT_PORT, &host, &port)) {
+        LOG_E("custom SRT: invalid caller URI");
+        return SBS_ERR_INVAL;
+    }
+
+    ensure_custom_srt_sender_state(branch);
+
+    snprintf(port_str, sizeof(port_str), "%u", port);
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_family = AF_UNSPEC;
+    gai_rc = getaddrinfo(host, port_str, &hints, &results);
+    if (gai_rc != 0) {
+        LOG_E("custom SRT: failed to resolve caller endpoint: %s", gai_strerror(gai_rc));
+        g_free(host);
+        return SBS_ERR_IO;
+    }
+
+    stream_id = build_srt_stream_id(branch->srt_uri, branch->srt_stream_key);
+
+    for (ai = results; ai; ai = ai->ai_next) {
+        client = srt_create_socket();
+        if (client == SRT_INVALID_SOCK)
+            break;
+        configure_srt_sender_socket(client, branch->srt_latency_ms);
+        configure_srt_stream_id(client, stream_id);
+        if (srt_connect(client, ai->ai_addr, ai->ai_addrlen) == 0)
+            break;
+        srt_close(client);
+        client = SRT_INVALID_SOCK;
+    }
+
+    freeaddrinfo(results);
+    g_free(host);
+    g_free(stream_id);
+
+    if (client == SRT_INVALID_SOCK) {
+        LOG_E("custom SRT: caller connect failed on port %u: %s",
+              port, srt_getlasterror_str());
+        return SBS_ERR_IO;
+    }
+
+    pthread_mutex_lock(&branch->srt_sender_mutex);
+    reset_custom_srt_sender_state_locked(branch, SRT_INVALID_SOCK, port);
+    if (branch->srt_clients) {
+        g_array_append_val(branch->srt_clients, client);
+        caller_count = branch->srt_clients->len;
+    }
+    pthread_mutex_unlock(&branch->srt_sender_mutex);
+
+    if (caller_count == 0) {
+        srt_close(client);
+        return SBS_ERR_IO;
+    }
+
+    custom_srt_client_connected(branch, client, caller_count);
+    LOG_I("custom SRT sender connected in caller mode on port %u latency=%ums",
+          port, branch->srt_latency_ms > 0 ? branch->srt_latency_ms : 600);
+    return SBS_OK;
+}
+
+static int start_custom_srt_sender(sink_branch_t *branch)
+{
+    if (branch && srt_mode_is_caller(branch->srt_mode))
+        return start_custom_srt_caller(branch);
+    return start_custom_srt_listener(branch);
 }
 
 static void stop_custom_srt_sender(sink_branch_t *branch)
@@ -1009,8 +1284,20 @@ static void custom_srt_send_message_locked(sink_branch_t *branch,
         uint64_t packets = (uint64_t)((size + SBS_TS_PACKET_SIZE - 1) / SBS_TS_PACKET_SIZE);
         int rc = srt_sendmsg(client, (const char *)data, len, -1, 0);
         if (rc == SRT_ERROR || rc != len) {
+            uint64_t failures_before = branch->srt_sender_send_failures;
+            SRT_SOCKSTATUS status = srt_getsockstate(client);
+            const char *error = srt_getlasterror_str();
             branch->srt_sender_send_failures++;
             branch->srt_sender_packets_dropped += packets;
+            if (failures_before < 8) {
+                LOG_W("custom SRT send failed: output=%s socket=%d status=%d rc=%d expected=%d error=%s bytes_sent=%lu packets_sent=%lu packets_dropped=%lu",
+                      branch->output_id ? branch->output_id : "<unknown>",
+                      (int)client, (int)status, rc, len,
+                      error ? error : "unknown",
+                      (unsigned long)branch->srt_sender_bytes_sent,
+                      (unsigned long)branch->srt_sender_packets_sent,
+                      (unsigned long)branch->srt_sender_packets_dropped);
+            }
             srt_close(client);
             g_array_remove_index_fast(branch->srt_clients, (guint)i);
             if (removed)
@@ -2127,6 +2414,8 @@ static void sink_branch_free(gpointer data)
     g_free(branch->output_id);
     g_free(branch->sink_type);
     g_free(branch->srt_uri);
+    g_free(branch->srt_mode);
+    g_free(branch->srt_stream_key);
     g_free(branch->rtmp_uri);
     g_free(branch->rtmp_passcode);
     g_free(branch->rtmp_plugin);
@@ -2182,6 +2471,27 @@ static char *build_rtmp_location(const char *rtmp_uri, const char *rtmp_passcode
 
     const char *sep = rtmp_uri[strlen(rtmp_uri) - 1] == '/' ? "" : "/";
     return g_strconcat(rtmp_uri, sep, rtmp_passcode, NULL);
+}
+
+static char *build_srt_location(const char *srt_uri, const char *srt_stream_key)
+{
+    char *escaped;
+    char *stream_id;
+    const char *sep;
+    char *location;
+
+    if (!srt_uri || !*srt_uri)
+        return NULL;
+    if (!srt_stream_key || !*srt_stream_key || strstr(srt_uri, "streamid=") != NULL)
+        return g_strdup(srt_uri);
+
+    stream_id = build_srt_stream_id(srt_uri, srt_stream_key);
+    escaped = g_uri_escape_string(stream_id ? stream_id : srt_stream_key, NULL, FALSE);
+    sep = strchr(srt_uri, '?') ? "&" : "?";
+    location = g_strconcat(srt_uri, sep, "streamid=", escaped, NULL);
+    g_free(escaped);
+    g_free(stream_id);
+    return location;
 }
 
 static const char *normalized_rtmp_plugin(const char *plugin)
@@ -2337,6 +2647,9 @@ static GstElement *create_sink(const sbs_sink_branch_config_t *config,
         }
     } else if (!sink_type || strcmp(sink_type, "srt") == 0) {
         if (config->srt_uri && strlen(config->srt_uri) > 0) {
+            bool caller_mode = srt_mode_is_caller(config->srt_mode);
+            char *srt_location = build_srt_location(config->srt_uri,
+                                                    caller_mode ? config->srt_stream_key : NULL);
             sink = gst_element_factory_make("srtserversink", NULL);
             if (!sink)
                 sink = gst_element_factory_make("srtsink", NULL);
@@ -2344,8 +2657,8 @@ static GstElement *create_sink(const sbs_sink_branch_config_t *config,
                 uint32_t latency_ms = config->srt_latency_ms > 0
                     ? config->srt_latency_ms : 600;
                 g_object_set(sink,
-                    "uri",                 config->srt_uri,
-                    "mode",                (gint)2,
+                    "uri",                 srt_location ? srt_location : config->srt_uri,
+                    "mode",                caller_mode ? (gint)1 : (gint)2,
                     "wait-for-connection", FALSE,
                     "poll-timeout",        (gint)100,
                     "latency",             (gint)latency_ms,
@@ -2353,8 +2666,10 @@ static GstElement *create_sink(const sbs_sink_branch_config_t *config,
                     "sync",                FALSE,
                     "async",               FALSE,
                     NULL);
-                LOG_I("SRT server sink: %s latency=%ums sync=0 blocksize=1316", config->srt_uri, latency_ms);
+                LOG_I("SRT sink: mode=%s latency=%ums sync=0 blocksize=1316",
+                      caller_mode ? "caller" : "listener", latency_ms);
             }
+            g_free(srt_location);
         } else {
             LOG_E("SRT sink requested without srt_uri");
         }
@@ -2712,6 +3027,8 @@ static int link_sink_branch(sbs_encoder_manager_t *mgr, sink_branch_t *branch)
         .output_id    = branch->output_id,
         .sink_type    = branch->sink_type,
         .srt_uri      = branch->srt_uri,
+        .srt_mode     = branch->srt_mode,
+        .srt_stream_key = branch->srt_stream_key,
         .srt_latency_ms = branch->srt_latency_ms,
         .rtmp_uri     = branch->rtmp_uri,
         .rtmp_passcode = branch->rtmp_passcode,
@@ -3433,6 +3750,8 @@ int sbs_encoder_manager_update_config(sbs_encoder_manager_t *mgr,
         copy->output_id    = g_strdup(branch->output_id);
         copy->sink_type    = g_strdup(branch->sink_type);
         copy->srt_uri      = g_strdup(branch->srt_uri);
+        copy->srt_mode     = g_strdup(branch->srt_mode);
+        copy->srt_stream_key = g_strdup(branch->srt_stream_key);
         copy->srt_latency_ms = branch->srt_latency_ms;
         copy->rtmp_uri     = g_strdup(branch->rtmp_uri);
         copy->rtmp_passcode = g_strdup(branch->rtmp_passcode);
@@ -3496,6 +3815,8 @@ int sbs_encoder_manager_update_config(sbs_encoder_manager_t *mgr,
             .output_id    = saved->output_id,
             .sink_type    = saved->sink_type,
             .srt_uri      = saved->srt_uri,
+            .srt_mode     = saved->srt_mode,
+            .srt_stream_key = saved->srt_stream_key,
             .srt_latency_ms = saved->srt_latency_ms,
             .rtmp_uri     = saved->rtmp_uri,
             .rtmp_passcode = saved->rtmp_passcode,
@@ -3715,6 +4036,8 @@ int sbs_encoder_manager_add_sink(sbs_encoder_manager_t *mgr,
     branch->output_id    = g_strdup(config->output_id);
     branch->sink_type    = g_strdup(config->sink_type ? config->sink_type : "srt");
     branch->srt_uri      = g_strdup(config->srt_uri);
+    branch->srt_mode     = g_strdup(normalized_srt_mode(config->srt_mode));
+    branch->srt_stream_key = g_strdup(config->srt_stream_key);
     branch->srt_latency_ms = config->srt_latency_ms;
     if (branch->sink_type && strcmp(branch->sink_type, "srt") == 0)
         branch->srt_callers = g_hash_table_new(g_direct_hash, g_direct_equal);
@@ -3839,12 +4162,17 @@ static cJSON *serialize_branch_health(sink_branch_t *branch)
     uint64_t packets_dropped = 0;
 
     if (g_strcmp0(sink_type, "srt") == 0) {
+        const char *srt_mode = branch ? normalized_srt_mode(branch->srt_mode) : "listener";
         packets_sent = branch ? branch->srt_sender_packets_sent : 0;
         packets_dropped = branch ? branch->srt_sender_packets_dropped : 0;
         if (!branch || !branch->srt_sender_running) {
-            reason = "SRT listener is not running";
+            reason = srt_mode_is_caller(srt_mode)
+                ? "SRT caller is not running"
+                : "SRT listener is not running";
         } else if (srt_callers <= 0) {
-            reason = "waiting for SRT caller";
+            reason = srt_mode_is_caller(srt_mode)
+                ? "SRT caller is disconnected"
+                : "waiting for SRT caller";
         } else if (srt_failures > 0) {
             status = "degraded";
             connected = true;
@@ -3853,12 +4181,16 @@ static cJSON *serialize_branch_health(sink_branch_t *branch)
         } else if (branch->srt_sender_bytes_sent > 0) {
             status = "connected";
             connected = true;
-            reason = "SRT caller streaming";
+            reason = srt_mode_is_caller(srt_mode)
+                ? "SRT caller streaming"
+                : "SRT listener streaming";
         } else {
             status = "degraded";
             connected = true;
             degraded = true;
-            reason = "SRT caller connected, waiting for packets";
+            reason = srt_mode_is_caller(srt_mode)
+                ? "SRT caller connected, waiting for packets"
+                : "SRT listener has caller, waiting for packets";
         }
     } else if (g_strcmp0(sink_type, "rtmp") == 0) {
         packets_sent = (uint64_t)MAX(sink_buffers, 0);
@@ -3907,6 +4239,8 @@ static cJSON *serialize_branch_health(sink_branch_t *branch)
                                 ? (double)packets_dropped / (double)(packets_sent + packets_dropped)
                                 : 0.0);
     if (g_strcmp0(sink_type, "srt") == 0) {
+        cJSON_AddStringToObject(obj, "srt_mode",
+                                branch ? normalized_srt_mode(branch->srt_mode) : "listener");
         cJSON_AddNumberToObject(obj, "callers", srt_callers);
         cJSON_AddNumberToObject(obj, "bytes_sent", (double)(branch ? branch->srt_sender_bytes_sent : 0));
         cJSON_AddNumberToObject(obj, "send_failures", (double)srt_failures);

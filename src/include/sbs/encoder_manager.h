@@ -51,6 +51,8 @@ typedef struct sbs_sink_branch_config {
     const char *output_id;       /* Unique output ID */
     const char *sink_type;       /* "srt", "rtmp", "file", "fakesink" */
     const char *srt_uri;         /* SRT URI (e.g. "srt://:8888") */
+    const char *srt_mode;        /* "listener" (default) or "caller" */
+    const char *srt_stream_key;  /* Optional SRT streamid/stream key */
     uint32_t    srt_latency_ms;  /* SRT latency (default: 600) */
     const char *rtmp_uri;        /* RTMP URI */
     const char *rtmp_passcode;   /* Optional RTMP stream key */

@@ -328,6 +328,14 @@ static bool rtmp_plugin_is_streambox(const char *plugin)
          g_ascii_strcasecmp(plugin, "experimental") == 0);
 }
 
+static const char *normalize_srt_mode(const char *mode)
+{
+    if (mode && (g_ascii_strcasecmp(mode, "caller") == 0 ||
+                 g_ascii_strcasecmp(mode, "client") == 0))
+        return "caller";
+    return "listener";
+}
+
 static const char *resolve_shared_codec_for_sink(const char *sink_type,
                                                  const char *rtmp_plugin,
                                                  const char *requested_codec)
@@ -489,6 +497,8 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
             GHashTable *enc = output->encoder;
             const char *sink_type = enc ? g_hash_table_lookup(enc, "sink_type") : NULL;
             const char *srt_uri   = enc ? g_hash_table_lookup(enc, "srt_uri")   : NULL;
+            const char *srt_mode  = enc ? g_hash_table_lookup(enc, "srt_mode")  : NULL;
+            const char *srt_stream_key = enc ? g_hash_table_lookup(enc, "srt_stream_key") : NULL;
             const char *lat_str   = enc ? g_hash_table_lookup(enc, "srt_latency_ms") : NULL;
             const char *rtmp_uri  = enc ? g_hash_table_lookup(enc, "rtmp_uri")  : NULL;
             const char *rtmp_passcode = enc ? g_hash_table_lookup(enc, "rtmp_passcode") : NULL;
@@ -501,6 +511,7 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
             uint32_t srt_latency  = lat_str ? (uint32_t)strtoul(lat_str, NULL, 10) : 600;
             if (!sink_type) sink_type = "srt";
             if (!srt_uri)   srt_uri   = "srt://:8888";
+            srt_mode = normalize_srt_mode(srt_mode);
             if (!file_path_mode) file_path_mode = "file";
             if (!file_prefix) file_prefix = "stream";
             if (!file_container) file_container = "ts";
@@ -511,6 +522,8 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
                 sink_cfg.output_id      = output->id;
                 sink_cfg.sink_type      = sink_type;
                 sink_cfg.srt_uri        = srt_uri;
+                sink_cfg.srt_mode       = srt_mode;
+                sink_cfg.srt_stream_key = srt_stream_key;
                 sink_cfg.srt_latency_ms = srt_latency;
                 sink_cfg.rtmp_uri       = rtmp_uri;
                 sink_cfg.rtmp_passcode  = rtmp_passcode;
@@ -553,9 +566,12 @@ static void restart_runtime_from_graph(sbs_api_server_t *server)
                 cfg.bitrate_kbps  = brate_str  ? (uint32_t)strtoul(brate_str, NULL, 10) : 10000;
                 cfg.sink_type     = sink_type;
                 cfg.srt_uri       = srt_uri;
+                cfg.srt_mode      = srt_mode;
+                cfg.srt_stream_key = srt_stream_key;
                 cfg.srt_latency_ms = srt_latency;
                 cfg.rtmp_uri      = rtmp_uri;
                 cfg.rtmp_passcode = rtmp_passcode;
+                cfg.rtmp_plugin   = rtmp_plugin;
                 cfg.file_path     = file_path;
                 cfg.file_path_mode = file_path_mode;
                 cfg.file_prefix   = file_prefix;

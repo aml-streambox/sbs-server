@@ -927,6 +927,14 @@ static cJSON *output_encoder_to_public_json(GHashTable *map)
             cJSON_AddNumberToObject(obj, "rtmp_stream_key_length", secret_len);
             continue;
         }
+        if (g_strcmp0((const char *)key, "srt_stream_key") == 0) {
+            const char *secret = value ? (const char *)value : "";
+            bool secret_set = secret[0] != '\0';
+            double secret_len = secret_set ? (double)strlen(secret) : 0.0;
+            cJSON_AddBoolToObject(obj, "srt_stream_key_set", secret_set);
+            cJSON_AddNumberToObject(obj, "srt_stream_key_length", secret_len);
+            continue;
+        }
         if (g_strcmp0((const char *)key, "remote_password") == 0) {
             cJSON_AddBoolToObject(obj, "remote_password_set",
                                   value && ((const char *)value)[0] != '\0');

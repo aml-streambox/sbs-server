@@ -21,6 +21,9 @@ RestartSec=3
 LimitNOFILE=4096
 LimitMEMLOCK=infinity
 
+# Keep SBS off CPU0; most device IRQs are routed there on target systems.
+CPUAffinity=1-7
+
 Environment=GST_DEBUG=2
 Environment=VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/mali.json
 Environment=XDG_RUNTIME_DIR=/run/sbs

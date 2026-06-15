@@ -240,9 +240,27 @@ void main() {
         uint dst_x = pair_x * 2u;
         imageStore(y_img, ivec2(dst_x, src_y), vec4(map_y10(y0), 0.0, 0.0, 1.0));
         imageStore(y_img, ivec2(dst_x + 1u, src_y), vec4(map_y10(y1), 0.0, 0.0, 1.0));
+        if ((src_y & 1u) == 0u) {
+            uint cy0, cu0, cy1, cv0, ny0, cu1, ny1, cv1;
+            uint row1 = min(src_y + 1u, pc.src_h - 1u);
+            decode_pair(src_y * pairs_per_row() + pair_x, cy0, cu0, cy1, cv0);
+            decode_pair(row1 * pairs_per_row() + pair_x, ny0, cu1, ny1, cv1);
+            uint u_avg = (cu0 + cu1 + 1u) >> 1;
+            uint v_avg = (cv0 + cv1 + 1u) >> 1;
+            imageStore(uv_img, ivec2(pair_x, src_y >> 1), vec4(map_vu10(u_avg, v_avg), 0.0, 1.0));
+        }
         return;
     }
 
     write_luma_rect(pair_x * 2u, src_y, map_y10(y0));
     write_luma_rect(pair_x * 2u + 1u, src_y, map_y10(y1));
+    if ((src_y & 1u) == 0u) {
+        uint cy0, cu0, cy1, cv0, ny0, cu1, ny1, cv1;
+        uint row1 = min(src_y + 1u, pc.src_h - 1u);
+        decode_pair(src_y * pairs_per_row() + pair_x, cy0, cu0, cy1, cv0);
+        decode_pair(row1 * pairs_per_row() + pair_x, ny0, cu1, ny1, cv1);
+        uint u_avg = (cu0 + cu1 + 1u) >> 1;
+        uint v_avg = (cv0 + cv1 + 1u) >> 1;
+        write_chroma_rect(pair_x, src_y, map_vu10(u_avg, v_avg));
+    }
 }

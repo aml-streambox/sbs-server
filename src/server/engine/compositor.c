@@ -7777,8 +7777,6 @@ _Static_assert(sizeof(sbs_native_downscale_pc_t) == SBS_NATIVE_DOWNSCALE_PC_SIZE
 #define SBS_NATIVE_P010_DIRECT_SRC_OFFSET 16u
 #define SBS_NATIVE_P010_DIRECT_SRC_RECT_OFFSET 32u
 #define SBS_NATIVE_P010_DIRECT_SOURCE_DRIVEN 64u
-#define SBS_NATIVE_P010_DIRECT_CHROMA_ONLY (1u << 12u)
-
 static bool native_item_filters_direct_yuv_compatible(const sbs_comp_scene_item_t *item,
                                                       sbs_export_color_mode_t color_mode)
 {
@@ -8252,47 +8250,6 @@ static void native_canvas_layer_barrier(VkCommandBuffer cb,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                           0, 0, NULL, 0, NULL, 2, barriers);
-}
-
-static void native_dispatch_amly_nv21_chroma_only(sbs_compositor_t *comp,
-                                                  VkCommandBuffer cb,
-                                                  VkDescriptorSet set,
-                                                  const sbs_native_p010_direct_pc_t *base_pc)
-{
-    if (!comp || cb == VK_NULL_HANDLE || set == VK_NULL_HANDLE || !base_pc ||
-        comp->native_amly_to_nv21_pipeline == VK_NULL_HANDLE ||
-        comp->native_p010_direct_pipeline_layout == VK_NULL_HANDLE ||
-        base_pc->canvas_width == 0 || base_pc->canvas_height == 0 ||
-        base_pc->dst_w == 0 || base_pc->dst_h == 0)
-        return;
-
-    sbs_native_p010_direct_pc_t pc = *base_pc;
-    pc.flags |= SBS_NATIVE_P010_DIRECT_CHROMA_ONLY;
-
-    uint32_t block_w = (pc.flags & SBS_NATIVE_P010_DIRECT_FULL_CANVAS)
-        ? ((pc.canvas_width + 1u) >> 1)
-        : ((pc.dst_w + 1u) >> 1);
-    uint32_t block_h = (pc.flags & SBS_NATIVE_P010_DIRECT_FULL_CANVAS)
-        ? ((pc.canvas_height + 1u) >> 1)
-        : ((pc.dst_h + 1u) >> 1);
-
-    if ((pc.flags & SBS_NATIVE_P010_DIRECT_FULL_CANVAS) &&
-        pc.dst_x <= 0 && pc.dst_y == 0 &&
-        pc.dst_x + (int32_t)pc.dst_w >= (int32_t)pc.canvas_width &&
-        pc.dst_h < pc.canvas_height)
-        block_h = (pc.dst_h + 1u) >> 1;
-
-    if (block_w == 0 || block_h == 0)
-        return;
-
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
-                      comp->native_amly_to_nv21_pipeline);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            comp->native_p010_direct_pipeline_layout, 0, 1,
-                            &set, 0, NULL);
-    vkCmdPushConstants(cb, comp->native_p010_direct_pipeline_layout,
-                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    vkCmdDispatch(cb, (block_w + 15u) / 16u, (block_h + 15u) / 16u, 1);
 }
 
 static bool native_crop_rgba_layer_to_alpha_bounds(const sbs_source_texture_t *tex,
@@ -8870,7 +8827,6 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                 .src_offset_y = src_y,
             };
             memcpy(pc.filter_params, item->filter_params, sizeof(pc.filter_params));
-            sbs_native_p010_direct_pc_t output_driven_pc = pc;
             if (source_driven_amly) {
                 int32_t local_x0 = -dst_x;
                 int32_t local_x1 = (int32_t)canvas_width - dst_x;
@@ -9021,12 +8977,6 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                     vkCmdDispatch(cb, (block_w + wg_x - 1u) / wg_x,
                                   (block_h + wg_y - 1u) / wg_y, 1);
                 }
-                if (use_source_split && entry->color_mode == SBS_EXPORT_COLOR_SDR &&
-                    tex->drm_format == SBS_DRM_FORMAT_AMLY) {
-                    native_canvas_layer_barrier(cb, entry);
-                    native_dispatch_amly_nv21_chroma_only(comp, cb, p010_direct_set,
-                                                          &output_driven_pc);
-                }
             } else {
                 uint32_t block_w = (pc.dst_w + 1u) / 2u;
                 uint32_t block_h = (pc.dst_h + 1u) / 2u;
@@ -9082,11 +9032,6 @@ static void native_dispatch_source_layers(sbs_compositor_t *comp,
                                           (((bg_rows + 1u) >> 1) + 7u) / 8u, 1);
                         }
                     }
-                }
-                if (source_driven_amly && entry->color_mode == SBS_EXPORT_COLOR_SDR) {
-                    native_canvas_layer_barrier(cb, entry);
-                    native_dispatch_amly_nv21_chroma_only(comp, cb, p010_direct_set,
-                                                          &output_driven_pc);
                 }
             }
             native_timing_record_layer_end(comp, cb, timing, item, tex,
